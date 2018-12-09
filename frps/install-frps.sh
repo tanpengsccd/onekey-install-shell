@@ -13,7 +13,7 @@ str_program_dir="/usr/local/${program_name}"
 program_init="/etc/init.d/${program_name}"
 program_config_file="frps.ini"
 ver_file="/tmp/.frp_ver.sh"
-program_version_link="https://raw.githubusercontent.com/clangcn/onekey-install-shell/master/frps/version.sh"
+program_version_link="https://raw.githubusercontent.com/tanpengsccd/onekey-install-shell/master/frps/version.sh"
 str_install_shell=https://raw.githubusercontent.com/clangcn/onekey-install-shell/master/frps/install-frps.sh
 shell_update(){
     fun_clangcn "clear"
