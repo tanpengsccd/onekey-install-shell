@@ -1,8 +1,6 @@
 # onekey-install-shell
 Linux 常自用shell脚本.
-
-下面的地址可自己替换 "https://iilog.com" ->  "https://raw.github.com/tanpengsccd/onekey-install-shell/master"
-
+> 由于大陆地方访问GitHub有间接性阻断,所以使用镜像加速地址 https://iilog.com , 如不放心代码可自行替换替换URL地址 "https://iilog.com" ->  "https://raw.github.com/tanpengsccd/onekey-install-shell/master" .
 ## 更改服务器的出栈优先级为IPv4/IPv6
 
   1. 设置为IPv4优先
