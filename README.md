@@ -16,5 +16,5 @@ bash <(wget --no-check-certificate -qO- 'https://raw.github.com/tanpengsccd/onek
 ## ssh key 登陆 工具 
 来自 https://github.com/P3TERX/SSH_Key_Installer, 具体使用说明见其网站. 
 ```
-bash <(curl -fsSL gh.tools.al/https://raw.github.com/tanpengsccd/onekey-install-shell/master/.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d 删除密码登录 -p 设置ssh开放端口
+bash <(curl -fsSL https://raw.github.com/tanpengsccd/onekey-install-shell/master/ssh_pub_key_installer.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d 删除密码登录 -p 设置ssh开放端口
 ```
