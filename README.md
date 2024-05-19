@@ -13,3 +13,8 @@ bash <(wget --no-check-certificate -qO- 'https://raw.github.com/tanpengsccd/onek
 ```
 bash <(wget --no-check-certificate -qO- 'https://raw.github.com/tanpengsccd/onekey-install-shell/master/set-ip-priority.sh') -reset
 ```
+## ssh key 登陆 工具 
+来自 https://github.com/P3TERX/SSH_Key_Installer, 具体使用说明见其网站. 
+```
+bash <(curl -fsSL gh.tools.al/https://raw.github.com/tanpengsccd/onekey-install-shell/master/.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d 删除密码登录 -p 设置ssh开放端口
+```
