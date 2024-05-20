@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# 显示帮助信息
+usage() {
+    echo "使用方式: $0 [-p] [-i interface] dns1 [dns2 ...]"
+    echo "  -p, --permanent   设置永久 DNS"
+    echo "  -i, --interface   指定网络接口"
+}
+
 # 检查是否有超级用户权限
 if [ "$(id -u)" -ne 0 ]; then
     echo "此脚本需要超级用户权限，请使用 sudo 或以 root 用户运行"
@@ -18,13 +25,26 @@ while [[ "$#" -gt 0 ]]; do
         shift
         interface="$1"
         ;;
-    *) dns_servers+=("$1") ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            dns_servers+=("$1")
+        else
+            echo "无效的 DNS 地址: $1"
+            usage
+            exit 1
+        fi
+        ;;
     esac
     shift
 done
 
 if [ "${#dns_servers[@]}" -eq 0 ]; then
     echo "请至少提供一个 DNS 地址。"
+    usage
     exit 1
 fi
 
@@ -37,23 +57,25 @@ if [ -z "$interface" ]; then
     fi
 fi
 
+set_temporary_dns() {
+    echo -n >/etc/resolv.conf
+    for dns in "${dns_servers[@]}"; do
+        echo "nameserver $dns" >>/etc/resolv.conf
+    done
+    echo "临时 DNS 已设置为："
+    cat /etc/resolv.conf
+}
+
 set_permanent_dns() {
     if systemctl is-active --quiet systemd-resolved; then
-        # 清理现有 DNS 设置
         sed -i '/^DNS=/d' /etc/systemd/resolved.conf
-        # 添加新 DNS 设置
         echo "DNS=${dns_servers[*]}" >>/etc/systemd/resolved.conf
         systemctl restart systemd-resolved
         echo "systemd-resolved 的 DNS 配置已更新。"
     else
         echo "systemd-resolved 服务不可用。正在尝试更新 /etc/resolv.conf 作为备选方案。"
-        echo -n >/etc/resolv.conf
-        for dns in "${dns_servers[@]}"; do
-            echo "nameserver $dns" >>/etc/resolv.conf
-        done
+        set_temporary_dns
     fi
-    echo "永久 DNS 已设置为："
-    cat /etc/resolv.conf
 }
 
 # 根据参数决定设置永久还是临时 DNS
