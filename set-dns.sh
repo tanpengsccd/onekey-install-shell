@@ -64,6 +64,7 @@ set_temporary_dns() {
     done
     echo "临时 DNS 已设置为："
     cat /etc/resolv.conf
+    echo "重启服务失效,如果需要设置永久dns,请添加 -p 参数再次执行。"
 }
 
 set_permanent_dns() {
@@ -71,7 +72,7 @@ set_permanent_dns() {
         sed -i '/^DNS=/d' /etc/systemd/resolved.conf
         echo "DNS=${dns_servers[*]}" >>/etc/systemd/resolved.conf
         systemctl restart systemd-resolved
-        echo "systemd-resolved 的 DNS 配置已更新。重启服务失效,如果需要设置永久dns,请添加 -p 参数。"
+        echo "systemd-resolved 的 DNS 配置已更新。"
     else
         # 提示用户启用 systemd-resolved 服务 或者 移除 -p 参数使用临时 DNS
         echo "systemd-resolved 服务未启用，请启用后再设置永久 DNS:"
