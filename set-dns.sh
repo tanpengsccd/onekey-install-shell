@@ -38,21 +38,22 @@ if [ -z "$interface" ]; then
 fi
 
 set_permanent_dns() {
-    # 设置永久 DNS
     if systemctl is-active --quiet systemd-resolved; then
+        # 清理现有 DNS 设置
         sed -i '/^DNS=/d' /etc/systemd/resolved.conf
+        # 添加新 DNS 设置
         echo "DNS=${dns_servers[*]}" >>/etc/systemd/resolved.conf
         systemctl restart systemd-resolved
         echo "systemd-resolved 的 DNS 配置已更新。"
     else
-        # 更新 /etc/network/interfaces 文件以设置永久 DNS
-        echo "iface $interface inet static" >>/etc/network/interfaces
-        echo "    dns-nameservers ${dns_servers[*]}" >>/etc/network/interfaces
-        ifdown $interface && ifup $interface
-        echo "网络接口文件 /etc/network/interfaces 已更新。"
+        echo "systemd-resolved 服务不可用。正在尝试更新 /etc/resolv.conf 作为备选方案。"
+        echo -n >/etc/resolv.conf
+        for dns in "${dns_servers[@]}"; do
+            echo "nameserver $dns" >>/etc/resolv.conf
+        done
     fi
     echo "永久 DNS 已设置为："
-    systemd-resolve --status | grep 'DNS Servers' -A 2 || cat /etc/resolv.conf
+    cat /etc/resolv.conf
 }
 
 # 根据参数决定设置永久还是临时 DNS
