@@ -28,5 +28,5 @@ Linux 常自用shell脚本.
 ## 设置 dns 
 
   ```
-  bash <(curl -fsSL 'https://iilog.com/set-dns.sh') 1.1.1.1 8.8.8.8 -p # -p 为永久设置;否则为临时设置,重启后失效
+  bash <(curl -fsSL 'https://iilog.com/set-dns.sh') 1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888 -p # -p 为永久设置;否则为临时设置,重启后失效
   ```
