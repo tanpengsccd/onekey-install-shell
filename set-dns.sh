@@ -30,7 +30,8 @@ while [[ "$#" -gt 0 ]]; do
         exit 0
         ;;
     *)
-        if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # 支持 IPv4 和 IPv6 地址的正则表达式
+        if [[ "$1" =~ ^(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)|([0-9a-fA-F:]+))$ ]]; then
             dns_servers+=("$1")
         else
             echo "无效的 DNS 地址: $1"
@@ -64,21 +65,20 @@ set_temporary_dns() {
     done
     echo "临时 DNS 已设置为："
     cat /etc/resolv.conf
-    echo "重启服务失效,如果需要设置永久dns,请添加 -p 参数再次执行。"
 }
 
 set_permanent_dns() {
     if systemctl is-active --quiet systemd-resolved; then
+        # 清理现有 DNS 设置
         sed -i '/^DNS=/d' /etc/systemd/resolved.conf
+        # 添加新 DNS 设置
         echo "DNS=${dns_servers[*]}" >>/etc/systemd/resolved.conf
         systemctl restart systemd-resolved
         echo "systemd-resolved 的 DNS 配置已更新。"
     else
-        # 提示用户启用 systemd-resolved 服务 或者 移除 -p 参数使用临时 DNS
         echo "systemd-resolved 服务未启用，请启用后再设置永久 DNS:"
         echo "  sudo systemctl enable systemd-resolved"
         echo "  sudo systemctl start systemd-resolved"
-        echo "或者移除 -p 参数 以 临时设置DNS。"
     fi
 }
 
@@ -88,3 +88,4 @@ if $permanent; then
 else
     set_temporary_dns
 fi
+echo "如出现不可解决异常请 访问 https://github.com/tanpengsccd/onekey-install-shell 提交issue"
