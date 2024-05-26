@@ -30,3 +30,11 @@ Linux 常自用shell脚本.
   ```
   bash <(curl -fsSL 'https://iilog.com/set-dns.sh') 1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888 -p # -p 为永久设置;否则为临时设置,重启后失效
   ```
+## 设置CloudFlare的安全等级 
+如设置站点 5秒盾 
+  - 用法： bash <(wget --no-check-certificate -qO- 'https://iilog.com/cf-security-level.sh') admin@badiu.com apikey30be7032ba0b0d870e74e3cdcd934ef zoneidcfe29838c671fbd522bc81856e under_attack
+  - 更多信息参考 https://limbopro.com/archives/ChangeSecurity-Level-setting.html
+  - 官方API     https://developers.cloudflare.com/api/operations/zone-settings-change-security-level-setting
+  ```
+  bash <(wget --no-check-certificate -qO- 'https://iilog.com/cf-security-level.sh') admin@badiu.com yourCfApiKey yourZoneId under_attack
+  ```
