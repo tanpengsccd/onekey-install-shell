@@ -18,17 +18,17 @@ Linux 常自用shell脚本.
 ## ssh key 登陆配置 
   来自 https://github.com/P3TERX/SSH_Key_Installer, 具体使用说明见其网站. 
   ```
-  bash <(curl -fsSL https://iilog.com/ssh_pub_key_installer.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d 删除密码登录 -p 设置ssh开放端口
+  bash <(curl -fsSL iilog.com/ssh.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d y/n 关闭/开启远程root密码登录 -p 设置ssh开放端口
   ```
 ## ddns 脚本  
   改自 https://github.com/yulewang/cloudflare-api-v4-ddns
   ```
-  curl -s https://iilog.com/cf-v4-ddns.sh | bash -s  f87a1025822be51556071ef68f1e8af10fb32 tanpengcd@gmail.com  baidu.com mynode.baidu.com # -s后跟四个参数  [CF_Global_API_KEY] [CF_Email] [二级域名] [具体域名]
+  curl -s iilog.com/cf-v4-ddns.sh | bash -s  f87a1025822be51556071ef68f1e8af10fb32 tanpengcd@gmail.com  baidu.com mynode.baidu.com # -s后跟四个参数  [CF_Global_API_KEY] [CF_Email] [二级域名] [具体域名]
   ```
 ## 设置 dns 
 
   ```
-  bash <(curl -fsSL 'https://iilog.com/set-dns.sh') 1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888 -p # -p 为永久设置;否则为临时设置,重启后失效
+  bash <(curl -fsSL iilog.com/set-dns.sh) 1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888 -p # -p 为永久设置;否则为临时设置,重启后失效
   ```
 ## 设置CloudFlare的安全等级 
 如设置站点 5秒盾 
