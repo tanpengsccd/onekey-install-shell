@@ -7,7 +7,7 @@
 # Blog: https://p3terx.com
 #=============================================================
 
-VERSION=2.7
+VERSION=1.0
 RED_FONT_PREFIX="\033[31m"
 LIGHT_GREEN_FONT_PREFIX="\033[1;32m"
 FONT_COLOR_SUFFIX="\033[0m"
@@ -20,7 +20,7 @@ USAGE() {
 SSH Key Installer $VERSION
 
 Usage:
-  bash <(curl -fsSL git.io/key.sh) [options...] <arg>
+  bash <(curl -fsSL iilog.com/ssh_pub_key_installer.sh) [options...] <arg>
 
 Options:
   -o	Overwrite mode, this option is valid at the top
@@ -28,7 +28,7 @@ Options:
   -u	Get the public key from the URL, the arguments is the URL
   -f	Get the public key from the local file, the arguments is the local file path
   -p	Change SSH port, the arguments is port number
-  -d	Disable password login"
+  -d	Default 'y' will disable password login" ,if 'n' will enable password login
 }
 
 if [ $# -eq 0 ]; then
@@ -126,29 +126,89 @@ change_port() {
     fi
 }
 
-disable_password() {
+# disable_password() {
+
+#     if [ $(uname -o) == Android ]; then
+#         sed -i "s@.*\(PasswordAuthentication \).*@\1no@" $PREFIX/etc/ssh/sshd_config && {
+#             RESTART_SSHD=2
+#             echo -e "${INFO} Disabled password login in SSH."
+#         } || {
+#             RESTART_SSHD=0
+#             echo -e "${ERROR} Disable password login failed!"
+#             exit 1
+#         }
+#     else
+#         $SUDO sed -i "s@.*\(PasswordAuthentication \).*@\1no@" /etc/ssh/sshd_config && {
+#             RESTART_SSHD=1
+#             echo -e "${INFO} Disabled password login in SSH."
+#         } || {
+#             RESTART_SSHD=0
+#             echo -e "${ERROR} Disable password login failed!"
+#             exit 1
+#         }
+#     fi
+# }
+
+permit_local_root_login() {
+    echo -e "允许 127.0.0.1 本地登录 root 用户"
+    # 允许 127.0.0.1 本地登录 root 用户, 需要检查有无"Match Address 127.0.0.1",有则先删除对应缩进里的所有配置,再添加
+    # Match Address 127.0.0.1
+    #     PermitRootLogin yes
+    #     PasswordAuthentication yes
     if [ $(uname -o) == Android ]; then
-        sed -i "s@.*\(PasswordAuthentication \).*@\1no@" $PREFIX/etc/ssh/sshd_config && {
-            RESTART_SSHD=2
-            echo -e "${INFO} Disabled password login in SSH."
-        } || {
-            RESTART_SSHD=0
-            echo -e "${ERROR} Disable password login failed!"
-            exit 1
-        }
+        if grep -q "Match Address 127.0.0.1" $PREFIX/etc/ssh/sshd_config; then
+            sed -i '/Match Address 127.0.0.1/,/^$/d' $PREFIX/etc/ssh/sshd_config
+        fi
+        echo -e "\Match Address 127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication yes\n" >>$PREFIX/etc/ssh/sshd_config
+        RESTART_SSHD=2
     else
-        $SUDO sed -i "s@.*\(PasswordAuthentication \).*@\1no@" /etc/ssh/sshd_config && {
-            RESTART_SSHD=1
-            echo -e "${INFO} Disabled password login in SSH."
-        } || {
-            RESTART_SSHD=0
-            echo -e "${ERROR} Disable password login failed!"
-            exit 1
-        }
+        if grep -q "Match Address 127.0.0.1" /etc/ssh/sshd_config; then
+            $SUDO sed -i '/Match Address 127.0.0.1/,/^$/d' /etc/ssh/sshd_config
+        fi
+        $SUDO echo -e "Match Address 127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication yes\n" >>/etc/ssh/sshd_config
+        RESTART_SSHD=1
     fi
+
 }
 
-while getopts "og:u:f:p:d" OPT; do
+permit_remote_root_password_login() {
+    # $DISABALE_PASSWORD 是 "n"/"N" 开头字符 就是 开启 root 密码登陆 (反反得正)
+    echo -e "permit_remote_root_password_login ${DISABALE_PASSWORD} "
+    if [[ ${DISABALE_PASSWORD} =~ ^[nN] ]]; then
+        echo -e "允许远程密码登录root用户"
+        if [ $(uname -o) == Android ]; then
+            if grep -q "Match Address \*,!127.0.0.1" $PREFIX/etc/ssh/sshd_config; then
+                sed -i '/Match Address \*,!127.0.0.1/,/^$/d' $PREFIX/etc/ssh/sshd_config
+            fi
+            echo -e "Match Address *,!127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication yes\n    PubkeyAuthentication yes\n" >>$PREFIX/etc/ssh/sshd_config
+            RESTART_SSHD=2
+        else
+            if grep -q "Match Address \*,!127.0.0.1" /etc/ssh/sshd_config; then
+                $SUDO sed -i '/Match Address \*,!127.0.0.1/,/^$/d' /etc/ssh/sshd_config
+            fi
+            $SUDO echo -e "Match Address *,!127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication yes\n    PubkeyAuthentication yes\n" >>/etc/ssh/sshd_config
+            RESTART_SSHD=1
+        fi
+    else
+        echo -e "不允许远程密码登录root用户,但允许ssh-key 登陆"
+        if [ $(uname -o) == Android ]; then
+            if grep -q "Match Address \*,!127.0.0.1" $PREFIX/etc/ssh/sshd_config; then
+                sed -i '/Match Address \*,!127.0.0.1/,/^$/d' $PREFIX/etc/ssh/sshd_config
+            fi
+            echo -e "Match Address *,!127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication no\n    PubkeyAuthentication yes\n" >>$PREFIX/etc/ssh/sshd_config
+            RESTART_SSHD=2
+        else
+            if grep -q "Match Address \*,!127.0.0.1" /etc/ssh/sshd_config; then
+                $SUDO sed -i '/Match Address \*,!127.0.0.1/,/^$/d' /etc/ssh/sshd_config
+            fi
+            $SUDO echo -e "Match Address *,!127.0.0.1\n    PermitRootLogin yes\n    PasswordAuthentication no\n    PubkeyAuthentication yes\n" >>/etc/ssh/sshd_config
+            RESTART_SSHD=1
+        fi
+    fi
+
+}
+
+while getopts "og:u:f:p:d:" OPT; do
     case $OPT in
     o)
         OVERWRITE=1
@@ -173,7 +233,10 @@ while getopts "og:u:f:p:d" OPT; do
         change_port
         ;;
     d)
-        disable_password
+        DISABALE_PASSWORD=${OPTARG:-y} # 如果未提供参数，则默认为'y'
+        permit_remote_root_password_login
+        permit_local_root_login
+        # disable_password
         ;;
     ?)
         USAGE
