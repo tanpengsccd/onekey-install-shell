@@ -18,7 +18,7 @@ Linux 常自用shell脚本.
 ## ssh key 登陆配置 
   来自 https://github.com/P3TERX/SSH_Key_Installer, 具体使用说明见其网站. 
   ```
-  bash <(curl -fsSL iilog.com/ssh.sh) -g tanpengsccd -d -p10022  # -g github的帐户名 -d y/n 关闭/开启远程root密码登录 -p 设置ssh开放端口
+  bash <(curl -fsSL iilog.com/ssh.sh) -g tanpengsccd -p10022 -d y  # -g github的帐户名 -d y/n 关闭/开启远程root密码登录 -p 设置ssh开放端口
   ```
 ## ddns 脚本  
   改自 https://github.com/yulewang/cloudflare-api-v4-ddns
