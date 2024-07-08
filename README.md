@@ -16,7 +16,10 @@ Linux 常自用shell脚本.
   bash <(wget --no-check-certificate -qO- 'https://iilog.com/set-ip-priority.sh') -reset
   ```
 ## ssh key 登陆配置 
-  来自 https://github.com/P3TERX/SSH_Key_Installer, 具体使用说明见其网站. 
+  改自 https://github.com/P3TERX/SSH_Key_Installer.   
+  -g [github的帐户名]   : 设置github的帐户名下的ssh key, 需要该github的帐户已配置ssh key.  
+  -d [y/n] : 关闭/开启远程root密码登录   
+  -p [ssh开放的端口]  
   ```
   bash <(curl -fsSL iilog.com/ssh.sh) -g tanpengsccd -p10022 -d y  # -g github的帐户名 -d y/n 关闭/开启远程root密码登录 -p 设置ssh开放端口
   ```
