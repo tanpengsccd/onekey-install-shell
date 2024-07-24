@@ -16,8 +16,8 @@ traffic_in_gb=$(echo "scale=2; $traffic_value/1024/1024/1024" | bc)
 # 根据 Traffic 值返回相应的信号
 if [ "$traffic_value" -gt 193273528320 ]; then
     echo "当月CDT流量:$traffic_in_gb ,已超过180G"
-    exit 1
+    exit 0
 else
     echo "当月CDT流量$traffic_in_gb ,还未超过180G"
-    exit 0
+    exit 1
 fi
