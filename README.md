@@ -41,3 +41,11 @@ Linux 常自用shell脚本.
   ```
   bash <(wget --no-check-certificate -qO- 'https://iilog.com/cf-security-level.sh') admin@badiu.com yourCfApiKey yourZoneId under_attack
   ```
+
+## 获取阿里CDT已使用的流量(beta)
+```
+export ALICDTCookie='_samesite_flag_=true; cookie2=XXXXXX;.....'
+export ALICDTBody='sec_token=xxxxxxxxxxx'
+
+bash <(wget --no-check-certificate -qO- 'https://iilog.com/ali-cdt-traffic-check.sh') 
+```
