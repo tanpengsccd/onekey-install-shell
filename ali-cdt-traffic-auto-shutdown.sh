@@ -9,7 +9,7 @@
 
 # 使用提供的 curl 命令获取数据
 json_response=$(curl 'https://cdt.console.aliyun.com/data/api.json?_fetcher_=cdt__ListCdtInternetTraffic&product=cdt&action=ListCdtInternetTraffic' \
-    -H "$ALICDTCookie" \
+    -H "$ALICookie" \
     --data-raw "$ALICDTBody" | jq '.')
 
 # 解析 JSON 响应并检查 Traffic 值
@@ -19,7 +19,7 @@ traffic_in_gb=$(echo "scale=2; $traffic_value/1024/1024/1024" | bc)
 if [ "$traffic_value" -gt 193273528320 ]; then
     echo "当月CDT流量:$traffic_in_gb ,已超过180G"
     curl 'https://ecs.console.aliyun.com/instance/operator/stopInstance.json' \
-        -H "$ALICDTCookie" \
+        -H "$ALICookie" \
         --data-raw "$ALIECSStopBody"
     echo "关机成功"
 # 如果 == 0 说明流量重置了, 客服说是每月1日重置的, 所以需要开机
@@ -27,7 +27,7 @@ elif [ "$traffic_value" -eq 0 ]; then
 
     echo "当月CDT流量$traffic_in_gb ,已经恢复流量"
     curl 'https://ecs.console.aliyun.com/instance/operator/startInstance.json' \
-        -H "$ALICDTCookie" \
+        -H "$ALICookie" \
         --data-raw "$ALIECSStartBody"
     echo "开机成功"
 
