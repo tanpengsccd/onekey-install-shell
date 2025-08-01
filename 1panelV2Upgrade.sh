@@ -325,8 +325,37 @@ check_installed() {
 # 获取已安装版本
 get_installed_version() {
     if check_installed; then
-        local version_output=$($BINARY_NAME --version 2>/dev/null || echo "unknown")
-        echo "$version_output"
+        # 尝试多种方式获取版本信息
+        local version_output=""
+        
+        # 方法1: 尝试 --version 参数
+        version_output=$($BINARY_NAME --version 2>/dev/null || echo "")
+        if [[ -n "$version_output" && "$version_output" != "unknown" ]]; then
+            echo "$version_output"
+            return 0
+        fi
+        
+        # 方法2: 尝试 -v 参数
+        version_output=$($BINARY_NAME -v 2>/dev/null || echo "")
+        if [[ -n "$version_output" && "$version_output" != "unknown" ]]; then
+            echo "$version_output"
+            return 0
+        fi
+        
+        # 方法3: 尝试 version 子命令
+        version_output=$($BINARY_NAME version 2>/dev/null || echo "")
+        if [[ -n "$version_output" && "$version_output" != "unknown" ]]; then
+            echo "$version_output"
+            return 0
+        fi
+        
+        # 方法4: 检查文件时间戳作为版本参考
+        if [[ -f "$INSTALL_DIR/$BINARY_NAME" ]]; then
+            local file_date=$(stat -c %y "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null | cut -d' ' -f1)
+            echo "installed-$file_date"
+        else
+            echo "unknown"
+        fi
     else
         echo "not_installed"
     fi
@@ -402,15 +431,20 @@ install_migrator() {
         
         if [[ "$current_version" == *"$LATEST_VERSION"* ]]; then
             log_success "已安装目标版本，无需重复安装"
-            read -p "是否强制重新安装？(y/N): " -n 1 -r
-            echo
+            read -p "是否强制重新安装？(y/N): " -r
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
                 log_info "安装已取消"
                 exit 0
             fi
+        elif [[ "$current_version" == "unknown" || "$current_version" == installed-* ]]; then
+            log_warning "当前版本信息不明确，建议重新安装"
+            read -p "是否重新安装？(Y/n): " -r
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                log_info "安装已取消"
+                exit 0
+            fi
         else
-            read -p "是否覆盖安装？(y/N): " -n 1 -r
-            echo
+            read -p "是否覆盖安装？(y/N): " -r
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
                 log_info "安装已取消"
                 exit 0
@@ -511,18 +545,22 @@ smart_upgrade() {
         install_migrator
         log_info "工具安装完成，继续升级流程..."
     else
-        # 检查是否有新版本
-        check_network_tools
-        if get_latest_version; then
-            local current_version=$(get_installed_version)
-            if [[ "$current_version" != *"$LATEST_VERSION"* ]]; then
+        local current_version=$(get_installed_version)
+        
+        # 只在能够获取网络版本信息时进行版本比较
+        if command -v jq &> /dev/null && get_latest_version &>/dev/null; then
+            if [[ "$current_version" != *"$LATEST_VERSION"* ]] && [[ "$current_version" != "unknown" ]]; then
                 log_warning "检测到新版本 $LATEST_VERSION，当前版本: $current_version"
-                read -p "是否更新到最新版本？(y/N): " -n 1 -r
-                echo
+                read -p "是否更新到最新版本？(y/N): " -r
                 if [[ $REPLY =~ ^[Yy]$ ]]; then
                     install_migrator
                 fi
+            else
+                log_info "当前工具版本: $current_version"
             fi
+        else
+            log_info "跳过版本检查，使用当前已安装的工具"
+            log_info "当前工具版本: $current_version"
         fi
     fi
 }
@@ -535,20 +573,52 @@ upgrade_master() {
     
     # 升级服务
     log_info "步骤1: 升级服务..."
-    $BINARY_NAME upgrade core
+    log_warning "即将开始服务升级，这会停止当前1Panel V1服务"
     
-    log_success "服务升级完成"
-    log_warning "请确保V2服务启动成功后再继续..."
+    # 执行服务升级
+    if $BINARY_NAME upgrade core; then
+        log_success "服务升级命令执行完成"
+    else
+        local exit_code=$?
+        if [[ $exit_code -eq 1 ]]; then
+            log_error "升级失败：当前版本过低，需要先在1Panel控制台更新到v1.10.29-lts或更高版本"
+            log_info "请先在1Panel控制台右下角手动更新到最新版本，然后重新运行此脚本"
+            exit 1
+        else
+            log_error "服务升级失败，退出码: $exit_code"
+            exit 1
+        fi
+    fi
+    
+    log_warning "请检查V2服务是否正常启动"
+    log_info "可以通过以下方式检查："
+    log_info "  - 访问1Panel Web界面"
+    log_info "  - 检查服务状态: systemctl status 1panel-core"
+    log_info "  - 查看日志: journalctl -u 1panel-core -f"
     
     # 询问是否继续网站升级
-    read -p "V2服务是否已启动成功？继续网站升级吗？(y/N): " -n 1 -r
-    echo
+    echo ""
+    read -p "V2服务是否已正常启动？继续网站升级吗？(y/N): " -r
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         log_info "步骤2: 升级网站..."
-        $BINARY_NAME upgrade website
-        log_success "主节点升级完成！"
+        log_warning "即将开始网站升级，升级期间网站将不可访问"
+        
+        if $BINARY_NAME upgrade website; then
+            log_success "主节点升级完成！"
+            log_info "升级完成后建议："
+            log_info "  1. 检查所有网站是否正常访问"
+            log_info "  2. 重新配置反代缓存（如需要）"
+            log_info "  3. 检查PHP网站设置（静态网站可切换回PHP）"
+        else
+            log_error "网站升级失败"
+            log_warning "请检查错误信息，必要时可以回滚: $0 rollback"
+            exit 1
+        fi
     else
-        log_warning "网站升级已跳过，请在V2服务启动后手动执行: $BINARY_NAME upgrade website"
+        log_warning "网站升级已跳过"
+        log_info "V2服务启动后，请手动执行网站升级:"
+        log_info "  $BINARY_NAME upgrade website"
+        log_info "或运行: $0 upgrade-master"
     fi
 }
 
@@ -560,11 +630,22 @@ upgrade_slave() {
     
     # 升级服务
     log_info "升级从节点服务..."
-    $BINARY_NAME upgrade agent
+    log_warning "即将开始从节点服务升级"
     
-    log_success "从节点服务升级完成！"
-    log_warning "请在主节点的【节点管理】页面添加此从节点"
-    log_warning "添加完成后，请运行: $0 upgrade-slave-web 完成网站升级"
+    if $BINARY_NAME upgrade agent; then
+        log_success "从节点服务升级完成！"
+        log_warning "请在主节点的【节点管理】页面添加此从节点"
+        log_info "添加步骤："
+        log_info "  1. 登录主节点1Panel控制台"
+        log_info "  2. 导航到【节点管理】页面"
+        log_info "  3. 点击【添加节点】"
+        log_info "  4. 输入此服务器的IP地址和端口"
+        log_info "  5. 系统会自动识别并处理V1历史数据"
+        log_warning "添加完成后，请运行: $0 upgrade-slave-web 完成网站升级"
+    else
+        log_error "从节点服务升级失败"
+        exit 1
+    fi
 }
 
 # 从节点网站升级
@@ -670,21 +751,47 @@ check_status() {
         local current_version=$(get_installed_version)
         log_success "1panel-migrator 已安装"
         log_info "安装路径: $INSTALL_DIR/$BINARY_NAME"
-        log_info "当前版本: $current_version"
+        
+        # 显示文件信息
+        if [[ -f "$INSTALL_DIR/$BINARY_NAME" ]]; then
+            local file_size=$(stat -c %s "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null)
+            local file_date=$(stat -c %y "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null | cut -d' ' -f1)
+            log_info "文件大小: $(numfmt --to=iec $file_size)B"
+            log_info "文件日期: $file_date"
+        fi
+        
+        log_info "版本信息: $current_version"
         
         # 检查最新版本
-        if check_network_tools && get_latest_version; then
-            log_info "最新版本: $LATEST_VERSION"
-            
-            if [[ "$current_version" != *"$LATEST_VERSION"* ]] && [[ "$current_version" != "unknown" ]]; then
-                log_warning "发现新版本可用"
-                log_info "运行以下命令更新: $0 install"
+        if command -v jq &> /dev/null; then
+            if get_latest_version &>/dev/null; then
+                log_info "最新版本: $LATEST_VERSION"
+                
+                # 简化版本比较逻辑
+                if [[ "$current_version" == *"$LATEST_VERSION"* ]]; then
+                    log_success "版本匹配最新版本"
+                elif [[ "$current_version" == "unknown" ]]; then
+                    log_warning "无法获取当前版本信息，但工具已正确安装"
+                    log_info "运行以下命令重新安装: $0 install"
+                else
+                    log_warning "可能有新版本可用"
+                    log_info "运行以下命令更新: $0 install"
+                fi
             else
-                log_success "已是最新版本"
+                log_warning "无法检查最新版本信息（网络问题）"
             fi
         else
-            log_warning "无法检查最新版本信息"
+            log_warning "缺少jq工具，无法检查最新版本"
+            log_info "安装jq: apt-get install jq 或 yum install jq"
         fi
+        
+        # 检查工具是否可执行
+        if $BINARY_NAME --help &>/dev/null || $BINARY_NAME help &>/dev/null; then
+            log_success "工具运行正常"
+        else
+            log_warning "工具可能存在问题，建议重新安装"
+        fi
+        
     else
         log_warning "1panel-migrator 未安装"
         log_info "请运行: $0 install 进行自动安装"
