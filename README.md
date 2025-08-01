@@ -41,8 +41,11 @@ Linux 常自用shell脚本.
   ```
   bash <(wget --no-check-certificate -qO- 'https://iilog.com/cf-security-level.sh') admin@badiu.com yourCfApiKey yourZoneId under_attack
   ```
-
-## 获取阿里CDT已使用的流量(beta)
+## 1panel V2 升级脚本
+ ```
+ bash <(wget --no-check-certificate -qO- 'https://raw.githubusercontent.com/tanpengsccd/onekey-install-shell/refs/heads/main/1panelV2Upgrade.sh')  upgrade-master
+ ```
+## 获取阿里CDT已使用的流量(beta) 不可用
 ```
 export ALICDTCookie='_samesite_flag_=true; cookie2=XXXXXX;.....'
 export ALICDTBody='sec_token=xxxxxxxxxxx'
