@@ -1,28 +1,4 @@
 #!/bin/bash
-# 显示设备详细信息
-show_disk_info() {
-    local disk=$1
-    local size=$(lsblk -nd -o SIZE /dev/$disk 2>/dev/null || echo 'unknown')
-    local model=$(lsblk -nd -o MODEL /dev/$disk 2>/dev/null || echo 'unknown')
-    local is_removable=$(cat /sys/block/$disk/removable 2>/dev/null || echo 0)
-    local device_type=$(udevadm info --query=property --name=/dev/$disk 2>/dev/null | grep "ID_BUS=" | cut -d= -f2)
-    
-    local info_tags=""
-    if [ "$is_removable" = "1" ]; then
-        info_tags="${info_tags}[可移动]"
-    fi
-    if [ "$device_type" = "usb" ]; then
-        info_tags="${info_tags}[USB]"
-    fi
-    if [ -z "$info_tags" ]; then
-        info_tags="[内置]"
-    fi
-    echo "  /dev/$disk ($size) $info_tags - $model"
-    # 如果没有指定具体硬盘检查，显示SMART摘要信息
-    if [ -z "$CHECK_DISK" ] || [ "$CHECK_DISK" = "$disk" ]; then
-        get_smart_summary "$disk"
-    fi
-}#!/bin/bash
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 LANG=en_US.UTF-8
@@ -128,19 +104,6 @@ get_internal_disks() {
             fi
             
             if [ "$should_include" = true ]; then
-                # 获取设备大小和类型信息
-                local size=$(lsblk -nd -o SIZE /dev/$disk 2>/dev/null || echo 'unknown')
-                local model=$(lsblk -nd -o MODEL /dev/$disk 2>/dev/null || echo 'unknown')
-                local device_info="$disk"
-                
-                # 添加设备类型标记
-                if [ "$is_removable" = "1" ]; then
-                    device_info="${device_info}[可移动]"
-                fi
-                if [ "$is_usb_device" = true ]; then
-                    device_info="${device_info}[USB]"
-                fi
-                
                 internal_disks="$internal_disks $disk"
             fi
         fi
@@ -300,6 +263,33 @@ show_detailed_smart() {
     echo "+----------------------------------------------------------------------"
 }
 
+# 显示设备详细信息
+show_disk_info() {
+    local disk=$1
+    local size=$(lsblk -nd -o SIZE /dev/$disk 2>/dev/null || echo 'unknown')
+    local model=$(lsblk -nd -o MODEL /dev/$disk 2>/dev/null || echo 'unknown')
+    local is_removable=$(cat /sys/block/$disk/removable 2>/dev/null || echo 0)
+    local device_type=$(udevadm info --query=property --name=/dev/$disk 2>/dev/null | grep "ID_BUS=" | cut -d= -f2)
+    
+    local info_tags=""
+    if [ "$is_removable" = "1" ]; then
+        info_tags="${info_tags}[可移动]"
+    fi
+    if [ "$device_type" = "usb" ]; then
+        info_tags="${info_tags}[USB]"
+    fi
+    if [ -z "$info_tags" ]; then
+        info_tags="[内置]"
+    fi
+    
+    echo "  /dev/$disk ($size) $info_tags - $model"
+    
+    # 如果没有指定具体硬盘检查，显示SMART摘要信息
+    if [ -z "$CHECK_DISK" ] || [ "$CHECK_DISK" = "$disk" ]; then
+        get_smart_summary "$disk"
+    fi
+}
+
 # 显示磁盘挂载状态
 show_disk_status() {
     echo "
@@ -369,9 +359,9 @@ show_usage() {
     
     echo "
 +----------------------------------------------------------------------
-| Bt-WebPanel 自动磁盘分区挂载工具 (增强版)
+| Bt-WebPanel 自动磁盘分区挂载工具 (增强版 MOD by tanpengsccd)
 +----------------------------------------------------------------------
-| Copyright © 2015-2017 BT-SOFT(http://www.bt.cn) All rights reserved.
+| (改自宝塔自动挂载脚本 http://download.bt.cn/tools/auto_disk.sh)
 +----------------------------------------------------------------------
 | 支持硬盘类型: NVMe, SATA, IDE, VirtIO, Xen, 可移动硬盘, USB硬盘
 +----------------------------------------------------------------------
