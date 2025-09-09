@@ -1,3 +1,4 @@
+#!/bin/bash
 # 显示设备详细信息
 show_disk_info() {
     local disk=$1
@@ -16,9 +17,7 @@ show_disk_info() {
     if [ -z "$info_tags" ]; then
         info_tags="[内置]"
     fi
-    
     echo "  /dev/$disk ($size) $info_tags - $model"
-    
     # 如果没有指定具体硬盘检查，显示SMART摘要信息
     if [ -z "$CHECK_DISK" ] || [ "$CHECK_DISK" = "$disk" ]; then
         get_smart_summary "$disk"
