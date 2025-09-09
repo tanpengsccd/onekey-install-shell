@@ -9,112 +9,10 @@ ALLOW_REMOVABLE=false
 ALLOW_USB=false
 AUTO_MODE=false
 
-# 显示磁盘挂载状态
-show_disk_status() {
-    echo "
-+----------------------------------------------------------------------
-| 当前磁盘状态
-+----------------------------------------------------------------------"
-    
-    # 显示已挂载的磁盘
-    echo "已挂载的磁盘:"
-    local mounted_found=false
-    while IFS= read -r line; do
-        if [[ $line =~ ^/dev/ ]]; then
-            local device=$(echo "$line" | awk '{print $1}')
-            local mount_point=$(echo "$line" | awk '{print $6}')
-            local size=$(echo "$line" | awk '{print $2}')
-            local used=$(echo "$line" | awk '{print $3}')
-            local available=$(echo "$line" | awk '{print $4}')
-            local use_percent=$(echo "$line" | awk '{print $5}')
-            
-            # 过滤掉一些系统分区
-            if [[ ! "$mount_point" =~ ^/(dev|proc|sys|run) ]]; then
-                echo "  $device -> $mount_point ($size, 已用:$used, 可用:$available, 使用率:$use_percent)"
-                mounted_found=true
-            fi
-        fi
-    done < <(df -h | grep -v "tmpfs" | grep -v "Filesystem")
-    
-    if [ "$mounted_found" = false ]; then
-        echo "  无已挂载的数据盘"
-    fi
-    
-    echo ""
-    
-    # 显示待挂载的硬盘
-    echo "待挂载的硬盘:"
-    local all_disks=$(get_internal_disks)
-    local system_disk=$(get_system_disk)
-    local available_found=false
-    
-    if [ -n "$all_disks" ]; then
-        for disk in $all_disks; do
-            if [ "$disk" != "$system_disk" ]; then
-                # 检查是否已挂载
-                local is_mounted=$(df -h | grep "/dev/$disk" | wc -l)
-                if [ "$is_mounted" -eq 0 ]; then
-                    show_disk_info "$disk"
-                    available_found=true
-                fi
-            fi
-        done
-    fi
-    
-    if [ "$available_found" = false ]; then
-        echo "  无待挂载的硬盘"
-        echo "  (当前配置: 可移动硬盘=$ALLOW_REMOVABLE, USB硬盘=$ALLOW_USB)"
-    fi
-    
-    echo ""
-    echo "系统盘: /dev/$system_disk [已排除,不会操作]"
-    echo ""
-}
-
-# 显示使用说明
-show_usage() {
-    # 先显示磁盘状态
-    show_disk_status
-    
-    echo "
-+----------------------------------------------------------------------
-| Bt-WebPanel 自动磁盘分区挂载工具 (增强版)
-+----------------------------------------------------------------------
-| Copyright © 2015-2017 BT-SOFT(http://www.bt.cn) All rights reserved.
-+----------------------------------------------------------------------
-| 支持硬盘类型: NVMe, SATA, IDE, VirtIO, Xen, 可移动硬盘, USB硬盘
-+----------------------------------------------------------------------
-
-用法: $0 [选项]
-
-选项:
-  -a, --auto             自动挂载内置硬盘 (默认行为，必须指定)
-  -r, --removable        允许识别可移动硬盘 (配合-a使用)
-  -u, --usb              允许识别USB硬盘 (配合-a使用)
-  -p, --path PATH        指定挂载路径 (默认:/www)
-  -h, --help             显示此使用说明
-
-组合使用示例:
-  $0 -a                  # 自动挂载内置硬盘
-  $0 -a -r               # 自动挂载内置和可移动硬盘
-  $0 -a -u               # 自动挂载内置和USB硬盘
-  $0 -a -r -u            # 自动挂载所有类型硬盘
-  $0 -a -p /data         # 自动挂载到/data目录
-
-注意事项:
-  • 必须使用 -a 参数才会执行自动挂载操作
-  • 脚本会自动排除系统盘，仅处理数据盘
-  • 默认只处理内置硬盘，外置设备需额外参数启用
-  • 挂载前会停止相关服务，完成后自动重启
-
-+----------------------------------------------------------------------
-"
-}
-
-# 如果没有参数，显示使用说明
+# 如果没有参数，推迟显示使用说明到函数定义之后
+SHOW_USAGE_ONLY=false
 if [ $# -eq 0 ]; then
-    show_usage
-    exit 0
+    SHOW_USAGE_ONLY=true
 fi
 
 # 解析命令行参数
@@ -141,8 +39,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            show_usage
-            exit 0
+            SHOW_USAGE_ONLY=true
+            break
             ;;
         *)
             echo "错误: 未知参数 '$1'"
@@ -151,13 +49,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# 检查是否指定了自动模式
-if [ "$AUTO_MODE" = false ]; then
-    echo "错误: 必须使用 -a 或 --auto 参数才能执行自动挂载操作"
-    echo "使用 '$0 -h' 查看使用说明"
-    exit 1
-fi
 
 # 检测内置硬盘数量（改进的检测逻辑）
 get_internal_disks() {
@@ -271,6 +162,121 @@ show_disk_info() {
     echo "  /dev/$disk ($size) $info_tags - $model"
 }
 
+# 显示磁盘挂载状态
+show_disk_status() {
+    echo "
++----------------------------------------------------------------------
+| 当前磁盘状态
++----------------------------------------------------------------------"
+    
+    # 显示已挂载的磁盘
+    echo "已挂载的磁盘:"
+    local mounted_found=false
+    while IFS= read -r line; do
+        if [[ $line =~ ^/dev/ ]]; then
+            local device=$(echo "$line" | awk '{print $1}')
+            local mount_point=$(echo "$line" | awk '{print $6}')
+            local size=$(echo "$line" | awk '{print $2}')
+            local used=$(echo "$line" | awk '{print $3}')
+            local available=$(echo "$line" | awk '{print $4}')
+            local use_percent=$(echo "$line" | awk '{print $5}')
+            
+            # 过滤掉一些系统分区
+            if [[ ! "$mount_point" =~ ^/(dev|proc|sys|run) ]]; then
+                echo "  $device -> $mount_point ($size, 已用:$used, 可用:$available, 使用率:$use_percent)"
+                mounted_found=true
+            fi
+        fi
+    done < <(df -h | grep -v "tmpfs" | grep -v "Filesystem")
+    
+    if [ "$mounted_found" = false ]; then
+        echo "  无已挂载的数据盘"
+    fi
+    
+    echo ""
+    
+    # 显示待挂载的硬盘
+    echo "待挂载的硬盘:"
+    local all_disks=$(get_internal_disks)
+    local system_disk=$(get_system_disk)
+    local available_found=false
+    
+    if [ -n "$all_disks" ]; then
+        for disk in $all_disks; do
+            if [ "$disk" != "$system_disk" ]; then
+                # 检查是否已挂载
+                local is_mounted=$(df -h | grep "/dev/$disk" | wc -l)
+                if [ "$is_mounted" -eq 0 ]; then
+                    show_disk_info "$disk"
+                    available_found=true
+                fi
+            fi
+        done
+    fi
+    
+    if [ "$available_found" = false ]; then
+        echo "  无待挂载的硬盘"
+        echo "  (当前配置: 可移动硬盘=$ALLOW_REMOVABLE, USB硬盘=$ALLOW_USB)"
+    fi
+    
+    echo ""
+    echo "系统盘: /dev/$system_disk [已排除,不会操作]"
+    echo ""
+}
+
+# 显示使用说明
+show_usage() {
+    # 先显示磁盘状态
+    show_disk_status
+    
+    echo "
++----------------------------------------------------------------------
+| Bt-WebPanel 自动磁盘分区挂载工具 (增强版)
++----------------------------------------------------------------------
+| Copyright © 2015-2017 BT-SOFT(http://www.bt.cn) All rights reserved.
++----------------------------------------------------------------------
+| 支持硬盘类型: NVMe, SATA, IDE, VirtIO, Xen, 可移动硬盘, USB硬盘
++----------------------------------------------------------------------
+
+用法: $0 [选项]
+
+选项:
+  -a, --auto             自动挂载内置硬盘 (默认行为，必须指定)
+  -r, --removable        允许识别可移动硬盘 (配合-a使用)
+  -u, --usb              允许识别USB硬盘 (配合-a使用)
+  -p, --path PATH        指定挂载路径 (默认:/www)
+  -h, --help             显示此使用说明
+
+组合使用示例:
+  $0 -a                  # 自动挂载内置硬盘
+  $0 -a -r               # 自动挂载内置和可移动硬盘
+  $0 -a -u               # 自动挂载内置和USB硬盘
+  $0 -a -r -u            # 自动挂载所有类型硬盘
+  $0 -a -p /data         # 自动挂载到/data目录
+
+注意事项:
+  • 必须使用 -a 参数才会执行自动挂载操作
+  • 脚本会自动排除系统盘，仅处理数据盘
+  • 默认只处理内置硬盘，外置设备需额外参数启用
+  • 挂载前会停止相关服务，完成后自动重启
+
++----------------------------------------------------------------------
+"
+}
+
+# 检查是否只显示使用说明
+if [ "$SHOW_USAGE_ONLY" = true ]; then
+    show_usage
+    exit 0
+fi
+
+# 检查是否指定了自动模式
+if [ "$AUTO_MODE" = false ]; then
+    echo "错误: 必须使用 -a 或 --auto 参数才能执行自动挂载操作"
+    echo "使用 '$0 -h' 查看使用说明"
+    exit 1
+fi
+
 # 检测数据盘数量
 sysDisk=$(get_data_disks)
 
@@ -334,7 +340,7 @@ echo "
 +----------------------------------------------------------------------
 | Bt-WebPanel 自动磁盘分区挂载工具 (增强版) 
 +----------------------------------------------------------------------
-| (改自宝塔版本 http://download.bt.cn/tools/auto_disk.sh)
+| Copyright © 2015-2017 BT-SOFT(http://www.bt.cn) All rights reserved.
 +----------------------------------------------------------------------
 | 挂载目标路径: $setup_path
 | 支持硬盘类型: NVMe, SATA, IDE, VirtIO, Xen
