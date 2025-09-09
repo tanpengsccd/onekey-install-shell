@@ -1,4 +1,29 @@
-#!/bin/bash
+# 显示设备详细信息
+show_disk_info() {
+    local disk=$1
+    local size=$(lsblk -nd -o SIZE /dev/$disk 2>/dev/null || echo 'unknown')
+    local model=$(lsblk -nd -o MODEL /dev/$disk 2>/dev/null || echo 'unknown')
+    local is_removable=$(cat /sys/block/$disk/removable 2>/dev/null || echo 0)
+    local device_type=$(udevadm info --query=property --name=/dev/$disk 2>/dev/null | grep "ID_BUS=" | cut -d= -f2)
+    
+    local info_tags=""
+    if [ "$is_removable" = "1" ]; then
+        info_tags="${info_tags}[可移动]"
+    fi
+    if [ "$device_type" = "usb" ]; then
+        info_tags="${info_tags}[USB]"
+    fi
+    if [ -z "$info_tags" ]; then
+        info_tags="[内置]"
+    fi
+    
+    echo "  /dev/$disk ($size) $info_tags - $model"
+    
+    # 如果没有指定具体硬盘检查，显示SMART摘要信息
+    if [ -z "$CHECK_DISK" ] || [ "$CHECK_DISK" = "$disk" ]; then
+        get_smart_summary "$disk"
+    fi
+}#!/bin/bash
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 LANG=en_US.UTF-8
@@ -8,6 +33,7 @@ setup_path=/www
 ALLOW_REMOVABLE=false
 ALLOW_USB=false
 AUTO_MODE=false
+CHECK_DISK=""
 
 # 如果没有参数，推迟显示使用说明到函数定义之后
 SHOW_USAGE_ONLY=false
@@ -36,6 +62,16 @@ while [[ $# -gt 0 ]]; do
                 echo "错误: -p|--path 需要指定路径参数"
                 exit 1
             fi
+            shift 2
+            ;;
+        -d|--disk)
+            CHECK_DISK="$2"
+            if [[ -z "$CHECK_DISK" ]]; then
+                echo "错误: -d|--disk 需要指定硬盘名称 (如: sda, nvme0n1)"
+                exit 1
+            fi
+            # 去掉可能的 /dev/ 前缀
+            CHECK_DISK=${CHECK_DISK#/dev/}
             shift 2
             ;;
         -h|--help)
@@ -140,26 +176,129 @@ get_data_disks() {
     echo $data_disks | xargs
 }
 
-# 显示设备详细信息
-show_disk_info() {
+# 检查smartctl工具是否安装
+check_smartctl() {
+    if ! command -v smartctl &> /dev/null; then
+        echo "  [警告] smartctl 工具未安装，无法显示SMART信息"
+        echo "  安装方法: apt-get install smartmontools 或 yum install smartmontools"
+        return 1
+    fi
+    return 0
+}
+
+# 获取硬盘SMART信息摘要
+get_smart_summary() {
     local disk=$1
-    local size=$(lsblk -nd -o SIZE /dev/$disk 2>/dev/null || echo 'unknown')
-    local model=$(lsblk -nd -o MODEL /dev/$disk 2>/dev/null || echo 'unknown')
-    local is_removable=$(cat /sys/block/$disk/removable 2>/dev/null || echo 0)
-    local device_type=$(udevadm info --query=property --name=/dev/$disk 2>/dev/null | grep "ID_BUS=" | cut -d= -f2)
-    
-    local info_tags=""
-    if [ "$is_removable" = "1" ]; then
-        info_tags="${info_tags}[可移动]"
-    fi
-    if [ "$device_type" = "usb" ]; then
-        info_tags="${info_tags}[USB]"
-    fi
-    if [ -z "$info_tags" ]; then
-        info_tags="[内置]"
+    if ! check_smartctl >/dev/null 2>&1; then
+        echo "    SMART: 未安装smartmontools"
+        return
     fi
     
-    echo "  /dev/$disk ($size) $info_tags - $model"
+    # 检查SMART是否支持和启用
+    local smart_available=$(smartctl -i /dev/$disk 2>/dev/null | grep -i "SMART support is:" | grep "Available")
+    local smart_enabled=$(smartctl -i /dev/$disk 2>/dev/null | grep -i "SMART support is:" | grep "Enabled")
+    
+    if [ -z "$smart_available" ]; then
+        echo "    SMART: 不支持"
+        return
+    fi
+    
+    if [ -z "$smart_enabled" ]; then
+        echo "    SMART: 支持但未启用"
+        return
+    fi
+    
+    # 获取关键SMART信息
+    local smart_health=$(smartctl -H /dev/$disk 2>/dev/null | grep -i "overall-health" | awk -F': ' '{print $2}')
+    local power_on_hours=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Power_On_Hours" | awk '{print $10}')
+    local power_cycle_count=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Power_Cycle_Count" | awk '{print $10}')
+    local temperature=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Temperature_Celsius" | awk '{print $10}' | head -1)
+    local reallocated_sectors=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Reallocated_Sector" | awk '{print $10}')
+    
+    # 对于NVMe硬盘，使用不同的命令
+    if [[ $disk =~ nvme ]]; then
+        smart_health=$(smartctl -H /dev/$disk 2>/dev/null | grep -i "critical warning" | awk -F': ' '{print $2}')
+        if [ "$smart_health" = "0x00" ]; then
+            smart_health="PASSED"
+        else
+            smart_health="WARNING"
+        fi
+        power_on_hours=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Power On Hours" | awk -F': ' '{print $2}' | awk '{print $1}')
+        temperature=$(smartctl -A /dev/$disk 2>/dev/null | grep -i "Temperature:" | awk -F': ' '{print $2}' | awk '{print $1}')
+    fi
+    
+    echo "    SMART: 健康=${smart_health:-N/A}"
+    if [ -n "$power_on_hours" ] && [ "$power_on_hours" != "N/A" ]; then
+        # 将小时转换为更友好的格式
+        local days=$((power_on_hours / 24))
+        echo "           通电时间=${power_on_hours}小时 (约${days}天)"
+    fi
+    if [ -n "$temperature" ] && [ "$temperature" != "N/A" ]; then
+        echo "           温度=${temperature}°C"
+    fi
+    if [ -n "$power_cycle_count" ] && [ "$power_cycle_count" != "N/A" ]; then
+        echo "           开机次数=${power_cycle_count}次"
+    fi
+    if [ -n "$reallocated_sectors" ] && [ "$reallocated_sectors" != "N/A" ] && [ "$reallocated_sectors" != "0" ]; then
+        echo "           重新分配扇区=${reallocated_sectors} [需关注]"
+    fi
+}
+
+# 显示详细SMART信息
+show_detailed_smart() {
+    local disk=$1
+    
+    echo "
++----------------------------------------------------------------------
+| 硬盘 /dev/$disk 详细SMART信息
++----------------------------------------------------------------------"
+    
+    if ! check_smartctl; then
+        echo "请先安装 smartmontools:"
+        echo "  Ubuntu/Debian: apt-get install smartmontools"
+        echo "  CentOS/RHEL:   yum install smartmontools"
+        return 1
+    fi
+    
+    # 检查硬盘是否存在
+    if [ ! -b "/dev/$disk" ]; then
+        echo "错误: 硬盘 /dev/$disk 不存在"
+        return 1
+    fi
+    
+    # 显示基本信息
+    echo "硬盘基本信息:"
+    smartctl -i /dev/$disk 2>/dev/null | grep -E "(Model|Serial|Firmware|User Capacity|Sector Size)" | sed 's/^/  /'
+    
+    echo ""
+    echo "SMART健康状态:"
+    smartctl -H /dev/$disk 2>/dev/null | sed 's/^/  /'
+    
+    echo ""
+    echo "关键SMART属性:"
+    if [[ $disk =~ nvme ]]; then
+        # NVMe设备
+        smartctl -A /dev/$disk 2>/dev/null | grep -E "(Critical Warning|Temperature|Available Spare|Percentage Used|Data Units|Power On|Power Cycle|Unsafe Shutdown)" | sed 's/^/  /'
+    else
+        # 传统SATA/SAS设备
+        smartctl -A /dev/$disk 2>/dev/null | grep -E "(Reallocated_Sector|Spin_Up_Time|Start_Stop_Count|Reallocated_Event|Current_Pending|Offline_Uncorrectable|UDMA_CRC_Error|Power_On_Hours|Power_Cycle_Count|Temperature|SATA_Downshift)" | sed 's/^/  /'
+    fi
+    
+    echo ""
+    echo "错误日志 (最近10条):"
+    local error_count=$(smartctl -l error /dev/$disk 2>/dev/null | grep -c "Error [0-9]" || echo 0)
+    if [ "$error_count" -gt 0 ]; then
+        smartctl -l error /dev/$disk 2>/dev/null | head -20 | sed 's/^/  /'
+        echo "  总错误数: $error_count"
+    else
+        echo "  无错误记录"
+    fi
+    
+    echo ""
+    echo "自检测试状态:"
+    smartctl -l selftest /dev/$disk 2>/dev/null | head -10 | sed 's/^/  /'
+    
+    echo "+----------------------------------------------------------------------"
 }
 
 # 显示磁盘挂载状态
@@ -245,14 +384,18 @@ show_usage() {
   -r, --removable        允许识别可移动硬盘 (配合-a使用)
   -u, --usb              允许识别USB硬盘 (配合-a使用)
   -p, --path PATH        指定挂载路径 (默认:/www)
+  -d, --disk DISK        查看指定硬盘的详细SMART信息 (如: sda, nvme0n1)
   -h, --help             显示此使用说明
 
 组合使用示例:
+  $0                     # 显示磁盘状态和SMART摘要
   $0 -a                  # 自动挂载内置硬盘
   $0 -a -r               # 自动挂载内置和可移动硬盘
   $0 -a -u               # 自动挂载内置和USB硬盘
   $0 -a -r -u            # 自动挂载所有类型硬盘
   $0 -a -p /data         # 自动挂载到/data目录
+  $0 -d sda              # 查看sda硬盘的详细SMART信息
+  $0 -d nvme0n1          # 查看nvme0n1硬盘的详细SMART信息
 
 注意事项:
   • 必须使用 -a 参数才会执行自动挂载操作
@@ -264,9 +407,18 @@ show_usage() {
 "
 }
 
-# 检查是否只显示使用说明
-if [ "$SHOW_USAGE_ONLY" = true ]; then
+# 检查是否只显示使用说明或检查指定硬盘
+if [ "$SHOW_USAGE_ONLY" = true ] && [ -n "$CHECK_DISK" ]; then
+    # 显示指定硬盘的详细SMART信息
+    show_detailed_smart "$CHECK_DISK"
+    exit 0
+elif [ "$SHOW_USAGE_ONLY" = true ]; then
+    # 显示使用说明（包含SMART摘要）
     show_usage
+    exit 0
+elif [ -n "$CHECK_DISK" ]; then
+    # 仅检查指定硬盘
+    show_detailed_smart "$CHECK_DISK"
     exit 0
 fi
 
