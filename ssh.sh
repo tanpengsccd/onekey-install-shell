@@ -2,7 +2,7 @@
 #=============================================================
 # 在https://github.com/P3TERX/SSH_Key_Installer基础上 做了功能增强 https://github.com/tanpengsccd/onekey-install-shell/ssh.sh
 # Description: Install SSH keys via GitHub, URL or local files
-# Version: 1.0.1
+# Version: 1.0.2
 # Author: P3TERX  mod by tanpengsccd
 # Blog: https://p3terx.com
 #=============================================================
@@ -28,7 +28,7 @@ Options:
   -u	Get the public key from the URL, the arguments is the URL
   -f	Get the public key from the local file, the arguments is the local file path
   -p	Change SSH port, the arguments is port number
-  -d	'y' will disable remote password login",'n' will enable remote password login
+  -d	'y' will disable remote password login, 'n' will enable remote password login
 "
 }
 
@@ -68,7 +68,7 @@ get_loacl_key() {
         read -e -p "Please enter the path:" KEY_PATH
         [ "${KEY_PATH}" == '' ] && echo -e "${ERROR} Invalid input." && exit 1
     fi
-    echo -e "${INFO} Get key from $(${KEY_PATH})..."
+    echo -e "${INFO} Get key from ${KEY_PATH}..."
     PUB_KEY=$(cat ${KEY_PATH})
 }
 
@@ -143,7 +143,7 @@ change_port() {
         if grep -q "^[[:space:]]*Port" "/etc/ssh/sshd_config"; then
             $SUDO sed -i "s@^[[:space:]]*Port.*@Port ${SSH_PORT}@" /etc/ssh/sshd_config
         else
-            $SUDO echo "Port ${SSH_PORT}" >>/etc/ssh/sshd_config
+            echo "Port ${SSH_PORT}" | $SUDO tee -a /etc/ssh/sshd_config >/dev/null
         fi
         [[ $(grep "^Port ${SSH_PORT}" "/etc/ssh/sshd_config") ]] && {
             echo -e "${INFO} SSH port changed successfully!"
