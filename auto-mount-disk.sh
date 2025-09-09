@@ -4,8 +4,6 @@ export PATH
 LANG=en_US.UTF-8
 setup_path=/www
 
-# 改自 bash <(wget --no-check-certificate -qO- 'http://download.bt.cn/tools/auto_disk.sh') 
-
 # 检测内置硬盘数量（改进的检测逻辑）
 get_internal_disks() {
     # 获取所有块设备，排除分区、loop设备、ram设备等
@@ -105,9 +103,9 @@ fi
 
 echo "
 +----------------------------------------------------------------------
-| Bt-WebPanel Automatic disk partitioning tool (Enhanced Version)
+| Bt-WebPanel Automatic disk partitioning tool （MOD by tanpengsccd）
 +----------------------------------------------------------------------
-| Copyright © 2015-2017 BT-SOFT(http://www.bt.cn) All rights reserved.
+| (改自 http://download.bt.cn/tools/auto_disk.sh)
 +----------------------------------------------------------------------
 | Auto mount partition disk to $setup_path
 | 支持硬盘类型: NVMe, SATA, IDE, VirtIO, Xen
