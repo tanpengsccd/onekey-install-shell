@@ -1,6 +1,11 @@
 # onekey-install-shell
 Linux 常自用shell脚本.
 > 由于大陆地方访问GitHub有间接性阻断,所以使用镜像加速地址 https://iilog.com , 如不放心代码可自行替换替换URL地址 "https://iilog.com" ->  "https://raw.github.com/tanpengsccd/onekey-install-shell/master" .
+## 配置自动挂载硬盘（改自宝塔挂载脚本）
+ ```shell
+ bash <(curl -fsSL iilog.com/auto-mount-disk.sh)  # 查看 已经挂载 和 可挂载的硬盘
+ bash <(curl -fsSL iilog.com/auto-mount-disk.sh)  -a # 自动挂载
+ ```
 ## 更改服务器的出栈优先级为IPv4/IPv6
 
   1. 设置为IPv4优先
@@ -43,12 +48,6 @@ Linux 常自用shell脚本.
   ```
 ## 1panel V2 升级脚本
  ```
- bash <(wget --no-check-certificate -qO- 'https://raw.githubusercontent.com/tanpengsccd/onekey-install-shell/refs/heads/main/1panelV2Upgrade.sh')  upgrade-master
+ bash <(wget --no-check-certificate -qO- 'https://iilog.com/1panelV2Upgrade.sh')  upgrade-master
  ```
-## 获取阿里CDT已使用的流量(beta) 不可用
-```
-export ALICDTCookie='_samesite_flag_=true; cookie2=XXXXXX;.....'
-export ALICDTBody='sec_token=xxxxxxxxxxx'
 
-bash <(wget --no-check-certificate -qO- 'https://iilog.com/ali-cdt-traffic-check.sh') 
-```
