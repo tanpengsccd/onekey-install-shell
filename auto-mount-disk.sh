@@ -49,6 +49,16 @@ while [[ $# -gt 0 ]]; do
             CHECK_DISK=${CHECK_DISK#/dev/}
             shift 2
             ;;
+        -s|--select)
+            SELECT_DISK="$2"
+            if [[ -z "$SELECT_DISK" ]]; then
+                echo "错误: -s|--select 需要指定硬盘名称 (如: sda, nvme0n1)"
+                exit 1
+            fi
+            # 去掉可能的 /dev/ 前缀
+            SELECT_DISK=${SELECT_DISK#/dev/}
+            shift 2
+            ;;
         -h|--help)
             SHOW_USAGE_ONLY=true
             break
@@ -136,6 +146,50 @@ get_data_disks() {
     done
     
     echo $data_disks | xargs
+}
+
+# 获取分区的UUID
+get_partition_uuid() {
+    local partition=$1
+    blkid /dev/$partition 2>/dev/null | grep -o 'UUID="[^"]*"' | cut -d'"' -f2 | head -1
+}
+
+# 交互式选择硬盘
+select_disk_interactive() {
+    local available_disks=$(get_data_disks)
+    local disk_array=($available_disks)
+    local disk_count=${#disk_array[@]}
+
+    if [ $disk_count -eq 0 ]; then
+        echo "错误: 没有可用的数据盘"
+        return 1
+    elif [ $disk_count -eq 1 ]; then
+        echo "只发现一块数据盘: ${disk_array[0]}"
+        echo "${disk_array[0]}"
+        return 0
+    fi
+
+    echo "发现多块数据盘，请选择要挂载的硬盘:"
+    echo ""
+
+    local i=1
+    for disk in $available_disks; do
+        echo "  [$i] /dev/$disk"
+        show_disk_info "$disk"
+        echo ""
+        ((i++))
+    done
+
+    while true; do
+        read -p "请输入选择 (1-$disk_count): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$disk_count" ]; then
+            local selected_index=$((choice - 1))
+            echo "${disk_array[$selected_index]}"
+            return 0
+        else
+            echo "错误: 请输入有效的数字 (1-$disk_count)"
+        fi
+    done
 }
 
 # 检查smartctl工具是否安装
@@ -283,7 +337,31 @@ show_disk_info() {
     fi
     
     echo "  /dev/$disk ($size) $info_tags - $model"
-    
+
+    # 显示UUID信息
+    local partition1="${disk}1"
+    if [[ $disk =~ nvme ]]; then
+        partition1="${disk}p1"
+    fi
+
+    if [ -b "/dev/${partition1}" ]; then
+        # 有分区的情况
+        local partition_uuid=$(get_partition_uuid "${partition1}")
+        if [ -n "$partition_uuid" ]; then
+            echo "    分区UUID: $partition_uuid"
+        else
+            echo "    分区UUID: 未检测到"
+        fi
+    else
+        # 检查整个硬盘是否有文件系统UUID（无分区表）
+        local disk_uuid=$(blkid /dev/$disk 2>/dev/null | grep -o 'UUID="[^"]*"' | cut -d'"' -f2 | head -1)
+        if [ -n "$disk_uuid" ]; then
+            echo "    硬盘UUID: $disk_uuid (无分区表)"
+        else
+            echo "    分区状态: 未分区"
+        fi
+    fi
+
     # 如果没有指定具体硬盘检查，显示SMART摘要信息
     if [ -z "$CHECK_DISK" ] || [ "$CHECK_DISK" = "$disk" ]; then
         get_smart_summary "$disk"
@@ -374,6 +452,7 @@ show_usage() {
   -u, --usb              允许识别USB硬盘 (配合-a使用)
   -p, --path PATH        指定挂载路径 (默认:/www)
   -d, --disk DISK        查看指定硬盘的详细SMART信息 (如: sda, nvme0n1)
+  -s, --select DISK      直接指定要挂载的硬盘 (如: sda, nvme0n1)
   -h, --help             显示此使用说明
 
 组合使用示例:
@@ -383,6 +462,7 @@ show_usage() {
   $0 -a -u               # 自动挂载内置和USB硬盘
   $0 -a -r -u            # 自动挂载所有类型硬盘
   $0 -a -p /data         # 自动挂载到/data目录
+  $0 -a -s sda           # 直接挂载指定硬盘sda
   $0 -d sda              # 查看sda硬盘的详细SMART信息
   $0 -d nvme0n1          # 查看nvme0n1硬盘的详细SMART信息
 
@@ -418,46 +498,42 @@ if [ "$AUTO_MODE" = false ]; then
     exit 1
 fi
 
-# 检测数据盘数量
-sysDisk=$(get_data_disks)
+# 处理硬盘选择
+if [ -n "$SELECT_DISK" ]; then
+    # 验证指定的硬盘是否存在于可用数据盘中
+    available_disks=$(get_data_disks)
+    if [[ " $available_disks " =~ " $SELECT_DISK " ]]; then
+        sysDisk="$SELECT_DISK"
+        echo "已指定使用硬盘: /dev/$SELECT_DISK"
+    else
+        echo "错误: 指定的硬盘 /dev/$SELECT_DISK 不在可用数据盘列表中"
+        echo "可用数据盘: $available_disks"
+        exit 1
+    fi
+else
+    # 检测数据盘数量
+    all_data_disks=$(get_data_disks)
 
-if [ -z "$sysDisk" ]; then
-    echo -e "错误: 未发现可用的数据盘"
-    echo -e ""
-    echo -e "当前硬盘检测配置:"
-    echo -e "  自动模式: $AUTO_MODE"
-    echo -e "  允许可移动硬盘: $ALLOW_REMOVABLE"
-    echo -e "  允许USB硬盘: $ALLOW_USB"
-    echo -e "  挂载路径: $setup_path"
-    echo -e ""
-    echo -e "当前所有硬盘列表:"
-    local all_disks=$(get_internal_disks)
-    if [ -n "$all_disks" ]; then
-        for disk in $all_disks; do
-            show_disk_info "$disk"
-        done
+    if [ -z "$all_data_disks" ]; then
+        echo "错误: 未发现可用的数据盘"
+        echo "当前硬盘检测配置:"
+        echo "  自动模式: $AUTO_MODE"
+        echo "  允许可移动硬盘: $ALLOW_REMOVABLE"
+        echo "  允许USB硬盘: $ALLOW_USB"
+        echo "  挂载路径: $setup_path"
+        exit 1
     else
-        echo "  未发现任何符合条件的硬盘"
+        # 如果有多块硬盘，进行交互式选择
+        selected_disk=$(select_disk_interactive)
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
+        sysDisk="$selected_disk"
     fi
-    echo -e "系统盘: /dev/$(get_system_disk) [已排除]"
-    echo -e ""
-    echo -e "解决建议:"
-    if [ "$ALLOW_REMOVABLE" = false ] && [ "$ALLOW_USB" = false ]; then
-        echo -e "  如需包含外置硬盘，请尝试:"
-        echo -e "    $0 -a -r     # 包含可移动硬盘"
-        echo -e "    $0 -a -u     # 包含USB硬盘"
-        echo -e "    $0 -a -r -u  # 包含所有外置硬盘"
-    else
-        echo -e "  请检查是否有其他可用硬盘连接到系统"
-    fi
-    echo -e ""
-    exit 1
 fi
 
-echo -e "发现以下可用的数据盘:"
-for disk in $sysDisk; do
-    show_disk_info "$disk"
-done
+echo -e "将要挂载的数据盘:"
+show_disk_info "$sysDisk"
 echo -e ""
 
 #检测/www目录是否已挂载磁盘
@@ -489,36 +565,47 @@ echo "
 +----------------------------------------------------------------------
 "
 
-#数据盘自动分区（修改后的函数）
+#数据盘自动分区（修改为使用UUID挂载）
 fdiskP(){
-	for disk in $sysDisk; do
-		echo "正在处理磁盘: /dev/$disk"
-		
-		#判断指定目录是否被挂载
-		isR=`df -P|grep $setup_path`
-		if [ "$isR" != "" ];then
-			echo "Error: The $setup_path directory has been mounted."
-			return;
-		fi
-		
-		# 检查第一个分区是否已挂载
-		partition1="${disk}1"
-		if [[ $disk =~ nvme ]]; then
-			partition1="${disk}p1"
-		fi
-		
-		isM=`df -P|grep "/dev/${partition1}"`
-		if [ "$isM" != "" ];then
-			echo "/dev/${partition1} has been mounted."
-			continue;
-		fi
+	disk=$sysDisk
+	echo "正在处理磁盘: /dev/$disk"
+
+	#判断指定目录是否被挂载
+	isR=`df -P|grep $setup_path`
+	if [ "$isR" != "" ];then
+		echo "Error: The $setup_path directory has been mounted."
+		return;
+	fi
+
+	# 检查分区或整个硬盘是否已挂载
+	partition1="${disk}1"
+	if [[ $disk =~ nvme ]]; then
+		partition1="${disk}p1"
+	fi
+
+	# 检查分区挂载
+	isM=`df -P|grep "/dev/${partition1}"`
+	if [ "$isM" != "" ];then
+		echo "/dev/${partition1} has been mounted."
+		return;
+	fi
+
+	# 检查整个硬盘挂载（无分区表情况）
+	isM_disk=`df -P|grep "/dev/${disk}"`
+	if [ "$isM_disk" != "" ];then
+		echo "/dev/${disk} has been mounted."
+		return;
+	fi
 			
-		#判断是否存在未分区磁盘
-		isP=`fdisk -l /dev/$disk 2>/dev/null |grep -v 'bytes'|grep "${disk}[p]*[1-9]"`
-		if [ "$isP" = "" ];then
-			echo "开始对 /dev/$disk 进行分区..."
-			#开始分区
-			fdisk -S 56 /dev/$disk << EOF
+	#判断磁盘状态：分区、无分区表文件系统、或完全未格式化
+	isP=`fdisk -l /dev/$disk 2>/dev/null |grep -v 'bytes'|grep "${disk}[p]*[1-9]"`
+	disk_uuid=$(blkid /dev/$disk 2>/dev/null | grep -o 'UUID="[^"]*"' | cut -d'"' -f2 | head -1)
+
+	if [ "$isP" = "" ] && [ -z "$disk_uuid" ];then
+		# 完全未格式化的硬盘，需要分区
+		echo "开始对 /dev/$disk 进行分区..."
+		#开始分区
+		fdisk -S 56 /dev/$disk << EOF
 n
 p
 1
@@ -526,58 +613,101 @@ p
 
 wq
 EOF
-			sleep 5
-			#检查是否分区成功
-			checkP=`fdisk -l /dev/$disk 2>/dev/null |grep "/dev/${partition1}"`
-			if [ "$checkP" != "" ];then
-				echo "分区创建成功，开始格式化..."
-				#格式化分区
-				mkfs.ext4 /dev/${partition1}
-				mkdir -p $setup_path
-				#挂载分区
-				sed -i "/\/dev\/${partition1//\//\\\/}/d" /etc/fstab
-				echo "/dev/${partition1}    $setup_path    ext4    defaults    0 0" >> /etc/fstab
-				mount -a
-				df -h
-				echo "磁盘 /dev/$disk 挂载完成!"
-				return
-			else
-				echo "分区创建失败: /dev/$disk"
+		sleep 5
+		#检查是否分区成功
+		checkP=`fdisk -l /dev/$disk 2>/dev/null |grep "/dev/${partition1}"`
+		if [ "$checkP" != "" ];then
+			echo "分区创建成功，开始格式化..."
+			#格式化分区
+			mkfs.ext4 /dev/${partition1}
+			# 获取分区UUID
+			sleep 2  # 等待文件系统创建完成
+			partition_uuid=$(get_partition_uuid "${partition1}")
+			if [ -z "$partition_uuid" ]; then
+				echo "错误: 无法获取分区UUID"
+				return 1
 			fi
+			echo "分区UUID: $partition_uuid"
+			mkdir -p $setup_path
+			#使用UUID挂载分区
+			sed -i "/UUID=$partition_uuid/d" /etc/fstab
+			echo "UUID=$partition_uuid    $setup_path    ext4    defaults    0 0" >> /etc/fstab
+			mount -a
+			df -h
+			echo "磁盘 /dev/$disk 使用UUID挂载完成!"
+			return
 		else
-			echo "磁盘 /dev/$disk 已存在分区"
-			#判断是否存在Windows磁盘分区
-			isN=`fdisk -l /dev/$disk 2>/dev/null |grep -v 'bytes'|grep -v "NTFS"|grep -v "FAT32"`
-			if [ "$isN" = "" ];then
-				echo 'Warning: The Windows partition was detected. For your data security, Mount manually.';
-				continue;
-			fi
-			
-			#挂载已有分区
-			checkR=`df -P|grep "/dev/$disk"`
-			if [ "$checkR" = "" ];then
-				echo "挂载现有分区 /dev/${partition1}..."
+			echo "分区创建失败: /dev/$disk"
+		fi
+	elif [ "$isP" = "" ] && [ -n "$disk_uuid" ];then
+		# 无分区表但有文件系统的硬盘，直接挂载
+		echo "检测到无分区表的文件系统: /dev/$disk (UUID: $disk_uuid)"
+		mkdir -p $setup_path
+		# 清理旧的挂载条目
+		sed -i "/\/dev\/${disk}/d" /etc/fstab
+		sed -i "/UUID=$disk_uuid/d" /etc/fstab
+		echo "UUID=$disk_uuid    $setup_path    ext4    defaults    0 0" >> /etc/fstab
+		mount -a
+		df -h
+
+		# 测试写入权限
+		echo 'True' > $setup_path/checkD.pl
+		if [ ! -f $setup_path/checkD.pl ];then
+			echo "分区不可写，重新挂载..."
+			umount $setup_path 2>/dev/null
+			mount -a
+			df -h
+		else
+			rm -f $setup_path/checkD.pl
+			echo "硬盘 /dev/$disk 使用UUID挂载完成!"
+			return
+		fi
+	else
+		echo "磁盘 /dev/$disk 已存在分区"
+		#判断是否存在Windows磁盘分区
+		isN=`fdisk -l /dev/$disk 2>/dev/null |grep -v 'bytes'|grep -v "NTFS"|grep -v "FAT32"`
+		if [ "$isN" = "" ];then
+			echo 'Warning: The Windows partition was detected. For your data security, Mount manually.';
+			return;
+		fi
+
+		#挂载已有分区
+		checkR=`df -P|grep "/dev/$disk"`
+		if [ "$checkR" = "" ];then
+			echo "挂载现有分区 /dev/${partition1}..."
+			# 获取现有分区的UUID
+			partition_uuid=$(get_partition_uuid "${partition1}")
+			if [ -z "$partition_uuid" ]; then
+				echo "错误: 无法获取分区UUID，将使用设备名挂载"
 				mkdir -p $setup_path
 				sed -i "/\/dev\/${partition1//\//\\\/}/d" /etc/fstab
 				echo "/dev/${partition1}    $setup_path    ext4    defaults    0 0" >> /etc/fstab
-				mount -a
-				df -h
-			fi
-			
-			#清理不可写分区
-			echo 'True' > $setup_path/checkD.pl
-			if [ ! -f $setup_path/checkD.pl ];then
-				echo "分区不可写，重新挂载..."
-				sed -i "/\/dev\/${partition1//\//\\\/}/d" /etc/fstab
-				mount -a
-				df -h
 			else
-				rm -f $setup_path/checkD.pl
-				echo "磁盘 /dev/$disk 挂载完成!"
-				return
+				echo "分区UUID: $partition_uuid"
+				mkdir -p $setup_path
+				# 清理旧的挂载条目
+				sed -i "/\/dev\/${partition1//\//\\\/}/d" /etc/fstab
+				sed -i "/UUID=$partition_uuid/d" /etc/fstab
+				echo "UUID=$partition_uuid    $setup_path    ext4    defaults    0 0" >> /etc/fstab
 			fi
+			mount -a
+			df -h
 		fi
-	done
+
+		#清理不可写分区
+		echo 'True' > $setup_path/checkD.pl
+		if [ ! -f $setup_path/checkD.pl ];then
+			echo "分区不可写，重新挂载..."
+			# 重新挂载
+			umount $setup_path 2>/dev/null
+			mount -a
+			df -h
+		else
+			rm -f $setup_path/checkD.pl
+			echo "磁盘 /dev/$disk 使用UUID挂载完成!"
+			return
+		fi
+	fi
 }
 
 stop_service(){
@@ -663,7 +793,7 @@ start_service(){
 
 while [ "$go" != 'y' ] && [ "$go" != 'n' ]
 do
-	read -p "确认要将数据盘挂载到 $setup_path 目录吗? (y/n): " go;
+	read -p "确认要将硬盘 /dev/$sysDisk 挂载到 $setup_path 目录吗? (y/n): " go;
 done
 
 if [ "$go" = 'n' ];then
@@ -672,9 +802,8 @@ if [ "$go" = 'n' ];then
 fi
 
 if [ -f "/etc/init.d/bt" ] && [ -f "/www/server/panel/data/port.pl" ]; then
-	# 获取第一个数据盘用于计算空间
-	first_disk=$(echo $sysDisk | awk '{print $1}')
-	diskFree=`cat /proc/partitions |grep ${first_disk}|awk '{print $3}'`
+	# 获取选定数据盘用于计算空间
+	diskFree=`cat /proc/partitions |grep ${sysDisk}|awk '{print $3}'`
 	wwwUse=`du -sh -k /www 2>/dev/null |awk '{print $1}' || echo 0`
 
 	if [ "${diskFree}" -lt "${wwwUse}" ]; then
