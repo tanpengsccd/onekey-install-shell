@@ -1,4534 +1,4903 @@
-# https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh 基础上添加了 microsoft.gzip  改为清华源
-#!/usr/bin/env bash
-# nixos 默认的配置不会生成 /bin/bash
-# shellcheck disable=SC2086
-
-set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
-
-# 默认密码
-DEFAULT_PASSWORD=123@@@
-
-# 用于判断 reinstall.sh 和 trans.sh 是否兼容
-SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0003
-
-# 记录要用到的 windows 程序，运行时输出删除 \r
-WINDOWS_EXES='cmd powershell wmic reg diskpart netsh bcdedit mountvol'
-
-# 强制 linux 程序输出英文，防止 grep 不到想要的内容
-# https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html
-export LC_ALL=C
-
-# 处理部分用户用 su 切换成 root 导致环境变量没 sbin 目录
-# 也能处理 cygwin bash 没有添加 -l 运行 reinstall.sh
-# 不要漏了最后的 $PATH，否则会找不到 windows 系统程序例如 diskpart
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
-
-# 记录日志，过滤含有 password 的行
-exec > >(tee >(grep -iv password >>/reinstall.log)) 2>&1
-THIS_SCRIPT=$(readlink -f "$0")
-trap 'trap_err $LINENO $?' ERR
-
-trap_err() {
-    line_no=$1
-    ret_no=$2
-
-    error "Line $line_no return $ret_no"
-    sed -n "$line_no"p "$THIS_SCRIPT"
-}
-
-usage_and_exit() {
-    if is_in_windows; then
-        reinstall_____='.\reinstall.bat'
-    else
-        reinstall_____=' ./reinstall.sh'
-    fi
-    cat <<EOF
-Usage: $reinstall_____ anolis      7|8|23
-                       opencloudos 8|9|23
-                       rocky       8|9|10
-                       oracle      8|9|10
-                       almalinux   8|9|10
-                       centos      9|10
-                       fedora      41|42
-                       nixos       25.05
-                       debian      9|10|11|12|13
-                       opensuse    15.6|tumbleweed
-                       alpine      3.19|3.20|3.21|3.22
-                       openeuler   20.03|22.03|24.03|25.09
-                       ubuntu      16.04|18.04|20.04|22.04|24.04|25.04 [--minimal]
-                       kali
-                       arch
-                       gentoo
-                       aosc
-                       fnos
-                       redhat      --img="http://access.cdn.redhat.com/xxx.qcow2"
-                       dd          --img="http://xxx.com/yyy.zzz" (raw image stores in raw/vhd/tar/gz/xz/zst)
-                       windows     --image-name="windows xxx yyy" --lang=xx-yy
-                       windows     --image-name="windows xxx yyy" --iso="http://xxx.com/xxx.iso"
-                       netboot.xyz
-
-       Options:        For Linux/Windows:
-                       [--password  PASSWORD]
-                       [--ssh-key   KEY]
-                       [--ssh-port  PORT]
-                       [--web-port  PORT]
-                       [--frpc-toml TOML]
-
-                       For Windows Only:
-                       [--allow-ping]
-                       [--rdp-port   PORT]
-                       [--add-driver INF_OR_DIR]
-
-Manual: https://github.com/bin456789/reinstall
-
-EOF
-    exit 1
-}
-
-info() {
-    local msg
-    if [ "$1" = false ]; then
-        shift
-        msg=$*
-    else
-        msg="***** $(to_upper <<<"$*") *****"
-    fi
-    echo_color_text '\e[32m' "$msg" >&2
-}
-
-warn() {
-    local msg
-    if [ "$1" = false ]; then
-        shift
-        msg=$*
-    else
-        msg="Warning: $*"
-    fi
-    echo_color_text '\e[33m' "$msg" >&2
-}
-
-error() {
-    echo_color_text '\e[31m' "***** ERROR *****" >&2
-    echo_color_text '\e[31m' "$*" >&2
-}
-
-echo_color_text() {
-    color="$1"
-    shift
-    plain="\e[0m"
-    echo -e "$color$*$plain"
-}
-
-error_and_exit() {
-    error "$@"
-    exit 1
-}
-
-curl() {
-    is_have_cmd curl || install_pkg curl
-
-    # 添加 -f, --fail，不然 404 退出码也为0
-    # 32位 cygwin 已停止更新，证书可能有问题，先添加 --insecure
-    # centos 7 curl 不支持 --retry-connrefused --retry-all-errors
-    # 因此手动 retry
-    grep -o 'http[^ ]*' <<<"$@" >&2
-    for i in $(seq 5); do
-        if command curl --insecure --connect-timeout 10 -f "$@"; then
-            return
-        else
-            ret=$?
-            # 403 404 错误，或者达到重试次数
-            if [ $ret -eq 22 ] || [ $i -eq 5 ]; then
-                return $ret
-            fi
-            sleep 1
-        fi
-    done
-}
-
-mask2cidr() {
-    local x=${1##*255.}
-    set -- 0^^^128^192^224^240^248^252^254^ $(((${#1} - ${#x}) * 2)) ${x%%.*}
-    x=${1%%"$3"*}
-    echo $(($2 + (${#x} / 4)))
-}
-
-is_in_china() {
-    [ "$force_cn" = 1 ] && return 0
-
-    if [ -z "$_loc" ]; then
-        # www.cloudflare.com/dash.cloudflare.com 国内访问的是美国服务器，而且部分地区被墙
-        # 没有ipv6 www.visa.cn
-        # 没有ipv6 www.bose.cn
-        # 没有ipv6 www.garmin.com.cn
-        # 备用 www.prologis.cn
-        # 备用 www.autodesk.com.cn
-        # 备用 www.keysight.com.cn
-        if ! _loc=$(curl -L http://www.qualcomm.cn/cdn-cgi/trace | grep '^loc=' | cut -d= -f2 | grep .); then
-            error_and_exit "Can not get location."
-        fi
-        echo "Location: $_loc" >&2
-    fi
-    [ "$_loc" = CN ]
-}
-
-is_in_windows() {
-    [ "$(uname -o)" = Cygwin ] || [ "$(uname -o)" = Msys ]
-}
-
-is_in_alpine() {
-    [ -f /etc/alpine-release ]
-}
-
-is_use_cloud_image() {
-    [ -n "$cloud_image" ] && [ "$cloud_image" = 1 ]
-}
-
-is_force_use_installer() {
-    [ -n "$installer" ] && [ "$installer" = 1 ]
-}
-
-is_use_dd() {
-    [ "$distro" = dd ]
-}
-
-is_boot_in_separate_partition() {
-    mount | grep -q ' on /boot type '
-}
-
-is_os_in_btrfs() {
-    mount | grep -q ' on / type btrfs '
-}
-
-is_os_in_subvol() {
-    subvol=$(awk '($2=="/") { print $i }' /proc/mounts | grep -o 'subvol=[^ ]*' | cut -d= -f2)
-    [ "$subvol" != / ]
-}
-
-get_os_part() {
-    awk '($2=="/") { print $1 }' /proc/mounts
-}
-
-umount_all() {
-    # windows defender 打开时，cygwin 运行 mount 很慢，但 cat /proc/mounts 很快
-    if mount_lists=$(mount | grep -w "on $1" | awk '{print $3}' | grep .); then
-        # alpine 没有 -R
-        if umount --help 2>&1 | grep -wq -- '-R'; then
-            umount -R "$1"
-        else
-            echo "$mount_lists" | tac | xargs -n1 umount
-        fi
-    fi
-}
-
-cp_to_btrfs_root() {
-    mount_dir=$tmp/reinstall-btrfs-root
-    if ! grep -q $mount_dir /proc/mounts; then
-        mkdir -p $mount_dir
-        mount "$(get_os_part)" $mount_dir -t btrfs -o subvol=/
-    fi
-    cp -rf "$@" "$mount_dir"
-}
-
-is_host_has_ipv4_and_ipv6() {
-    host=$1
-
-    install_pkg dig
-    # dig会显示cname结果，cname结果以.结尾，grep -v '\.$' 用于去除 cname 结果
-    res=$(dig +short $host A $host AAAA | grep -v '\.$')
-    # 有.表示有ipv4地址，有:表示有ipv6地址
-    grep -q \. <<<$res && grep -q : <<<$res
-}
-
-is_netboot_xyz() {
-    [ "$distro" = netboot.xyz ]
-}
-
-is_alpine_live() {
-    [ "$distro" = alpine ] && [ "$hold" = 1 ]
-}
-
-is_have_initrd() {
-    ! is_netboot_xyz
-}
-
-is_use_firmware() {
-    # shellcheck disable=SC2154
-    [ "$nextos_distro" = debian ] && ! is_virt
-}
-
-is_digit() {
-    [[ "$1" =~ ^[0-9]+$ ]]
-}
-
-is_port_valid() {
-    is_digit "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-get_host_by_url() {
-    cut -d/ -f3 <<<$1
-}
-
-get_function() {
-    declare -f "$1"
-}
-
-get_function_content() {
-    declare -f "$1" | sed '1d;2d;$d'
-}
-
-insert_into_file() {
-    file=$1
-    location=$2
-    regex_to_find=$3
-
-    line_num=$(grep -E -n "$regex_to_find" "$file" | cut -d: -f1)
-
-    found_count=$(echo "$line_num" | wc -l)
-    if [ ! "$found_count" -eq 1 ]; then
-        return 1
-    fi
-
-    case "$location" in
-    before) line_num=$((line_num - 1)) ;;
-    after) ;;
-    *) return 1 ;;
-    esac
-
-    sed -i "${line_num}r /dev/stdin" "$file"
-}
-
-test_url() {
-    test_url_real false "$@"
-}
-
-test_url_grace() {
-    test_url_real true "$@"
-}
-
-test_url_real() {
-    grace=$1
-    url=$2
-    expect_types=$3
-    var_to_eval=$4
-    info test url
-
-    failed() {
-        $grace && return 1
-        error_and_exit "$@"
-    }
-
-    tmp_file=$tmp/img-test
-
-    # TODO: 好像无法识别 nixos 官方源的跳转
-    # 有的服务器不支持 range，curl会下载整个文件
-    # 所以用 head 限制 1M
-    # 过滤 curl 23 错误（head 限制了大小）
-    # 也可用 ulimit -f 但好像 cygwin 不支持
-    # ${PIPESTATUS[n]} 表示第n个管道的返回值
-    echo $url
-    for i in $(seq 5 -1 0); do
-        if command curl --insecure --connect-timeout 10 -Lfr 0-1048575 "$url" \
-            1> >(exec head -c 1048576 >$tmp_file) \
-            2> >(exec grep -v 'curl: (23)' >&2); then
-            break
-        else
-            ret=$?
-            msg="$url not accessible"
-            case $ret in
-            22)
-                # 403 404
-                # 这里的 failed 虽然返回 1，但是不会中断脚本，因此要手动 return
-                failed "$msg"
-                return "$ret"
-                ;;
-            23)
-                # 限制了空间
-                break
-                ;;
-            *)
-                # 其他错误
-                if [ $i -eq 0 ]; then
-                    failed "$msg"
-                    return "$ret"
-                fi
-                ;;
-            esac
-            sleep 1
-        fi
-    done
-
-    # 如果要检查文件类型
-    if [ -n "$expect_types" ]; then
-        install_pkg file
-        real_type=$(file_enhanced $tmp_file)
-        echo "File type: $real_type"
-
-        # debian 9 ubuntu 16.04-20.04 可能会将 iso 识别成 raw
-        for type in $expect_types $([ "$expect_types" = iso ] && echo raw); do
-            if [[ ."$real_type" = *."$type" ]]; then
-                # 如果要设置变量
-                if [ -n "$var_to_eval" ]; then
-                    IFS=. read -r "${var_to_eval?}" "${var_to_eval}_warp" <<<"$real_type"
-                fi
-                return
-            fi
-        done
-
-        failed "$url
-Expected type: $expect_types
-Actually type: $real_type"
-    fi
-}
-
-fix_file_type() {
-    # gzip的mime有很多种写法
-    # centos7中显示为 x-gzip，在其他系统中显示为 gzip，可能还有其他
-    # 所以不用mime判断
-    # https://www.digipres.org/formats/sources/tika/formats/#application/gzip
-
-    # centos 7 上的 file 显示 qcow2 的 mime 为 application/octet-stream
-    # file debian-12-genericcloud-amd64.qcow2
-    # debian-12-genericcloud-amd64.qcow2: QEMU QCOW Image (v3), 2147483648 bytes
-    # file --mime debian-12-genericcloud-amd64.qcow2
-    # debian-12-genericcloud-amd64.qcow2: application/octet-stream; charset=binary
-
-    # --extension 不靠谱
-    # file -b /reinstall-tmp/img-test --mime-type
-    # application/x-qemu-disk
-    # file -b /reinstall-tmp/img-test --extension
-    # ???
-
-    # 1. 删除,;#
-    # DOS/MBR boot sector; partition 1: ...
-    # gzip compressed data, was ...
-    # # ISO 9660 CD-ROM filesystem data... (有些 file 版本开头输出有井号)
-
-    # 2. 删除开头的空格
-
-    # 3. 删除无意义的单词 POSIX, Unicode, UTF-8, ASCII
-    # POSIX tar archive (GNU)
-    # Unicode text, UTF-8 text
-    # UTF-8 Unicode text, with very long lines
-    # ASCII text
-
-    # 4. 下面两种都是 raw
-    # DOS/MBR boot sector
-    # x86 boot sector; partition 1: ...
-    sed -E \
-        -e 's/[,;#]//g' \
-        -e 's/^[[:space:]]*//' \
-        -e 's/(POSIX|Unicode|UTF-8|ASCII)//gi' \
-        -e 's/DOS\/MBR boot sector/raw/i' \
-        -e 's/x86 boot sector/raw/i' \
-        -e 's/Zstandard/zstd/i' \
-        -e 's/Windows imaging \(WIM\) image/wim/i' |
-        awk '{print $1}' | to_lower
-}
-
-# 不用 file -z，因为
-# 1. file -z 只能看透一层
-# 2. alpine file -z 无法看透部分镜像（前1M），例如：
-# guajibao-win10-ent-ltsc-2021-x64-cn-efi.vhd.gz
-# guajibao-win7-sp1-ent-x64-cn-efi.vhd.gz
-# win7-ent-sp1-x64-cn-efi.vhd.gz
-# 还要注意 centos 7 没有 -Z 只有 -z
-file_enhanced() {
-    file=$1
-
-    full_type=
-    while true; do
-        type="$(file -b $file | fix_file_type)"
-        full_type="$type.$full_type"
-        case "$type" in
-        xz | gzip | zstd)
-            install_pkg "$type"
-            $type -dc <"$file" | head -c 1048576 >"$file.inside"
-            mv -f "$file.inside" "$file"
-            ;;
-        tar)
-            install_pkg "$type"
-            # 隐藏 gzip: unexpected end of file 提醒
-            tar xf "$file" -O 2>/dev/null | head -c 1048576 >"$file.inside"
-            mv -f "$file.inside" "$file"
-            ;;
-        *)
-            break
-            ;;
-        esac
-    done
-    # shellcheck disable=SC2001
-    echo "$full_type" | sed 's/\.$//'
-}
-
-add_community_repo_for_alpine() {
-    local alpine_ver
-
-    # 先检查原来的repo是不是egde
-    if grep -q '^http.*/edge/main$' /etc/apk/repositories; then
-        alpine_ver=edge
-    else
-        alpine_ver=v$(cut -d. -f1,2 </etc/alpine-release)
-    fi
-
-    if ! grep -q "^http.*/$alpine_ver/community$" /etc/apk/repositories; then
-        mirror=$(grep '^http.*/main$' /etc/apk/repositories | sed 's,/[^/]*/main$,,' | head -1)
-        echo $mirror/$alpine_ver/community >>/etc/apk/repositories
-    fi
-}
-
-assert_not_in_container() {
-    _error_and_exit() {
-        error_and_exit "Not Supported OS in Container.\nPlease use https://github.com/LloydAsp/OsMutation"
-    }
-
-    is_in_windows && return
-
-    if is_have_cmd systemd-detect-virt; then
-        if systemd-detect-virt -qc; then
-            _error_and_exit
-        fi
-    else
-        if [ -d /proc/vz ] || grep -q container=lxc /proc/1/environ; then
-            _error_and_exit
-        fi
-    fi
-}
-
-# 使用 | del_br ，但返回 del_br 之前返回值
-run_with_del_cr() {
-    if false; then
-        # ash 不支持 PIPESTATUS[n]
-        res=$("$@") && ret=0 || ret=$?
-        echo "$res" | del_cr
-        return $ret
-    else
-        "$@" | del_cr
-        return ${PIPESTATUS[0]}
-    fi
-}
-
-run_with_del_cr_template() {
-    if get_function _$exe >/dev/null; then
-        run_with_del_cr _$exe "$@"
-    else
-        run_with_del_cr command $exe "$@"
-    fi
-}
-
-wmic() {
-    if is_have_cmd wmic; then
-        # 如果参数没有 GET，添加 GET，防止以下报错
-        # wmic memorychip /format:list
-        # 此级别的开关异常。
-        has_get=false
-        for i in "$@"; do
-            # 如果参数有 GET
-            if [ "$(to_upper <<<"$i")" = GET ]; then
-                has_get=true
-                break
-            fi
-        done
-
-        # 输出为 /format:list 格式
-        if $has_get; then
-            command wmic "$@" /format:list
-        else
-            command wmic "$@" get /format:list
-        fi
-        return
-    fi
-
-    # powershell wmi 默认参数
-    local namespace='root\cimv2'
-    local class=
-    local filter=
-    local props=
-
-    # namespace
-    if [[ "$(to_upper <<<"$1")" = /NAMESPACE* ]]; then
-        # 删除引号，删除 \\
-        namespace=$(cut -d: -f2 <<<"$1" | sed -e "s/[\"']//g" -e 's/\\\\//g')
-        shift
-    fi
-
-    # class
-    if [[ "$(to_upper <<<"$1")" = PATH ]]; then
-        class=$2
-        shift 2
-    else
-        case "$(to_lower <<<"$1")" in
-        nicconfig) class=Win32_NetworkAdapterConfiguration ;;
-        memorychip) class=Win32_PhysicalMemory ;;
-        *) class=Win32_$1 ;;
-        esac
-        shift
-    fi
-
-    # filter
-    if [[ "$(to_upper <<<"$1")" = WHERE ]]; then
-        filter=$2
-        shift 2
-    fi
-
-    # props
-    if [[ "$(to_upper <<<"$1")" = GET ]]; then
-        props=$2
-        shift 2
-    fi
-
-    if ! [ -f "$tmp/wmic.ps1" ]; then
-        curl -Lo "$tmp/wmic.ps1" "$confhome/wmic.ps1"
-    fi
-
-    # shellcheck disable=SC2046
-    powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-        -File "$(cygpath -w "$tmp/wmic.ps1")" \
-        -Namespace "$namespace" \
-        -Class "$class" \
-        $([ -n "$filter" ] && echo -Filter "$filter") \
-        $([ -n "$props" ] && echo -Properties "$props")
-}
-
-is_virt() {
-    if [ -z "$_is_virt" ]; then
-        if is_in_windows; then
-            # https://github.com/systemd/systemd/blob/main/src/basic/virt.c
-            # https://sources.debian.org/src/hw-detect/1.159/hw-detect.finish-install.d/08hw-detect/
-            vmstr='VMware|Virtual|Virtualization|VirtualBox|VMW|Hyper-V|Bochs|QEMU|KVM|OpenStack|KubeVirt|innotek|Xen|Parallels|BHYVE'
-            for name in ComputerSystem BIOS BaseBoard; do
-                if wmic $name | grep -Eiw $vmstr; then
-                    _is_virt=true
-                    break
-                fi
-            done
-
-            # 用运行 windows ，肯定够内存运行 alpine lts netboot
-            # 何况还能停止 modloop
-
-            # 没有风扇和温度信息，大概是虚拟机
-            # 阿里云 倚天710 arm 有温度传感器
-            # ovh KS-LE-3 没有风扇和温度信息？
-            if false && [ -z "$_is_virt" ] &&
-                ! wmic /namespace:'\\root\cimv2' PATH Win32_Fan 2>/dev/null | grep -q ^Name &&
-                ! wmic /namespace:'\\root\wmi' PATH MSAcpi_ThermalZoneTemperature 2>/dev/null | grep -q ^Name; then
-                _is_virt=true
-            fi
-        else
-            # aws t4g debian 11
-            # systemd-detect-virt: 为 none，即使装了dmidecode
-            # virt-what: 未装 deidecode时结果为空，装了deidecode后结果为aws
-            # 所以综合两个命令的结果来判断
-            if is_have_cmd systemd-detect-virt && systemd-detect-virt -v; then
-                _is_virt=true
-            fi
-
-            if [ -z "$_is_virt" ]; then
-                # debian 安装 virt-what 不会自动安装 dmidecode，因此结果有误
-                install_pkg dmidecode virt-what
-                # virt-what 返回值始终是0，所以用是否有输出作为判断
-                if [ -n "$(virt-what)" ]; then
-                    _is_virt=true
-                fi
-            fi
-        fi
-
-        if [ -z "$_is_virt" ]; then
-            _is_virt=false
-        fi
-        echo "VM: $_is_virt"
-    fi
-    $_is_virt
-}
-
-is_absolute_path() {
-    # 检查路径是否以/开头
-    # 注意语法和 ash 不同
-    [[ "$1" = /* ]]
-}
-
-is_cpu_supports_x86_64_v3() {
-    # 用 ld.so/cpuid/coreinfo.exe 更准确
-    # centos 7 /usr/lib64/ld-linux-x86-64.so.2 没有 --help
-    # alpine gcompat /lib/ld-linux-x86-64.so.2 没有 --help
-
-    # https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels
-    # https://learn.microsoft.com/sysinternals/downloads/coreinfo
-
-    # abm = popcnt + lzcnt
-    # /proc/cpuinfo 不显示 lzcnt, 可用 abm 代替，但 cygwin 也不显示 abm
-    # /proc/cpuinfo 不显示 osxsave, 故用 xsave 代替
-
-    need_flags="avx avx2 bmi1 bmi2 f16c fma movbe xsave"
-    had_flags=$(grep -m 1 ^flags /proc/cpuinfo | awk -F': ' '{print $2}')
-
-    for flag in $need_flags; do
-        if ! grep -qw $flag <<<"$had_flags"; then
-            return 1
-        fi
-    done
-}
-
-assert_cpu_supports_x86_64_v3() {
-    if ! is_cpu_supports_x86_64_v3; then
-        error_and_exit "Could not install $distro $releasever because the CPU does not support x86-64-v3."
-    fi
-}
-
-# sr-latn-rs 到 sr-latn
-en_us() {
-    echo "$lang" | awk -F- '{print $1"-"$2}'
-
-    # zh-hk 可回落到 zh-tw
-    if [ "$lang" = zh-hk ]; then
-        echo zh-tw
-    fi
-}
-
-# fr-ca 到 ca
-us() {
-    # 葡萄牙准确对应 pp
-    if [ "$lang" = pt-pt ]; then
-        echo pp
-        return
-    fi
-    # 巴西准确对应 pt
-    if [ "$lang" = pt-br ]; then
-        echo pt
-        return
-    fi
-
-    echo "$lang" | awk -F- '{print $2}'
-
-    # hk 额外回落到 tw
-    if [ "$lang" = zh-hk ]; then
-        echo tw
-    fi
-}
-
-# fr-ca 到 fr-fr
-en_en() {
-    echo "$lang" | awk -F- '{print $1"-"$1}'
-
-    # en-gb 额外回落到 en-us
-    if [ "$lang" = en-gb ]; then
-        echo en-us
-    fi
-}
-
-# fr-ca 到 fr
-en() {
-    # 巴西/葡萄牙回落到葡萄牙语
-    if [ "$lang" = pt-br ] || [ "$lang" = pt-pt ]; then
-        echo "pp"
-        return
-    fi
-
-    echo "$lang" | awk -F- '{print $1}'
-}
-
-english() {
-    case "$lang" in
-    ar-sa) echo Arabic ;;
-    bg-bg) echo Bulgarian ;;
-    cs-cz) echo Czech ;;
-    da-dk) echo Danish ;;
-    de-de) echo German ;;
-    el-gr) echo Greek ;;
-    en-gb) echo Eng_Intl ;;
-    en-us) echo English ;;
-    es-es) echo Spanish ;;
-    es-mx) echo Spanish_Latam ;;
-    et-ee) echo Estonian ;;
-    fi-fi) echo Finnish ;;
-    fr-ca) echo FrenchCanadian ;;
-    fr-fr) echo French ;;
-    he-il) echo Hebrew ;;
-    hr-hr) echo Croatian ;;
-    hu-hu) echo Hungarian ;;
-    it-it) echo Italian ;;
-    ja-jp) echo Japanese ;;
-    ko-kr) echo Korean ;;
-    lt-lt) echo Lithuanian ;;
-    lv-lv) echo Latvian ;;
-    nb-no) echo Norwegian ;;
-    nl-nl) echo Dutch ;;
-    pl-pl) echo Polish ;;
-    pt-pt) echo Portuguese ;;
-    pt-br) echo Brazilian ;;
-    ro-ro) echo Romanian ;;
-    ru-ru) echo Russian ;;
-    sk-sk) echo Slovak ;;
-    sl-si) echo Slovenian ;;
-    sr-latn | sr-latn-rs) echo Serbian_Latin ;;
-    sv-se) echo Swedish ;;
-    th-th) echo Thai ;;
-    tr-tr) echo Turkish ;;
-    uk-ua) echo Ukrainian ;;
-    zh-cn) echo ChnSimp ;;
-    zh-hk | zh-tw) echo ChnTrad ;;
-    esac
-}
-
-parse_windows_image_name() {
-    set -- $image_name
-
-    if ! [ "$1" = windows ]; then
-        return 1
-    fi
-    shift
-
-    if [ "$1" = server ]; then
-        server=server
-        shift
-    fi
-
-    version=$1
-    shift
-
-    if [ "$1" = r2 ]; then
-        version+=" r2"
-        shift
-    fi
-
-    edition=
-    while [ $# -gt 0 ]; do
-        case "$1" in
-        # windows 10 enterprise n ltsc 2021
-        k | n | kn) ;;
-        *)
-            if [ -n "$edition" ]; then
-                edition+=" "
-            fi
-            edition+="$1"
-            ;;
-        esac
-        shift
-    done
-}
-
-is_have_arm_version() {
-    case "$version" in
-    10)
-        case "$edition" in
-        pro | education | enterprise | 'pro education' | 'pro for workstations') return ;;
-        'iot enterprise') return ;;
-        'enterprise ltsc 2021' | 'iot enterprise ltsc 2021') return ;;
-        esac
-        ;;
-    11)
-        case "$edition" in
-        pro | education | enterprise | 'pro education' | 'pro for workstations') return ;;
-        'iot enterprise' | 'iot enterprise subscription') return ;;
-        'enterprise ltsc 2024' | 'iot enterprise ltsc 2024' | 'iot enterprise ltsc 2024 subscription') return ;;
-        esac
-        ;;
-    esac
-    return 1
-}
-
-find_windows_iso() {
-    parse_windows_image_name || error_and_exit "--image-name wrong: $image_name"
-    if ! [ "$version" = 8.1 ] && [ -z "$edition" ]; then
-        error_and_exit "Edition is not set."
-    fi
-    if [ "$basearch" = 'aarch64' ] && ! is_have_arm_version; then
-        error_and_exit "No ARM iso for this Windows Version."
-    fi
-
-    if [ -z "$lang" ]; then
-        lang=en-us
-    fi
-    langs="$lang $(en_us) $(us) $(en_en) $(en)"
-    langs=$(echo "$langs" | xargs -n 1 | awk '!seen[$0]++')
-    full_lang=$(english)
-
-    case "$basearch" in
-    x86_64) arch_win=x64 ;;
-    aarch64) arch_win=arm64 ;;
-    esac
-
-    get_windows_iso_link
-}
-
-get_windows_iso_link() {
-    get_label_msdn() {
-        if [ -n "$server" ]; then
-            case "$version" in
-            2008 | '2008 r2')
-                case "$edition" in
-                serverweb | serverwebcore) echo _ ;;
-                serverstandard | serverstandardcore) echo _ ;;
-                serverenterprise | serverenterprisecore) echo _ ;;
-                serverdatacenter | serverdatacentercore) echo _ ;;
-                esac
-                ;;
-            # massgrave 不提供 2012 下载
-            '2012 r2' | \
-                2016 | 2019 | 2022 | 2025)
-                case "$edition" in
-                serverstandard | serverstandardcore) echo _ ;;
-                serverdatacenter | serverdatacentercore) echo _ ;;
-                esac
-                ;;
-            esac
-        else
-            case "$version" in
-            vista)
-                case "$edition" in
-                starter)
-                    case "$arch_win" in
-                    x86) echo _ ;;
-                    esac
-                    ;;
-                homebasic | homepremium | business | ultimate) echo _ ;;
-                esac
-                ;;
-            7)
-                case "$edition" in
-                starter)
-                    case "$arch_win" in
-                    x86) echo starter ;;
-                    esac
-                    ;;
-                homebasic)
-                    case "$arch_win" in
-                    x86) echo "home basic" ;;
-                    esac
-                    ;;
-                homepremium) echo "home premium" ;;
-                professional | enterprise | ultimate) echo "$edition" ;;
-                esac
-                ;;
-            # massgrave 不提供 windows 8 下载
-            8.1)
-                case "$edition" in
-                '') echo _ ;; # windows 8.1 core
-                pro | enterprise) echo "$edition" ;;
-                esac
-                ;;
-            10)
-                case "$edition" in
-                home | 'home single language') echo consumer ;;
-                pro | education | enterprise | 'pro education' | 'pro for workstations') echo business ;;
-                # iot
-                'iot enterprise') echo 'iot enterprise' ;;
-                # iot ltsc
-                'iot enterprise ltsc 2019' | 'iot enterprise ltsc 2021') echo "$edition" ;;
-                # ltsc
-                'enterprise 2015 ltsb' | 'enterprise 2016 ltsb' | 'enterprise ltsc 2019') echo "$edition" ;;
-                'enterprise ltsc 2021')
-                    # arm64 的 enterprise ltsc 2021 要下载 iot enterprise ltsc 2021 iso
-                    case "$arch_win" in
-                    arm64) echo 'iot enterprise ltsc 2021' ;;
-                    x86 | x64) echo 'enterprise ltsc 2021' ;;
-                    esac
-                    ;;
-                esac
-                ;;
-            11)
-                case "$edition" in
-                home | 'home single language') echo consumer ;;
-                pro | education | enterprise | 'pro education' | 'pro for workstations') echo business ;;
-                # iot
-                'iot enterprise' | 'iot enterprise subscription') echo 'iot enterprise' ;;
-                # iot ltsc
-                'iot enterprise ltsc 2024' | 'iot enterprise ltsc 2024 subscription') echo 'iot enterprise ltsc 2024' ;;
-                # ltsc
-                'enterprise ltsc 2024')
-                    # arm64 的 enterprise ltsc 2024 要下载 iot enterprise ltsc 2024 iso
-                    case "$arch_win" in
-                    arm64) echo 'iot enterprise ltsc 2024' ;;
-                    x64) echo 'enterprise ltsc 2024' ;;
-                    esac
-                    ;;
-                esac
-                ;;
-            esac
-        fi
-    }
-
-    get_label_vlsc() {
-        case "$version" in
-        10 | 11)
-            case "$edition" in
-            pro | education | enterprise | 'pro education' | 'pro for workstations') echo pro ;;
-            esac
-            ;;
-        esac
-    }
-
-    # 8.1 和 11 arm 没有每月发布 iso
-    # 因此优先从 msdl 下载
-    get_label_msdl() {
-        case "$version" in
-        8.1)
-            case "$edition" in
-            '' | pro) echo _ ;;
-            esac
-            ;;
-        11)
-            case "$edition" in
-            home | 'home single language' | pro | education | 'pro education' | 'pro for workstations')
-                case "$arch_win" in
-                arm64) echo _ ;;
-                esac
-                ;;
-            esac
-            ;;
-        esac
-    }
-
-    get_page() {
-        if [ "$arch_win" = arm64 ]; then
-            echo arm
-        elif is_ltsc; then
-            echo ltsc
-        elif [ "$server" = 'server' ]; then
-            echo server
-        else
-            case "$version" in
-            vista | 7 | 8.1 | 10 | 11)
-                echo "$version"
-                ;;
-            esac
-        fi
-    }
-
-    is_ltsc() {
-        grep -Ewq 'ltsb|ltsc' <<<"$edition"
-    }
-
-    # 部分 bash 不支持 $() 里面嵌套case，所以定义成函数
-    label_msdn=$(get_label_msdn)
-    label_msdl=$(get_label_msdl)
-    label_vlsc=$(get_label_vlsc)
-    page=$(get_page)
-
-    if [ "$page" = vista ]; then
-        page_url=https://massgrave.dev/windows_vista__links
-    elif [ "$page" = server ]; then
-        page_url=https://massgrave.dev/windows-server-links
-    else
-        page_url=https://massgrave.dev/windows_${page}_links
-    fi
-
-    info "Find windows iso"
-    echo "Version:    $version"
-    echo "Edition:    $edition"
-    echo "Label msdn: $label_msdn"
-    echo "Label msdl: $label_msdl"
-    echo "Label vlsc: $label_vlsc"
-    echo "List:       $page_url"
-    echo
-
-    if [ -z "$page" ] || { [ -z "$label_msdn" ] && [ -z "$label_msdl" ] && [ -z "$label_vlsc" ]; }; then
-        error_and_exit "Not support find this iso. Check if --image-name is wrong. If not, set --iso manually."
-    fi
-
-    if [ -n "$label_msdl" ]; then
-        iso=$(curl -L "$page_url" | grep -ioP 'https://.*?#[0-9]+' | head -1 | grep .)
-    else
-        curl -L "$page_url" | grep -ioP 'https://.*?.(iso|img)' >$tmp/win.list
-
-        # 如果不是 ltsc ，应该先去除 ltsc 链接，否则最终链接有 ltsc 的
-        # 例如查找 windows 10 iot enterprise，会得到
-        # en-us_windows_10_iot_enterprise_ltsc_2021_arm64_dvd_e8d4fc46.iso
-        # en-us_windows_10_iot_enterprise_version_22h2_arm64_dvd_39566b6b.iso
-        # sed -Ei 和 sed -iE 是不同的
-        if is_ltsc; then
-            sed -Ei '/ltsc|ltsb/!d' $tmp/win.list
-        else
-            sed -Ei '/ltsc|ltsb/d' $tmp/win.list
-        fi
-
-        get_windows_iso_link_inner
-    fi
-}
-
-get_shortest_line() {
-    # awk '{print length($0), $0}' | sort -n | head -1 | awk '{print $2}'
-    awk '(NR == 1 || length($0) < length(shortest)) { shortest = $0 } END { print shortest }'
-}
-
-get_windows_iso_link_inner() {
-    regexs=()
-
-    # msdn
-    if [ -n "$label_msdn" ]; then
-        if [ "$label_msdn" = _ ]; then
-            label_msdn=
-        fi
-        for lang in $langs; do
-            regex=
-            for i in ${lang} windows ${server} ${version} ${label_msdn}; do
-                if [ -n "$i" ]; then
-                    regex+="${i}_"
-                fi
-            done
-            regex+=".*${arch_win}.*.(iso|img)"
-            regexs+=("$regex")
-        done
-    fi
-
-    # vlsc
-    if [ -n "$label_vlsc" ]; then
-        regex="sw_dvd[59]_win_${label_vlsc}_${version}.*${arch_win}_${full_lang}.*.(iso|img)"
-        regexs+=("$regex")
-    fi
-
-    # 查找
-    for regex in "${regexs[@]}"; do
-        regex=${regex// /_}
-
-        echo "looking for: $regex" >&2
-        if iso=$(grep -Ei "/$regex" "$tmp/win.list" | get_shortest_line | grep .); then
-            return
-        fi
-    done
-
-    error_and_exit "Could not find iso for this windows edition or language."
-}
-
-setos() {
-    local step=$1
-    local distro=$2
-    local releasever=$3
-    info set $step $distro $releasever
-
-    setos_netboot.xyz() {
-        if is_efi; then
-            if [ "$basearch" = aarch64 ]; then
-                eval ${step}_efi=https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.efi
-            else
-                eval ${step}_efi=https://boot.netboot.xyz/ipxe/netboot.xyz.efi
-            fi
-        else
-            eval ${step}_vmlinuz=https://boot.netboot.xyz/ipxe/netboot.xyz.lkrn
-        fi
-    }
-
-    setos_alpine() {
-        is_virt && flavour=virt || flavour=lts
-
-        # 不要用https 因为甲骨文云arm initramfs阶段不会从硬件同步时钟，导致访问https出错
-        if is_in_china; then
-            mirror=http://mirrors.tuna.tsinghua.edu.cn/alpine/v$releasever
-        else
-            mirror=http://dl-cdn.alpinelinux.org/alpine/v$releasever
-        fi
-        eval ${step}_vmlinuz=$mirror/releases/$basearch/netboot/vmlinuz-$flavour
-        eval ${step}_initrd=$mirror/releases/$basearch/netboot/initramfs-$flavour
-        eval ${step}_modloop=$mirror/releases/$basearch/netboot/modloop-$flavour
-        eval ${step}_repo=$mirror/main
-    }
-
-    setos_debian() {
-        is_debian_elts() {
-            [ "$releasever" -le 10 ]
-        }
-
-        # 用此标记要是否 elts, 用于安装后修改 elts/etls-cn 源
-        # shellcheck disable=SC2034
-        is_debian_elts && elts=1 || elts=0
-
-        case "$releasever" in
-        9) codename=stretch ;;
-        10) codename=buster ;;
-        11) codename=bullseye ;;
-        12) codename=bookworm ;;
-        13) codename=trixie ;;
-        14) codename=forky ;;
-        15) codename=duke ;;
-        esac
-
-        if ! is_use_cloud_image && is_debian_elts && is_in_china; then
-            warn "
-Due to the lack of Debian Freexian ELTS instaler mirrors in China, the installation time may be longer.
-Continue?
-
-由于没有 Debian Freexian ELTS 国内安装源，安装时间可能会比较长。
-继续安装?
-"
-            read -r -p '[y/N]: '
-            if ! [[ "$REPLY" = [Yy] ]]; then
-                exit
-            fi
-        fi
-
-        # udeb_mirror 安装时的源
-        # deb_mirror 安装后要修改成的源
-        if is_debian_elts; then
-            if is_in_china; then
-                # https://github.com/tuna/issues/issues/1999
-                # nju 也没同步
-                udeb_mirror=deb.freexian.com/extended-lts
-                deb_mirror=mirrors.tuna.tsinghua.edu.cn/debian-elts
-                initrd_mirror=mirrors.tuna.tsinghua.edu.cn/debian-archive/debian
-            else
-                # 按道理不应该用官方源，但找不到其他源
-                udeb_mirror=deb.freexian.com/extended-lts
-                deb_mirror=deb.freexian.com/extended-lts
-                initrd_mirror=archive.debian.org/debian
-            fi
-        else
-            if is_in_china; then
-                # ftp.cn.debian.org 不在国内还严重丢包
-                # https://www.itdog.cn/ping/ftp.cn.debian.org
-                mirror=mirrors.tuna.tsinghua.edu.cn/debian
-            else
-                mirror=deb.debian.org/debian # fastly
-            fi
-            udeb_mirror=$mirror
-            deb_mirror=$mirror
-            initrd_mirror=$mirror
-        fi
-
-        # 云镜像和 firmware 下载源
-        if is_in_china; then
-            cdimage_mirror=https://mirrors.tuna.tsinghua.edu.cn/debian-cdimage
-        else
-            cdimage_mirror=https://cdimage.debian.org/images # 在瑞典，不是 cdn
-            # cloud.debian.org 同样在瑞典，不是 cdn
-        fi
-
-        is_virt && flavour=-cloud || flavour=
-        # debian 10 云内核 vultr efi vnc 没有显示
-        [ "$releasever" -le 10 ] && flavour=
-        # 甲骨文 arm64 cloud 内核 vnc 没有显示
-        [ "$basearch_alt" = arm64 ] && flavour=
-
-        if is_use_cloud_image; then
-            # cloud image
-            # https://salsa.debian.org/cloud-team/debian-cloud-images/-/tree/master/config_space/bookworm/files/etc/default/grub.d
-            # cloud 包括各种奇怪的优化，例如不显示 grub 菜单
-            # 因此使用 nocloud
-            if false; then
-                is_virt && ci_type=genericcloud || ci_type=generic
-            else
-                ci_type=nocloud
-            fi
-            eval ${step}_img=$cdimage_mirror/cloud/$codename/latest/debian-$releasever-$ci_type-$basearch_alt.qcow2
-        else
-            # 传统安装
-            initrd_dir=dists/$codename/main/installer-$basearch_alt/current/images/netboot/debian-installer/$basearch_alt
-
-            eval ${step}_udeb_mirror=$udeb_mirror
-            eval ${step}_vmlinuz=https://$initrd_mirror/$initrd_dir/linux
-            eval ${step}_initrd=https://$initrd_mirror/$initrd_dir/initrd.gz
-            eval ${step}_ks=$confhome/debian.cfg
-            eval ${step}_firmware=$cdimage_mirror/unofficial/non-free/firmware/$codename/current/firmware.cpio.gz
-            eval ${step}_codename=$codename
-        fi
-
-        # 官方安装和云镜像都会用到的
-        eval ${step}_deb_mirror=$deb_mirror
-        eval ${step}_kernel=linux-image$flavour-$basearch_alt
-    }
-
-    setos_kali() {
-        if is_use_cloud_image; then
-            :
-        else
-            # 传统安装
-            if is_in_china; then
-                hostname=mirrors.tuna.tsinghua.edu.cn
-            else
-                # http.kali.org 没有 ipv6 地址
-                # http.kali.org (geoip 重定向) 到 kali.download (cf)
-                hostname=kali.download
-            fi
-            codename=kali-rolling
-            mirror=http://$hostname/kali/dists/$codename/main/installer-$basearch_alt/current/images/netboot/debian-installer/$basearch_alt
-
-            is_virt && flavour=-cloud || flavour=
-
-            eval ${step}_vmlinuz=$mirror/linux
-            eval ${step}_initrd=$mirror/initrd.gz
-            eval ${step}_ks=$confhome/debian.cfg
-            eval ${step}_udeb_mirror=$hostname/kali
-            eval ${step}_codename=$codename
-            eval ${step}_kernel=linux-image$flavour-$basearch_alt
-            # 缺少 firmware 下载
-        fi
-    }
-
-    setos_ubuntu() {
-        case "$releasever" in
-        16.04) codename=xenial ;;
-        18.04) codename=bionic ;;
-        20.04) codename=focal ;;
-        22.04) codename=jammy ;;
-        24.04) codename=noble ;;
-        25.04) codename=plucky ;; # non-lts
-        esac
-
-        if is_use_cloud_image; then
-            # cloud image
-            if is_in_china; then
-                # 有的源没有 releases 镜像
-                # https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/releases/
-                #   https://unicom.mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/
-                #            https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/releases/
-
-                # mirrors.cloud.tencent.com
-                ci_mirror=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images
-            else
-                ci_mirror=https://cloud-images.ubuntu.com
-            fi
-
-            # 以下版本有 minimal 镜像
-            # amd64 所有
-            # arm64 24.04 和以上
-            is_have_minimal_image() {
-                [ "$basearch_alt" = amd64 ] || [ "${releasever%.*}" -ge 24 ]
-            }
-
-            get_suffix() {
-                if [ "$releasever" = 16.04 ]; then
-                    if is_efi; then
-                        echo -uefi1
-                    else
-                        echo -disk1
-                    fi
-                fi
-            }
-
-            if [ "$minimal" = 1 ]; then
-                if ! is_have_minimal_image; then
-                    error_and_exit "Minimal cloud image is not available for $releasever $basearch_alt."
-                fi
-                eval ${step}_img="$ci_mirror/minimal/releases/$codename/release/ubuntu-$releasever-minimal-cloudimg-$basearch_alt$(get_suffix).img"
-            else
-                # 用 codename 而不是 releasever，可减少一次跳转
-                eval ${step}_img="$ci_mirror/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt$(get_suffix).img"
-            fi
-        else
-            # 传统安装
-            if is_in_china; then
-                case "$basearch" in
-                "x86_64") mirror=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/$releasever ;;
-                "aarch64") mirror=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/releases/$releasever/release ;;
-                esac
-            else
-                case "$basearch" in
-                "x86_64") mirror=https://releases.ubuntu.com/$releasever ;;
-                "aarch64") mirror=https://cdimage.ubuntu.com/releases/$releasever/release ;;
-                esac
-            fi
-
-            # iso
-            filename=$(curl -L $mirror/ | grep -oP "ubuntu-$releasever.*?-live-server-$basearch_alt.iso" |
-                sort -uV | tail -1 | grep .)
-            iso=$mirror/$filename
-            # 在 ubuntu 20.04 上，file 命令检测 ubuntu 22.04 iso 结果是 DOS/MBR boot sector
-            test_url "$iso" iso
-            eval ${step}_iso=$iso
-
-            # ks
-            eval ${step}_ks=$confhome/ubuntu.yaml
-            eval ${step}_minimal=$minimal
-        fi
-    }
-
-    setos_arch() {
-        if [ "$basearch" = "x86_64" ]; then
-            if is_in_china; then
-                mirror=https://mirrors.tuna.tsinghua.edu.cn/archlinux
-            else
-                mirror=https://geo.mirror.pkgbuild.com # geoip
-            fi
-        else
-            if is_in_china; then
-                mirror=https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm
-            else
-                # https 证书有问题
-                mirror=http://mirror.archlinuxarm.org # geoip
-            fi
-        fi
-
-        if is_use_cloud_image; then
-            # cloud image
-            eval ${step}_img=$mirror/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
-        else
-            # 传统安装
-            case "$basearch" in
-            x86_64) dir="core/os/$basearch" ;;
-            aarch64) dir="$basearch/core" ;;
-            esac
-            test_url $mirror/$dir/core.db gzip
-            eval ${step}_mirror=$mirror
-        fi
-    }
-
-    setos_nixos() {
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/nix-channels
-        else
-            mirror=https://nixos.org/channels
-        fi
-
-        if is_use_cloud_image; then
-            :
-        else
-            # 传统安装
-            # 该服务器文件缓存 miss 时会响应 206 + Location 头
-            # 但 curl 这种情况不会重定向，所以添加 text 类型让它不要报错
-            test_url $mirror/nixos-$releasever/store-paths.xz 'xz text'
-            eval ${step}_mirror=$mirror
-        fi
-    }
-
-    setos_gentoo() {
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/gentoo
-        else
-            mirror=https://distfiles.gentoo.org # cdn77
-        fi
-
-        dir=releases/$basearch_alt/autobuilds
-
-        if is_use_cloud_image; then
-            # 使用 systemd 且没有 cloud-init
-            prefix=di-$basearch_alt-console
-            filename=$(curl -L $mirror/$dir/latest-$prefix.txt | grep '.qcow2' | awk '{print $1}' | grep .)
-            file=$mirror/$dir/$filename
-            test_url "$file" 'qemu'
-            eval ${step}_img=$file
-        else
-            prefix=stage3-$basearch_alt-systemd
-            filename=$(curl -L $mirror/$dir/latest-$prefix.txt | grep '.tar.xz' | awk '{print $1}' | grep .)
-            file=$mirror/$dir/$filename
-            test_url "$file" 'tar.xz'
-            eval ${step}_img=$file
-        fi
-    }
-
-    setos_opensuse() {
-        # https://download.opensuse.org/
-        # curl 会跳转到最近的镜像源，但可能会被镜像源 block
-        # aria2 会跳转使用 metalink
-
-        # https://downloadcontent.opensuse.org    # 德国
-        # https://downloadcontentcdn.opensuse.org # fastly cdn
-
-        # 很多国内源缺少 aarch64 tumbleweed appliances
-        #                 https://download.opensuse.org/ports/aarch64/tumbleweed/appliances/
-        #          https://mirrors.ustc.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
-        # https://mirrors.tuna.tsinghua.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
-
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/opensuse
-        else
-            mirror=https://downloadcontentcdn.opensuse.org
-        fi
-
-        if [ "$releasever" = tumbleweed ]; then
-            # tumbleweed
-            if [ "$basearch" = aarch64 ]; then
-                dir=ports/aarch64/tumbleweed/appliances
-            else
-                dir=tumbleweed/appliances
-            fi
-            file=openSUSE-Tumbleweed-Minimal-VM.$basearch-Cloud.qcow2
-        else
-            # leap
-            dir=distribution/leap/$releasever/appliances
-            if [ "$releasever" = 15.6 ]; then
-                file=openSUSE-Leap-$releasever-Minimal-VM.$basearch-Cloud.qcow2
-                # https://build.opensuse.org/projects/Virtualization:Appliances:Images:openSUSE-Leap-15.6/packages/kiwi-templates-Minimal/files/Minimal.kiwi
-                # https://build.opensuse.org/projects/Virtualization:Appliances:Images:openSUSE-Tumbleweed/packages/kiwi-templates-Minimal/files/Minimal.kiwi
-                # 有专门的kvm镜像，openSUSE-Leap-15.5-Minimal-VM.x86_64-kvm-and-xen.qcow2，里面没有cloud-init
-                # file=openSUSE-Leap-15.5-Minimal-VM.x86_64-kvm-and-xen.qcow2
-            else
-                # https://src.opensuse.org/openSUSE/Leap/raw/branch/16.0/Leap/Leap.kiwi
-                # Default 比 Base 多了以下组件
-                # <namedCollection name="salt_minion" />
-                # <package name="patterns-base-salt_minion" />
-                # <namedCollection name="kvm_host" />
-                # <package name="patterns-base-kvm_host" />
-                # <package name="lzop" />
-                # <package name="wpa_supplicant" arch="x86_64,aarch64" />
-                # <package name="k3s-install" />
-
-                # file=Leap.x86_64-Default.raw.xz
-                file=Leap.x86_64-Base.raw.xz
-            fi
-        fi
-        eval ${step}_img=$mirror/$dir/$file
-    }
-
-    setos_windows() {
-        if [ -z "$iso" ]; then
-            # 查找时将 windows longhorn serverdatacenter 改成 windows server 2008 serverdatacenter
-            image_name=${image_name/windows longhorn server/windows server 2008 server}
-            echo "iso url is not set. Attempting to find it automatically."
-            find_windows_iso
-        fi
-
-        # 将上面的 windows server 2008 serverdatacenter 改回 windows longhorn serverdatacenter
-        # 也能纠正用户输入了 windows server 2008 serverdatacenter
-        # 注意 windows server 2008 r2 serverdatacenter 不用改
-        image_name=${image_name/windows server 2008 server/windows longhorn server}
-
-        if [[ "$iso" = magnet:* ]]; then
-            : # 不测试磁力链接
-        else
-            # 需要用户输入 massgrave.dev 直链
-            if grep -Eiq '\.massgrave\.dev/.*\.(iso|img)$' <<<"$iso" ||
-                grep -Eiq '\.gravesoft\.dev/#[0-9]+$' <<<"$iso"; then
-                info "Set Direct link"
-                # MobaXterm 不支持
-                # printf '\e]8;;http://example.com\e\\This is a link\e]8;;\e\\\n'
-
-                # MobaXterm 不显示为超链接
-                # info false "请在浏览器中打开 $iso 获取直链并粘贴到这里。"
-                # info false "Please open $iso in browser to get the direct link and paste it here."
-
-                echo "请在浏览器中打开 $iso 获取直链并粘贴到这里。"
-                echo "Please open $iso in browser to get the direct link and paste it here."
-                IFS= read -r -p "Direct Link: " iso
-                if [ -z "$iso" ]; then
-                    error_and_exit "ISO Link is empty."
-                fi
-            fi
-
-            # 测试是否是 iso
-            test_url "$iso" iso
-
-            # 判断 iso 架构是否兼容
-            # https://gitlab.com/libosinfo/osinfo-db/-/tree/main/data/os/microsoft.com?ref_type=heads
-            # uupdump linux 下合成的标签是 ARM64，windows下合成的标签是 A64
-            if file -b "$tmp/img-test" | grep -Eq '_(A64|ARM64)'; then
-                iso_arch=arm64
-            else
-                iso_arch=x86_or_x64
-            fi
-
-            if ! {
-                { [ "$basearch" = x86_64 ] && [ "$iso_arch" = x86_or_x64 ]; } ||
-                    { [ "$basearch" = aarch64 ] && [ "$iso_arch" = arm64 ]; }
-            }; then
-                warn "
-The current machine is $basearch, but it seems the ISO is for $iso_arch. Continue?
-当前机器是 $basearch，但 ISO 似乎是 $iso_arch。继续安装?"
-                read -r -p '[y/N]: '
-                if ! [[ "$REPLY" = [Yy] ]]; then
-                    exit
-                fi
-            fi
-        fi
-
-        [ -n "$boot_wim" ] && test_url "$boot_wim" 'wim'
-
-        eval "${step}_iso='$iso'"
-        eval "${step}_boot_wim='$boot_wim'"
-        eval "${step}_image_name='$image_name'"
-    }
-
-    # shellcheck disable=SC2154
-    setos_dd() {
-        # raw 包含 vhd
-        test_url $img 'raw raw.gzip microsoft.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd' img_type
-
-        if is_efi; then
-            install_pkg hexdump
-
-            # openwrt 镜像 efi part type 不是 esp
-            # 因此改成检测 fat?
-            # https://downloads.openwrt.org/releases/23.05.3/targets/x86/64/openwrt-23.05.3-x86-64-generic-ext4-combined-efi.img.gz
-
-            # od 在 coreutils 里面，好像要配合 tr 才能删除空格
-            # hexdump 在 util-linux / bsdmainutils 里面
-            # xxd 要单独安装，el 在 vim-common 里面
-            # xxd -l $((34 * 4096)) -ps -c 128
-
-            # 仅打印前34个扇区 * 4096字节（按最大的算）
-            # 每行128字节
-            hexdump -n $((34 * 4096)) -e '128/1 "%02x" "\n"' -v "$tmp/img-test" >$tmp/img-test-hex
-            if grep -q '^28732ac11ff8d211ba4b00a0c93ec93b' $tmp/img-test-hex; then
-                echo 'DD: Image is EFI.'
-            else
-                echo 'DD: Image is not EFI.'
-                warn '
-The current machine uses EFI boot, but the DD image seems not an EFI image.
-Continue with DD?
-当前机器使用 EFI 引导，但 DD 镜像可能不是 EFI 镜像。
-继续 DD?'
-                read -r -p '[y/N]: '
-                if [[ "$REPLY" = [Yy] ]]; then
-                    eval ${step}_confirmed_no_efi=1
-                else
-                    exit
-                fi
-            fi
-        fi
-        eval "${step}_img='$img'"
-        eval "${step}_img_type='$img_type'"
-        eval "${step}_img_type_warp='$img_type_warp'"
-    }
-
-    setos_fnos() {
-        if [ "$basearch" = aarch64 ]; then
-            error_and_exit "FNOS not supports ARM."
-        fi
-
-        # 系统盘大小
-        min=8
-        default=8
-        while true; do
-            IFS= read -r -p "Type System Partition Size in GB. Minimal $min GB. [$default]: " input
-            input=${input:-$default}
-            if ! { is_digit "$input" && [ "$input" -ge "$min" ]; }; then
-                error "Invalid Size. Please Try again."
-            else
-                eval "${step}_fnos_part_size=${input}G"
-                break
-            fi
-        done
-
-        iso=$(curl -L https://fnnas.com/ | grep -o 'https://[^"]*\.iso' | head -1 | grep .)
-
-        # curl 7.82.0+
-        # curl -L --json '{"url":"'$iso'"}' https://www.fnnas.com/api/download-sign
-
-        iso=$(curl -L \
-            -d '{"url":"'$iso'"}' \
-            -H 'Content-Type: application/json' \
-            https://www.fnnas.com/api/download-sign |
-            grep -o 'https://[^"]*')
-
-        test_url "$iso" iso
-        eval "${step}_iso='$iso'"
-    }
-
-    setos_aosc() {
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/anthon/aosc-os
-        else
-            # 服务器在香港
-            mirror=https://releases.aosc.io
-        fi
-
-        dir=os-$basearch_alt/base
-        file=$(curl -L $mirror/$dir/ | grep -oP 'aosc-os_base_.*?\.tar.xz' |
-            sort -uV | tail -1 | grep .)
-        img=$mirror/$dir/$file
-        test_url $img 'tar.xz'
-        eval ${step}_img=$img
-    }
-
-    setos_centos_almalinux_rocky_fedora() {
-        # el 10 需要 x86-64-v3，除了 almalinux
-        if [ "$basearch" = x86_64 ] &&
-            { [ "$distro" = centos ] || [ "$distro" = rocky ]; } &&
-            [ "$releasever" -ge 10 ]; then
-            assert_cpu_supports_x86_64_v3
-        fi
-
-        elarch=$basearch
-        if [ "$basearch" = x86_64 ] &&
-            [ "$distro" = almalinux ] && [ "$releasever" -ge 10 ] &&
-            ! is_cpu_supports_x86_64_v3; then
-            elarch=x86_64_v2
-        fi
-
-        if is_use_cloud_image; then
-            # ci
-            if is_in_china; then
-                case $distro in
-                centos) ci_mirror="https://mirrors.tuna.tsinghua.edu.cn/centos-cloud/centos" ;;
-                almalinux) ci_mirror="https://mirrors.tuna.tsinghua.edu.cn/almalinux/$releasever/cloud/$elarch/images" ;;
-                rocky) ci_mirror="https://mirrors.tuna.tsinghua.edu.cn/rocky/$releasever/images/$elarch" ;;
-                fedora) ci_mirror="https://mirrors.tuna.tsinghua.edu.cn/fedora/releases/$releasever/Cloud/$elarch/images" ;;
-                esac
-            else
-                case $distro in
-                centos) ci_mirror="https://cloud.centos.org/centos" ;;
-                almalinux) ci_mirror="https://repo.almalinux.org/almalinux/$releasever/cloud/$elarch/images" ;;
-                rocky) ci_mirror="https://download.rockylinux.org/pub/rocky/$releasever/images/$elarch" ;;
-                fedora) ci_mirror="https://d2lzkl7pfhq30w.cloudfront.net/pub/fedora/linux/releases/$releasever/Cloud/$elarch/images" ;;
-                esac
-            fi
-            case $distro in
-            centos)
-                case $releasever in
-                7)
-                    # CentOS-7-aarch64-GenericCloud.qcow2c 是旧版本
-                    ver=-2211
-                    ci_image=$ci_mirror/$releasever/images/CentOS-$releasever-$elarch-GenericCloud$ver.qcow2c
-                    ;;
-                *)
-                    # 有 bios 和 efi 镜像
-                    # https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2
-                    # https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-x86_64-10-latest.x86_64.qcow2
-                    [ "$elarch" = x86_64 ] &&
-                        ci_image=$ci_mirror/$releasever-stream/$elarch/images/CentOS-Stream-GenericCloud-x86_64-$releasever-latest.$elarch.qcow2 ||
-                        ci_image=$ci_mirror/$releasever-stream/$elarch/images/CentOS-Stream-GenericCloud-$releasever-latest.$elarch.qcow2
-                    ;;
-                esac
-                ;;
-            almalinux) ci_image=$ci_mirror/AlmaLinux-$releasever-GenericCloud-latest.$elarch.qcow2 ;;
-            rocky) ci_image=$ci_mirror/Rocky-$releasever-GenericCloud-Base.latest.$elarch.qcow2 ;;
-            fedora)
-                # 不加 / 会跳转到 https://dl.fedoraproject.org，纯 ipv6 无法访问
-                # curl -L -6 https://d2lzkl7pfhq30w.cloudfront.net/pub/fedora/linux/releases/42/Cloud/x86_64/images
-                # curl -L -6 https://d2lzkl7pfhq30w.cloudfront.net/pub/fedora/linux/releases/42/Cloud/x86_64/images/
-                filename=$(curl -L $ci_mirror/ | grep -oP "Fedora-Cloud-Base-Generic.*?.qcow2" |
-                    sort -uV | tail -1 | grep .)
-                ci_image=$ci_mirror/$filename
-                ;;
-            esac
-
-            eval ${step}_img=${ci_image}
-        else
-            # 传统安装
-            case $distro in
-            centos) mirrorlist="https://mirrors.centos.org/mirrorlist?repo=centos-baseos-$releasever-stream&arch=$elarch" ;;
-            almalinux) mirrorlist="https://mirrors.almalinux.org/mirrorlist/$releasever/baseos" ;;
-            rocky) mirrorlist="https://mirrors.rockylinux.org/mirrorlist?arch=$elarch&repo=BaseOS-$releasever" ;;
-            fedora) mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?arch=$elarch&repo=fedora-$releasever" ;;
-            esac
-
-            # rocky/centos9 需要删除第一行注释， almalinux 需要替换链接里面的 $basearch
-            for cur_mirror in $(curl -L $mirrorlist | sed "/^#/d" | sed "s,\$basearch,$elarch,"); do
-                host=$(get_host_by_url $cur_mirror)
-                if is_host_has_ipv4_and_ipv6 $host &&
-                    test_url_grace ${cur_mirror}images/pxeboot/vmlinuz; then
-                    mirror=$cur_mirror
-                    break
-                fi
-            done
-
-            if [ -z "$mirror" ]; then
-                error_and_exit "All mirror failed."
-            fi
-
-            eval "${step}_mirrorlist='${mirrorlist}'"
-
-            eval ${step}_ks=$confhome/redhat.cfg
-            eval ${step}_vmlinuz=${mirror}images/pxeboot/vmlinuz
-            eval ${step}_initrd=${mirror}images/pxeboot/initrd.img
-            eval ${step}_squashfs=${mirror}images/install.img
-            test_url ${mirror}images/install.img 'squashfs'
-        fi
-    }
-
-    setos_oracle() {
-        # el 10 需要 x86-64-v3
-        if [ "$basearch" = x86_64 ] && [ "$releasever" -ge 10 ]; then
-            assert_cpu_supports_x86_64_v3
-        fi
-
-        if is_use_cloud_image; then
-            # ci
-            install_pkg jq
-            mirror=https://yum.oracle.com
-
-            [ "$basearch" = aarch64 ] &&
-                template_prefix=ol${releasever}_${basearch}-cloud ||
-                template_prefix=ol${releasever}
-            curl -Lo $tmp/oracle.json $mirror/templates/OracleLinux/$template_prefix-template.json
-            dir=$(jq -r .base_url $tmp/oracle.json)
-            file=$(jq -r .kvm.image $tmp/oracle.json)
-            ci_image=$mirror$dir/$file
-
-            eval ${step}_img=${ci_image}
-        else
-            :
-        fi
-    }
-
-    setos_redhat() {
-        if is_use_cloud_image; then
-            # el 10 需要 x86-64-v3
-            if [ "$basearch" = x86_64 ] && [[ "$img" = *rhel-10* ]]; then
-                assert_cpu_supports_x86_64_v3
-            fi
-            eval "${step}_img='$img'"
-        else
-            :
-        fi
-    }
-
-    setos_opencloudos() {
-        # https://mirrors.opencloudos.tech 不支持 ipv6
-        # https://mirrors.cloud.tencent.com 没有 stream
-        if [ "$releasever" -ge 23 ]; then
-            mirror=https://mirrors.opencloudos.tech/opencloudos-stream/releases
-        else
-            mirror=https://mirrors.cloud.tencent.com/opencloudos
-        fi
-
-        if is_use_cloud_image; then
-            # ci
-            if [ "$releasever" -eq 9 ]; then
-                dir=$releasever/images/qcow2/$basearch
-            else
-                dir=$releasever/images/$basearch
-            fi
-
-            file=$(curl -L $mirror/$dir/ | grep -oP 'OpenCloudOS.*?\.qcow2' |
-                sort -uV | tail -1 | grep .)
-            eval ${step}_img=$mirror/$dir/$file
-        else
-            :
-        fi
-    }
-
-    setos_anolis() {
-        mirror=https://mirrors.openanolis.cn/anolis
-        if is_use_cloud_image; then
-            # ci
-            dir=$releasever/isos/GA/$basearch
-            [ "$releasever" -ge 23 ] &&
-                filename='AnolisOS.*?\.qcow2' ||
-                filename='AnolisOS.*?-ANCK\.qcow2'
-            file=$(curl -L $mirror/$dir/ | grep -oP "$filename" |
-                sort -uV | tail -1 | grep .)
-            eval ${step}_img=$mirror/$dir/$file
-        else
-            :
-        fi
-    }
-
-    setos_openeuler() {
-        if is_in_china; then
-            mirror=https://repo.openeuler.openatom.cn
-        else
-            mirror=https://repo.openeuler.org
-        fi
-        if is_use_cloud_image; then
-            # ci
-            name=$(curl -L "$mirror/" | grep -oE "openEuler-$releasever(-LTS)?(-SP[0-9])?" |
-                sort -uV | tail -1 | grep .)
-            eval ${step}_img=$mirror/$name/virtual_machine_img/$basearch/$name-$basearch.qcow2.xz
-        else
-            :
-        fi
-    }
-
-    eval ${step}_distro=$distro
-    eval ${step}_releasever=$releasever
-
-    case "$distro" in
-    centos | almalinux | rocky | fedora) setos_centos_almalinux_rocky_fedora ;;
-    *) setos_$distro ;;
-    esac
-
-    # debian/kali <=256M 必须使用云内核，否则不够内存
-    if is_distro_like_debian && ! is_in_windows && [ "$ram_size" -le 256 ]; then
-        exit_if_cant_use_cloud_kernel
-    fi
-
-    # 集中测试云镜像格式
-    if is_use_cloud_image && [ "$step" = finalos ]; then
-        # shellcheck disable=SC2154
-        test_url $finalos_img 'qemu qemu.gzip qemu.xz qemu.zstd raw.xz' finalos_img_type
-    fi
-}
-
-is_distro_like_redhat() {
-    if [ -n "$1" ]; then
-        _distro=$1
-    else
-        _distro=$distro
-    fi
-    [ "$_distro" = redhat ] || [ "$_distro" = centos ] || [ "$_distro" = almalinux ] || [ "$_distro" = rocky ] || [ "$_distro" = fedora ] || [ "$_distro" = oracle ]
-}
-
-is_distro_like_debian() {
-    if [ -n "$1" ]; then
-        _distro=$1
-    else
-        _distro=$distro
-    fi
-    [ "$_distro" = debian ] || [ "$_distro" = kali ]
-}
-
-get_latest_distro_releasever() {
-    get_function_content verify_os_name |
-        grep -wo "$1 [^'\"]*" | awk -F'|' '{print $NF}'
-}
-
-# 检查是否为正确的系统名
-verify_os_name() {
-    if [ -z "$*" ]; then
-        usage_and_exit
-    fi
-
-    # 不要删除 centos 7
-    for os in \
-        'centos      7|9|10' \
-        'anolis      7|8|23' \
-        'opencloudos 8|9|23' \
-        'almalinux   8|9|10' \
-        'rocky       8|9|10' \
-        'oracle      8|9|10' \
-        'fedora      41|42' \
-        'nixos       25.05' \
-        'debian      9|10|11|12|13' \
-        'opensuse    15.6|16.0|tumbleweed' \
-        'alpine      3.19|3.20|3.21|3.22' \
-        'openeuler   20.03|22.03|24.03|25.09' \
-        'ubuntu      16.04|18.04|20.04|22.04|24.04|25.04' \
-        'redhat' \
-        'kali' \
-        'arch' \
-        'gentoo' \
-        'aosc' \
-        'fnos' \
-        'windows' \
-        'dd' \
-        'netboot.xyz'; do
-        read -r ds vers <<<"$os"
-        vers_=${vers//\./\\\.}
-        finalos=$(echo "$@" | to_lower | sed -n -E "s,^($ds)[ :-]?(|$vers_)$,\1 \2,p")
-        if [ -n "$finalos" ]; then
-            read -r distro releasever <<<"$finalos"
-            # 默认版本号
-            if [ -z "$releasever" ] && [ -n "$vers" ]; then
-                releasever=$(awk -F '|' '{print $NF}' <<<"|$vers")
-            fi
-            return
-        fi
-    done
-
-    error "Please specify a proper os"
-    usage_and_exit
-}
-
-verify_os_args() {
-    case "$distro" in
-    dd) [ -n "$img" ] || error_and_exit "dd need --img" ;;
-    redhat) [ -n "$img" ] || error_and_exit "redhat need --img" ;;
-    windows) [ -n "$image_name" ] || error_and_exit "Install Windows need --image-name." ;;
-    esac
-
-    case "$distro" in
-    netboot.xyz | windows) [ -z "$ssh_keys" ] || error_and_exit "not support ssh key for $distro" ;;
-    esac
-}
-
-get_cmd_path() {
-    # arch 云镜像不带 which
-    # command -v 包括脚本里面的方法
-    # ash 无效
-    type -f -p $1
-}
-
-is_have_cmd() {
-    get_cmd_path $1 >/dev/null 2>&1
-}
-
-install_pkg() {
-    is_in_windows && return
-
-    find_pkg_mgr() {
-        [ -n "$pkg_mgr" ] && return
-
-        # 查找方法1: 通过 ID / ID_LIKE
-        # 因为可能装了多种包管理器
-        if [ -f /etc/os-release ]; then
-            # shellcheck source=/dev/null
-            . /etc/os-release
-            for id in $ID $ID_LIKE; do
-                # https://github.com/chef/os_release
-                case "$id" in
-                fedora | centos | rhel) is_have_cmd dnf && pkg_mgr=dnf || pkg_mgr=yum ;;
-                debian | ubuntu) pkg_mgr=apt-get ;;
-                opensuse | suse) pkg_mgr=zypper ;;
-                alpine) pkg_mgr=apk ;;
-                arch) pkg_mgr=pacman ;;
-                gentoo) pkg_mgr=emerge ;;
-                nixos) pkg_mgr=nix-env ;;
-                esac
-                [ -n "$pkg_mgr" ] && return
-            done
-        fi
-
-        # 查找方法 2
-        for mgr in dnf yum apt-get pacman zypper emerge apk nix-env; do
-            is_have_cmd $mgr && pkg_mgr=$mgr && return
-        done
-
-        return 1
-    }
-
-    cmd_to_pkg() {
-        unset USE
-        case $cmd in
-        ar)
-            case "$pkg_mgr" in
-            *) pkg="binutils" ;;
-            esac
-            ;;
-        xz)
-            case "$pkg_mgr" in
-            apt-get) pkg="xz-utils" ;;
-            *) pkg="xz" ;;
-            esac
-            ;;
-        lsblk | findmnt)
-            case "$pkg_mgr" in
-            apk) pkg="$cmd" ;;
-            *) pkg="util-linux" ;;
-            esac
-            ;;
-        lsmem)
-            case "$pkg_mgr" in
-            apk) pkg="util-linux-misc" ;;
-            *) pkg="util-linux" ;;
-            esac
-            ;;
-        fdisk)
-            case "$pkg_mgr" in
-            apt-get) pkg="fdisk" ;;
-            apk) pkg="util-linux-misc" ;;
-            *) pkg="util-linux" ;;
-            esac
-            ;;
-        hexdump)
-            case "$pkg_mgr" in
-            apt-get) pkg="bsdmainutils" ;;
-            *) pkg="util-linux" ;;
-            esac
-            ;;
-        unsquashfs)
-            case "$pkg_mgr" in
-            zypper) pkg="squashfs" ;;
-            emerge) pkg="squashfs-tools" && export USE="lzma" ;;
-            *) pkg="squashfs-tools" ;;
-            esac
-            ;;
-        nslookup | dig)
-            case "$pkg_mgr" in
-            apt-get) pkg="dnsutils" ;;
-            pacman) pkg="bind" ;;
-            apk | emerge) pkg="bind-tools" ;;
-            yum | dnf | zypper) pkg="bind-utils" ;;
-            esac
-            ;;
-        iconv)
-            case "$pkg_mgr" in
-            apk) pkg="musl-utils" ;;
-            *) error_and_exit "Which GNU/Linux do not have iconv built-in?" ;;
-            esac
-            ;;
-        *) pkg=$cmd ;;
-        esac
-    }
-
-    # 系统                       package名称                                    repo名称
-    # centos/alma/rocky/fedora   epel-release                                   epel
-    # oracle linux               oracle-epel-release                            ol9_developer_EPEL
-    # opencloudos                epol-release                                   EPOL
-    # alibaba cloud linux 3      epel-release/epel-aliyuncs-release(qcow2自带)  epel
-    # anolis 23                  anolis-epao-release                            EPAO
-
-    # anolis 8
-    # [root@localhost ~]# yum search *ep*-release | grep -v next
-    # ========================== Name Matched: *ep*-release ==========================
-    # anolis-epao-release.noarch : EPAO Packages for Anolis OS 8 repository configuration
-    # epel-aliyuncs-release.noarch : Extra Packages for Enterprise Linux repository configuration
-    # epel-release.noarch : Extra Packages for Enterprise Linux repository configuration (qcow2自带)
-
-    check_is_need_epel() {
-        is_need_epel() {
-            case "$pkg" in
-            dpkg) true ;;
-            jq) is_have_cmd yum && ! is_have_cmd dnf ;; # el7/ol7 的 jq 在 epel 仓库
-            *) false ;;
-            esac
-        }
-
-        get_epel_repo_name() {
-            # el7 不支持 yum repolist --all，要使用 yum repolist all
-            # el7 yum repolist 第一栏有 /x86_64 后缀，因此要去掉。而 el9 没有
-            $pkg_mgr repolist all | awk '{print $1}' | awk -F/ '{print $1}' | grep -Ei 'ep(el|ol|ao)$'
-        }
-
-        get_epel_pkg_name() {
-            # el7 不支持 yum list --available，要使用 yum list available
-            $pkg_mgr list available | grep -E '(.*-)?ep(el|ol|ao)-(.*-)?release' |
-                awk '{print $1}' | cut -d. -f1 | grep -v next | head -1
-        }
-
-        if is_need_epel; then
-            if ! epel=$(get_epel_repo_name); then
-                $pkg_mgr install -y "$(get_epel_pkg_name)"
-                epel=$(get_epel_repo_name)
-            fi
-            enable_epel="--enablerepo=$epel"
-        else
-            enable_epel=
-        fi
-    }
-
-    install_pkg_real() {
-        text="$pkg"
-        if [ "$pkg" != "$cmd" ]; then
-            text+=" ($cmd)"
-        fi
-        echo "Installing package '$text'..."
-
-        case $pkg_mgr in
-        dnf)
-            check_is_need_epel
-            dnf install $enable_epel -y --setopt=install_weak_deps=False $pkg
-            ;;
-        yum)
-            check_is_need_epel
-            yum install $enable_epel -y $pkg
-            ;;
-        emerge) emerge --oneshot $pkg ;;
-        pacman) pacman -Syu --noconfirm --needed $pkg ;;
-        zypper) zypper install -y $pkg ;;
-        apk)
-            add_community_repo_for_alpine
-            apk add $pkg
-            ;;
-        apt-get)
-            [ -z "$apt_updated" ] && apt-get update && apt_updated=1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkg
-            ;;
-        nix-env)
-            # 不指定 channel 会很慢，而且很占内存
-            [ -z "$nix_updated" ] && nix-channel --update && nix_updated=1
-            nix-env -iA nixos.$pkg
-            ;;
-        esac
-    }
-
-    is_need_reinstall() {
-        cmd=$1
-
-        # gentoo 默认编译的 unsquashfs 不支持 xz
-        if [ "$cmd" = unsquashfs ] && is_have_cmd emerge && ! $cmd |& grep -wq xz; then
-            echo "unsquashfs not supported xz. rebuilding."
-            return 0
-        fi
-
-        # busybox fdisk 无法显示 mbr 分区表的 id
-        if [ "$cmd" = fdisk ] && is_have_cmd apk && $cmd |& grep -wq BusyBox; then
-            return 0
-        fi
-
-        # busybox grep 不支持 -oP
-        if [ "$cmd" = grep ] && is_have_cmd apk && $cmd |& grep -wq BusyBox; then
-            return 0
-        fi
-
-        return 1
-    }
-
-    for cmd in "$@"; do
-        if ! is_have_cmd $cmd || is_need_reinstall $cmd; then
-            if ! find_pkg_mgr; then
-                error_and_exit "Can't find compatible package manager. Please manually install $cmd."
-            fi
-            cmd_to_pkg
-            install_pkg_real
-        fi
-    done >&2
-}
-
-is_valid_ram_size() {
-    is_digit "$1" && [ "$1" -gt 0 ]
-}
-
-check_ram() {
-    ram_standard=$(
-        case "$distro" in
-        netboot.xyz) echo 0 ;;
-        alpine | debian | kali | dd) echo 256 ;;
-        arch | gentoo | aosc | nixos | windows) echo 512 ;;
-        redhat | centos | almalinux | rocky | fedora | oracle | ubuntu | anolis | opencloudos | openeuler) echo 1024 ;;
-        opensuse | fnos) echo -1 ;; # 没有安装模式
-        esac
-    )
-
-    # 不用检查内存的情况
-    if [ "$ram_standard" -eq 0 ]; then
-        return
-    fi
-
-    # 未测试
-    ram_cloud_image=256
-
-    has_cloud_image=$(
-        case "$distro" in
-        redhat | centos | almalinux | rocky | oracle | fedora | debian | ubuntu | opensuse | anolis | openeuler) echo true ;;
-        netboot.xyz | alpine | dd | arch | gentoo | nixos | kali | windows) echo false ;;
-        esac
-    )
-
-    if is_in_windows; then
-        ram_size=$(wmic memorychip get capacity | awk -F= '{sum+=$2} END {if(sum>0) print sum/1024/1024}')
-    else
-        # lsmem最准确但 centos7 arm 和 alpine 不能用，debian 9 util-linux 没有 lsmem
-        # arm 24g dmidecode 显示少了128m
-        # arm 24g lshw 显示23BiB
-        # ec2 t4g arm alpine 用 lsmem 和 dmidecode 都无效，要用 lshw，但结果和free -m一致，其他平台则没问题
-        install_pkg lsmem
-        ram_size=$(lsmem -b 2>/dev/null | grep 'Total online memory:' | awk '{ print $NF/1024/1024 }')
-
-        if ! is_valid_ram_size "$ram_size"; then
-            install_pkg dmidecode
-            ram_size=$(dmidecode -t 17 | grep "Size.*[GM]B" | awk '{if ($3=="GB") s+=$2*1024; else s+=$2} END {if(s>0) print s}')
-        fi
-
-        if ! is_valid_ram_size "$ram_size"; then
-            install_pkg lshw
-            # 不能忽略 -i，alpine 显示的是 System memory
-            ram_str=$(lshw -c memory -short | grep -i 'System Memory' | awk '{print $3}')
-            ram_size=$(grep <<<$ram_str -o '[0-9]*')
-            grep <<<$ram_str GiB && ram_size=$((ram_size * 1024))
-        fi
-    fi
-
-    # 用于兜底，不太准确
-    # cygwin 要装 procps-ng 才有 free 命令
-    if ! is_valid_ram_size "$ram_size"; then
-        ram_size_k=$(grep '^MemTotal:' /proc/meminfo | awk '{print $2}')
-        ram_size=$((ram_size_k / 1024 + 64 + 4))
-    fi
-
-    if ! is_valid_ram_size "$ram_size"; then
-        error_and_exit "Could not detect RAM size."
-    fi
-
-    # ram 足够就用普通方法安装，否则如果内存大于512就用 cloud image
-    # TODO: 测试 256 384 内存
-    if ! is_use_cloud_image && [ $ram_size -lt $ram_standard ]; then
-        if $has_cloud_image; then
-            info "RAM < $ram_standard MB. Fallback to cloud image mode"
-            cloud_image=1
-        else
-            error_and_exit "Could not install $distro: RAM < $ram_standard MB."
-        fi
-    fi
-
-    if is_use_cloud_image && [ $ram_size -lt $ram_cloud_image ]; then
-        error_and_exit "Could not install $distro using cloud image: RAM < $ram_cloud_image MB."
-    fi
-}
-
-is_efi() {
-    if is_in_windows; then
-        # bcdedit | grep -qi '^path.*\.efi'
-        mountvol | grep -q --text 'EFI'
-    else
-        [ -d /sys/firmware/efi ]
-    fi
-}
-
-is_grub_dir_linked() {
-    # cloudcone 重装前/重装后(方法1)
-    [ "$(readlink -f /boot/grub/grub.cfg)" = /boot/grub2/grub.cfg ] ||
-        [ "$(readlink -f /boot/grub2/grub.cfg)" = /boot/grub/grub.cfg ] ||
-        # cloudcone 重装后(方法2)
-        { [ -f /boot/grub2/grub.cfg ] && [ "$(cat /boot/grub2/grub.cfg)" = 'chainloader (hd0)+1' ]; }
-}
-
-is_secure_boot_enabled() {
-    if is_efi; then
-        if is_in_windows; then
-            reg query 'HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State' /v UEFISecureBootEnabled 2>/dev/null | grep 0x1
-        else
-            if dmesg | grep -i 'Secure boot enabled'; then
-                return 0
-            fi
-            install_pkg mokutil
-            mokutil --sb-state 2>&1 | grep -i 'SecureBoot enabled'
-        fi
-    else
-        return 1
-    fi
-}
-
-is_need_grub_extlinux() {
-    ! { is_netboot_xyz && is_efi; }
-}
-
-# 只有 linux bios 是用本机的 grub/extlinux
-is_use_local_grub_extlinux() {
-    is_need_grub_extlinux && ! is_in_windows && ! is_efi
-}
-
-is_use_local_grub() {
-    is_use_local_grub_extlinux && is_mbr_using_grub
-}
-
-is_use_local_extlinux() {
-    is_use_local_grub_extlinux && ! is_mbr_using_grub
-}
-
-is_mbr_using_grub() {
-    find_main_disk
-    # 各发行版不一定自带 strings hexdump xxd od 命令
-    head -c 440 /dev/$xda | grep --text -iq 'GRUB'
-}
-
-to_upper() {
-    tr '[:lower:]' '[:upper:]'
-}
-
-to_lower() {
-    tr '[:upper:]' '[:lower:]'
-}
-
-del_cr() {
-    # wmic/reg 换行符是 \r\r\n
-    # wmic nicconfig where InterfaceIndex=$id get MACAddress,IPAddress,IPSubnet,DefaultIPGateway | hexdump -c
-    sed -E 's/\r+$//'
-}
-
-del_empty_lines() {
-    sed '/^[[:space:]]*$/d'
-}
-
-trim() {
-    # sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
-    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
-}
-
-prompt_password() {
-    info "prompt password"
-    while true; do
-        IFS= read -r -p "Password [$DEFAULT_PASSWORD]: " password
-        IFS= read -r -p "Retype password [$DEFAULT_PASSWORD]: " password_confirm
-        password=${password:-$DEFAULT_PASSWORD}
-        password_confirm=${password_confirm:-$DEFAULT_PASSWORD}
-        if [ -z "$password" ]; then
-            error "Passwords is empty. Try again."
-        elif [ "$password" != "$password_confirm" ]; then
-            error "Passwords don't match. Try again."
-        else
-            break
-        fi
-    done
-}
-
-save_password() {
-    dir=$1
-
-    # mkpasswd 有三个
-    # expect 里的 mkpasswd 是用来生成随机密码的
-    # whois 里的 mkpasswd 才是我们想要的，可能不支持 yescrypt，alpine 的 mkpasswd 是独立的包
-    # busybox 里的 mkpasswd 也是我们想要的，但多数不支持 yescrypt
-
-    # alpine 这两个包有冲突
-    # apk add expect mkpasswd
-
-    # 不要用 echo "$password" 保存密码，原因：
-    # password="-n"
-    # echo "$password"  # 空白
-
-    # 明文密码
-    # 假如用户运行 alpine live 直接打包硬盘镜像，如果保存了明文密码，则会暴露明文密码，因为 netboot initrd 在里面
-    # 通过 --password 传入密码，history 有记录，也会暴露明文密码
-    # /reinstall.log 也会暴露明文密码（已处理）
-    if false; then
-        printf '%s' "$password" >>"$dir/password-plaintext"
-    fi
-
-    # sha512
-    # 以下系统均支持 sha512 密码，但是生成密码需要不同的工具
-    # 兼容性     openssl   mkpasswd          busybox  python
-    # centos 7     ×      只有expect的       需要编译    √
-    # centos 8     √      只有expect的
-    # debian 9     ×         √
-    # ubuntu 16    ×         √
-    # alpine       √      可能系统装了expect     √
-    # cygwin       √
-    # others       √
-
-    # alpine
-    if is_have_cmd busybox && busybox mkpasswd --help 2>&1 | grep -wq sha512; then
-        crypted=$(printf '%s' "$password" | busybox mkpasswd -m sha512)
-    # others
-    elif install_pkg openssl && openssl passwd --help 2>&1 | grep -wq '\-6'; then
-        crypted=$(printf '%s' "$password" | openssl passwd -6 -stdin)
-    # debian 9 / ubuntu 16
-    elif is_have_cmd apt-get && install_pkg whois && mkpasswd -m help | grep -wq sha-512; then
-        crypted=$(printf '%s' "$password" | mkpasswd -m sha-512 --stdin)
-    # centos 7
-    # crypt.mksalt 是 python3 的
-    # 红帽把它 backport 到了 centos7 的 python2 上
-    # 在其它发行版的 python2 上运行会出错
-    elif is_have_cmd yum && is_have_cmd python2; then
-        crypted=$(python2 -c "import crypt, sys; print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))" "$password")
-    else
-        error_and_exit "Could not generate sha512 password."
-    fi
-    echo "$crypted" >"$dir/password-linux-sha512"
-
-    # yescrypt
-    # 旧系统不支持，先不管
-    if false; then
-        if mkpasswd -m help | grep -wq yescrypt; then
-            crypted=$(printf '%s' "$password" | mkpasswd -m yescrypt --stdin)
-            echo "$crypted" >"$dir/password-linux-yescrypt"
-        fi
-    fi
-
-    # windows
-    if [ "$distro" = windows ] || [ "$distro" = dd ]; then
-        install_pkg iconv
-
-        # 要分两行写，因为 echo "$(xxx)" 返回值始终为 0，出错也不会中断脚本
-        # grep . 为了保证脚本没有出错
-        base64=$(printf '%s' "${password}Password" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0 | grep .)
-        echo "$base64" >"$dir/password-windows-user-base64"
-
-        base64=$(printf '%s' "${password}AdministratorPassword" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0 | grep .)
-        echo "$base64" >"$dir/password-windows-administrator-base64"
-    fi
-}
-
-# 记录主硬盘
-find_main_disk() {
-    if [ -n "$main_disk" ]; then
-        return
-    fi
-
-    if is_in_windows; then
-        # TODO:
-        # 已测试 vista
-        # 测试 软raid
-        # 测试 动态磁盘
-
-        # diskpart 命令结果
-        # 磁盘 ID: E5FDE61C
-        # 磁盘 ID: {92CF6564-9B2E-4348-A3BD-D84E3507EBD7}
-        main_disk=$(printf "%s\n%s" "select volume $c" "uniqueid disk" | diskpart |
-            tail -1 | awk '{print $NF}' | sed 's,[{}],,g')
-    else
-        # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
-        # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
-        # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
-        # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
-
-        # 还有 findmnt
-
-        # 改成先检测 /boot/efi /efi /boot 分区？
-
-        install_pkg lsblk
-        # 查找主硬盘时，优先查找 /boot 分区，再查找 / 分区
-        # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
-        mapper=$(mount | awk '$3=="/boot" {print $1}' | grep . || mount | awk '$3=="/" {print $1}')
-        xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
-
-        # 检测主硬盘是否横跨多个磁盘
-        os_across_disks_count=$(wc -l <<<"$xda")
-        if [ $os_across_disks_count -eq 1 ]; then
-            info "Main disk: $xda"
-        else
-            error_and_exit "OS across $os_across_disks_count disk: $xda"
-        fi
-
-        # 可以用 dd 找出 guid?
-
-        # centos7 blkid lsblk 不显示 PTUUID
-        # centos7 sfdisk 不显示 Disk identifier
-        # alpine blkid 不显示 gpt 分区表的 PTUUID
-        # 因此用 fdisk
-
-        # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
-        # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
-        # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
-        # 不显示 Disk identifier                                        # busybox fdisk + mbr
-
-        # 获取 xda 的 id
-        install_pkg fdisk
-        main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
-    fi
-
-    # 检查 id 格式是否正确
-    if ! grep -Eix '[0-9a-f]{8}' <<<"$main_disk" &&
-        ! grep -Eix '[0-9a-f-]{36}' <<<"$main_disk"; then
-        error_and_exit "Disk ID is invalid: $main_disk"
-    fi
-}
-
-is_found_ipv4_netconf() {
-    [ -n "$ipv4_mac" ] && [ -n "$ipv4_addr" ] && [ -n "$ipv4_gateway" ]
-}
-
-is_found_ipv6_netconf() {
-    [ -n "$ipv6_mac" ] && [ -n "$ipv6_addr" ] && [ -n "$ipv6_gateway" ]
-}
-
-# TODO: 单网卡多IP
-collect_netconf() {
-    if is_in_windows; then
-        convert_net_str_to_array() {
-            config=$1
-            key=$2
-            var=$3
-            IFS=',' read -r -a "${var?}" <<<"$(grep "$key=" <<<"$config" | cut -d= -f2 | sed 's/[{}\"]//g')"
-        }
-
-        # 部分机器精简了 powershell
-        # 所以不要用 powershell 获取网络信息
-        # ids=$(wmic nic where "PhysicalAdapter=true and MACAddress is not null and (PNPDeviceID like '%VEN_%&DEV_%' or PNPDeviceID like '%{F8615163-DF3E-46C5-913F-F2D2F965ED0E}%')" get InterfaceIndex | sed '1d')
-
-        # 否        手动        0    0.0.0.0/0                  19  192.168.1.1
-        # 否        手动        0    0.0.0.0/0                  59  nekoray-tun
-
-        # wmic nic:
-        # 真实网卡
-        # AdapterType=以太网 802.3
-        # AdapterTypeId=0
-        # MACAddress=68:EC:C5:11:11:11
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=PCI\VEN_8086&amp;DEV_095A&amp;SUBSYS_94108086&amp;REV_61\4&amp;295A4BD&amp;1&amp;00E0
-
-        # VPN tun 网卡，部分移动云电脑也有
-        # AdapterType=
-        # AdapterTypeId=
-        # MACAddress=
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=SWD\WINTUN\{6A460D48-FB76-6C3F-A47D-EF97D3DC6B0E}
-
-        # VMware 网卡
-        # AdapterType=以太网 802.3
-        # AdapterTypeId=0
-        # MACAddress=00:50:56:C0:00:08
-        # PhysicalAdapter=TRUE
-        # PNPDeviceID=ROOT\VMWARE\0001
-
-        for v in 4 6; do
-            if [ "$v" = 4 ]; then
-                # 或者 route print
-                routes=$(netsh int ipv4 show route | awk '$4 == "0.0.0.0/0"')
-            else
-                routes=$(netsh int ipv6 show route | awk '$4 == "::/0"')
-            fi
-
-            if [ -z "$routes" ]; then
-                continue
-            fi
-
-            while read -r route; do
-                if false; then
-                    read -r _ _ _ _ id gateway <<<"$route"
-                else
-                    id=$(awk '{print $5}' <<<"$route")
-                    gateway=$(awk '{print $6}' <<<"$route")
-                fi
-
-                config=$(wmic nicconfig where InterfaceIndex=$id get MACAddress,IPAddress,IPSubnet,DefaultIPGateway)
-                # 排除 IP/子网/网关/MAC 为空的
-                if grep -q '=$' <<<"$config"; then
-                    continue
-                fi
-
-                mac_addr=$(grep "MACAddress=" <<<"$config" | cut -d= -f2 | to_lower)
-                convert_net_str_to_array "$config" IPAddress ips
-                convert_net_str_to_array "$config" IPSubnet subnets
-                convert_net_str_to_array "$config" DefaultIPGateway gateways
-
-                # IPv4
-                # shellcheck disable=SC2154
-                if [ "$v" = 4 ]; then
-                    for ((i = 0; i < ${#ips[@]}; i++)); do
-                        ip=${ips[i]}
-                        subnet=${subnets[i]}
-                        if [[ "$ip" = *.* ]]; then
-                            # ipcalc 依赖 perl，会使 cygwin 增加 ~50M
-                            # cidr=$(ipcalc -b "$ip/$subnet" | grep Netmask: | awk '{print $NF}')
-                            cidr=$(mask2cidr "$subnet")
-                            ipv4_addr="$ip/$cidr"
-                            ipv4_gateway="$gateway"
-                            ipv4_mac="$mac_addr"
-                            # 只取第一个 IP
-                            break
-                        fi
-                    done
-                fi
-
-                # IPv6
-                if [ "$v" = 6 ]; then
-                    ipv6_type_list=$(netsh interface ipv6 show address $id normal)
-                    for ((i = 0; i < ${#ips[@]}; i++)); do
-                        ip=${ips[i]}
-                        cidr=${subnets[i]}
-                        if [[ "$ip" = *:* ]]; then
-                            ipv6_type=$(grep "$ip" <<<"$ipv6_type_list" | awk '{print $1}')
-                            # Public 是 slaac
-                            # 还有类型 Temporary，不过有 Temporary 肯定还有 Public，因此不用
-                            if [ "$ipv6_type" = Public ] ||
-                                [ "$ipv6_type" = Dhcp ] ||
-                                [ "$ipv6_type" = Manual ]; then
-                                ipv6_addr="$ip/$cidr"
-                                ipv6_gateway="$gateway"
-                                ipv6_mac="$mac_addr"
-                                # 只取第一个 IP
-                                break
-                            fi
-                        fi
-                    done
-                fi
-
-                # 网关
-                # shellcheck disable=SC2154
-                if false; then
-                    for gateway in "${gateways[@]}"; do
-                        if [ -n "$ipv4_addr" ] && [[ "$gateway" = *.* ]]; then
-                            ipv4_gateway="$gateway"
-                        elif [ -n "$ipv6_addr" ] && [[ "$gateway" = *:* ]]; then
-                            ipv6_gateway="$gateway"
-                        fi
-                    done
-                fi
-
-                # 如果通过本条 route 的网卡找到了 IP 则退出 routes 循环
-                if is_found_ipv${v}_netconf; then
-                    break
-                fi
-            done < <(echo "$routes")
-        done
-    else
-        # linux
-        # 通过默认网关得到默认网卡
-
-        # 多个默认路由下
-        # ip -6 route show default dev ens3 完全不显示
-
-        # ip -6 route show default
-        # default proto static metric 1024 pref medium
-        #         nexthop via 2a01:1111:262:4940::2 dev ens3 weight 1 onlink
-        #         nexthop via fe80::5054:ff:fed4:5286 dev ens3 weight 1
-
-        # ip -6 route show default
-        # default via 2602:1111:0:80::1 dev eth0 metric 1024 onlink pref medium
-
-        # arch + vultr
-        # ip -6 route show default
-        # default nhid 4011550343 via fe80::fc00:5ff:fe3d:2714 dev enp1s0 proto ra metric 1024 expires 1504sec pref medium
-
-        for v in 4 6; do
-            if via_gateway_dev_ethx=$(ip -$v route show default | grep -Ewo 'via [^ ]+ dev [^ ]+' | head -1 | grep .); then
-                read -r _ gateway _ ethx <<<"$via_gateway_dev_ethx"
-                eval ipv${v}_ethx="$ethx" # can_use_cloud_kernel 要用
-                eval ipv${v}_mac="$(ip link show dev $ethx | grep link/ether | head -1 | awk '{print $2}')"
-                eval ipv${v}_gateway="$gateway"
-                eval ipv${v}_addr="$(ip -$v -o addr show scope global dev $ethx | grep -v temporary | head -1 | awk '{print $4}')"
-            fi
-        done
-    fi
-
-    if ! is_found_ipv4_netconf && ! is_found_ipv6_netconf; then
-        error_and_exit "Can not get IP info."
-    fi
-
-    info "Network Info"
-    echo "IPv4 MAC: $ipv4_mac"
-    echo "IPv4 Address: $ipv4_addr"
-    echo "IPv4 Gateway: $ipv4_gateway"
-    echo "---"
-    echo "IPv6 MAC: $ipv6_mac"
-    echo "IPv6 Address: $ipv6_addr"
-    echo "IPv6 Gateway: $ipv6_gateway"
-    echo
-}
-
-add_efi_entry_in_windows() {
-    source=$1
-
-    # 挂载
-    if result=$(find /cygdrive/?/EFI/Microsoft/Boot/bootmgfw.efi 2>/dev/null); then
-        # 已经挂载
-        x=$(echo $result | cut -d/ -f3)
-    else
-        # 找到空盘符并挂载
-        for x in {a..z}; do
-            [ ! -e /cygdrive/$x ] && break
-        done
-        mountvol $x: /s
-    fi
-
-    # 文件夹命名为reinstall而不是grub，因为可能机器已经安装了grub，bcdedit名字同理
-    dist_dir=/cygdrive/$x/EFI/reinstall
-    basename=$(basename $source)
-    mkdir -p $dist_dir
-    cp -f "$source" "$dist_dir/$basename"
-
-    # 如果 {fwbootmgr} displayorder 为空
-    # 执行 bcdedit /copy '{bootmgr}' 会报错
-    # 例如 azure windows 2016 模板
-    # 要先设置默认的 {fwbootmgr} displayorder
-    # https://github.com/hakuna-m/wubiuefi/issues/286
-    bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst
-
-    # 添加启动项
-    id=$(bcdedit /copy '{bootmgr}' /d "$(get_entry_name)" | grep -o '{.*}')
-    bcdedit /set $id device partition=$x:
-    bcdedit /set $id path \\EFI\\reinstall\\$basename
-    bcdedit /set '{fwbootmgr}' bootsequence $id
-}
-
-get_maybe_efi_dirs_in_linux() {
-    # arch云镜像efi分区挂载在/efi，且使用 autofs，挂载后会有两个 /efi 条目
-    # openEuler 云镜像 boot 分区是 vfat 格式，但 vfat 可以当 efi 分区用
-    # TODO: 最好通过 lsblk/blkid 检查是否为 efi 分区类型
-    mount | awk '$5=="vfat" || $5=="autofs" {print $3}' | grep -E '/boot|/efi' | sort -u
-}
-
-get_disk_by_part() {
-    dev_part=$1
-    install_pkg lsblk >&2
-    lsblk -rn --inverse "$dev_part" | grep -w disk | awk '{print $1}'
-}
-
-get_part_num_by_part() {
-    dev_part=$1
-    grep -oE '[0-9]*$' <<<"$dev_part"
-}
-
-grep_efi_entry() {
-    # efibootmgr
-    # BootCurrent: 0002
-    # Timeout: 1 seconds
-    # BootOrder: 0000,0002,0003,0001
-    # Boot0000* sles-secureboot
-    # Boot0001* CD/DVD Rom
-    # Boot0002* Hard Disk
-    # Boot0003* sles-secureboot
-    # MirroredPercentageAbove4G: 0.00
-    # MirrorMemoryBelow4GB: false
-
-    # 根据文档，* 表示 active，也就是说有可能没有*(代表inactive)
-    # https://manpages.debian.org/testing/efibootmgr/efibootmgr.8.en.html
-    grep -E '^Boot[0-9a-fA-F]{4}'
-}
-
-# trans.sh 有同名方法
-grep_efi_index() {
-    awk '{print $1}' | sed -e 's/Boot//' -e 's/\*//'
-}
-
-add_efi_entry_in_linux() {
-    source=$1
-
-    install_pkg efibootmgr
-
-    for efi_part in $(get_maybe_efi_dirs_in_linux); do
-        if find $efi_part -iname "*.efi" >/dev/null; then
-            dist_dir=$efi_part/EFI/reinstall
-            basename=$(basename $source)
-            mkdir -p $dist_dir
-
-            if [[ "$source" = http* ]]; then
-                curl -Lo "$dist_dir/$basename" "$source"
-            else
-                cp -f "$source" "$dist_dir/$basename"
-            fi
-
-            if false; then
-                grub_probe="$(command -v grub-probe grub2-probe)"
-                dev_part="$("$grub_probe" -t device "$dist_dir")"
-            else
-                install_pkg findmnt
-                # arch findmnt 会得到
-                # systemd-1
-                # /dev/sda2
-                dev_part=$(findmnt -T "$dist_dir" -no SOURCE | grep '^/dev/')
-            fi
-
-            id=$(efibootmgr --create-only \
-                --disk "/dev/$(get_disk_by_part $dev_part)" \
-                --part "$(get_part_num_by_part $dev_part)" \
-                --label "$(get_entry_name)" \
-                --loader "\\EFI\\reinstall\\$basename" |
-                grep_efi_entry | tail -1 | grep_efi_index)
-            efibootmgr --bootnext $id
-            return
-        fi
-    done
-
-    error_and_exit "Can't find efi partition."
-}
-
-get_grub_efi_filename() {
-    case "$basearch" in
-    x86_64) echo grubx64.efi ;;
-    aarch64) echo grubaa64.efi ;;
-    esac
-}
-
-install_grub_linux_efi() {
-    info 'download grub efi'
-
-    # fedora 39 的 efi 无法识别 opensuse tumbleweed 的 xfs
-    efi_distro=fedora
-    grub_efi=$(get_grub_efi_filename)
-
-    # 不要用 download.opensuse.org 和 download.fedoraproject.org
-    # 因为 ipv6 访问有时跳转到 ipv4 地址，造成 ipv6 only 机器无法下载
-    # 日韩机器有时得到国内镜像源，但镜像源屏蔽了国外 IP 导致连不上
-    # https://mirrors.bfsu.edu.cn/opensuse/ports/aarch64/tumbleweed/repo/oss/EFI/BOOT/grub.efi
-
-    # fcix 经常 404
-    # https://mirror.fcix.net/opensuse/tumbleweed/repo/oss/EFI/BOOT/bootx64.efi
-    # https://mirror.fcix.net/opensuse/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2
-
-    # dl.fedoraproject.org 不支持 ipv6
-
-    if [ "$efi_distro" = fedora ]; then
-        fedora_ver=$(get_latest_distro_releasever fedora)
-
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/fedora
-        else
-            mirror=https://d2lzkl7pfhq30w.cloudfront.net/pub/fedora/linux
-        fi
-
-        curl -Lo $tmp/$grub_efi $mirror/releases/$fedora_ver/Everything/$basearch/os/EFI/BOOT/$grub_efi
-    else
-        if is_in_china; then
-            mirror=https://mirrors.tuna.tsinghua.edu.cn/opensuse
-        else
-            mirror=https://downloadcontentcdn.opensuse.org
-        fi
-
-        [ "$basearch" = x86_64 ] && ports='' || ports=/ports/$basearch
-
-        curl -Lo $tmp/$grub_efi $mirror$ports/tumbleweed/repo/oss/EFI/BOOT/grub.efi
-    fi
-
-    add_efi_entry_in_linux $tmp/$grub_efi
-}
-
-download_and_extract_apk() {
-    local alpine_ver=$1
-    local package=$2
-    local extract_dir=$3
-
-    install_pkg tar xz
-    is_in_china && mirror=http://mirrors.tuna.tsinghua.edu.cn/alpine || mirror=https://dl-cdn.alpinelinux.org/alpine
-    package_apk=$(curl -L $mirror/v$alpine_ver/main/$basearch/ | grep -oP "$package-[^-]*-[^-]*\.apk" | sort -u)
-    if ! [ "$(wc -l <<<"$package_apk")" -eq 1 ]; then
-        error_and_exit "find no/multi apks."
-    fi
-    mkdir -p "$extract_dir"
-
-    # 屏蔽警告
-    tar 2>&1 | grep -q BusyBox && tar_args= || tar_args=--warning=no-unknown-keyword
-    curl -L "$mirror/v$alpine_ver/main/$basearch/$package_apk" | tar xz $tar_args -C "$extract_dir"
-}
-
-install_grub_win() {
-    # 下载 grub
-    info download grub
-    grub_ver=2.06
-    # ftpmirror.gnu.org 是 geoip 重定向，不是 cdn
-    # 有可能重定义到一个拉黑了部分 IP 的服务器
-    is_in_china && grub_url=https://mirrors.tuna.tsinghua.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
-        grub_url=https://mirrors.kernel.org/gnu/grub/grub-$grub_ver-for-windows.zip
-    curl -Lo $tmp/grub.zip $grub_url
-    # unzip -qo $tmp/grub.zip
-    7z x $tmp/grub.zip -o$tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
-    grub_dir=$tmp/grub-$grub_ver-for-windows
-    grub=$grub_dir/grub
-
-    # 设置 grub 包含的模块
-    # 原系统是 windows，因此不需要 ext2 lvm xfs btrfs
-    grub_modules+=" normal minicmd serial ls echo test cat reboot halt linux chain search all_video configfile"
-    grub_modules+=" scsi part_msdos part_gpt fat ntfs ntfscomp lzopio xzio gzio zstd"
-    if ! is_efi; then
-        grub_modules+=" biosdisk linux16"
-    fi
-
-    # 设置 grub prefix 为c盘根目录
-    # 运行 grub-probe 会改变cmd窗口字体
-    prefix=$($grub-probe -t drive $c: | sed 's|.*PhysicalDrive|(hd|' | del_cr)/
-    echo $prefix
-
-    # 安装 grub
-    if is_efi; then
-        # efi
-        info install grub for efi
-
-        case "$basearch" in
-        x86_64) grub_arch=x86_64 ;;
-        aarch64) grub_arch=arm64 ;;
-        esac
-
-        # 下载 grub arm64 模块
-        if ! [ -d $grub_dir/grub/$grub_arch-efi ]; then
-            # 3.20 是 grub 2.12，可能会有问题
-            alpine_ver=3.19
-            download_and_extract_apk $alpine_ver grub-efi $tmp/grub-efi
-            cp -r $tmp/grub-efi/usr/lib/grub/$grub_arch-efi/ $grub_dir
-        fi
-
-        grub_efi=$(get_grub_efi_filename)
-        $grub-mkimage -p $prefix -O $grub_arch-efi -o "$(cygpath -w "$grub_dir/$grub_efi")" $grub_modules
-        add_efi_entry_in_windows "$grub_dir/$grub_efi"
-    else
-        # bios
-        info install grub for bios
-
-        # bootmgr 加载 g2ldr 有大小限制
-        # 超过大小会报错 0xc000007b
-        # 解决方法1 g2ldr.mbr + g2ldr
-        # 解决方法2 生成少于64K的 g2ldr + 动态模块
-        if false; then
-            # g2ldr.mbr
-            # 部分国内机无法访问 ftp.cn.debian.org
-            is_in_china && host=mirrors.tuna.tsinghua.edu.cn || host=deb.debian.org
-            curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
-            7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
-            find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
-
-            # g2ldr
-            # 配置文件 c:\grub.cfg
-            $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
-            cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
-        else
-            # grub-install 无法设置 prefix
-            # 配置文件 c:\grub\grub.cfg
-            $grub-install $c \
-                --target=i386-pc \
-                --boot-directory=$c: \
-                --install-modules="$grub_modules" \
-                --themes= \
-                --fonts= \
-                --no-bootsector
-
-            cat $grub_dir/i386-pc/lnxboot.img /cygdrive/$c/grub/i386-pc/core.img >/cygdrive/$c/g2ldr
-        fi
-
-        # 添加引导
-        # 脚本可能不是首次运行，所以先删除原来的
-        id='{1c41f649-1637-52f1-aea8-f96bfebeecc8}'
-        bcdedit /enum all | grep --text $id && bcdedit /delete $id
-        bcdedit /create $id /d "$(get_entry_name)" /application bootsector
-        bcdedit /set $id device partition=$c:
-        bcdedit /set $id path \\g2ldr
-        bcdedit /displayorder $id /addlast
-        bcdedit /bootsequence $id /addfirst
-    fi
-}
-
-find_grub_extlinux_cfg() {
-    dir=$1
-    filename=$2
-    keyword=$3
-
-    # 当 ln -s /boot/grub /boot/grub2 时
-    # find /boot/ 会自动忽略 /boot/grub2 里面的文件
-    cfgs=$(
-        # 只要 $dir 存在
-        # 无论是否找到结果，返回值都是 0
-        find $dir \
-            -type f -name $filename \
-            -exec grep -E -l "$keyword" {} \;
-    )
-
-    count="$(wc -l <<<"$cfgs")"
-    if [ "$count" -eq 1 ]; then
-        echo "$cfgs"
-    else
-        error_and_exit "Find $count $filename."
-    fi
-}
-
-# 空格、&、用户输入的网址要加引号，否则 grub 无法正确识别
-is_need_quote() {
-    [[ "$1" = *' '* ]] || [[ "$1" = *'&'* ]] || [[ "$1" = http* ]]
-}
-
-# 转换 finalos_a=1 为 finalos.a=1 ，排除 finalos_mirrorlist
-build_finalos_cmdline() {
-    if vars=$(compgen -v finalos_); then
-        for key in $vars; do
-            value=${!key}
-            key=${key#finalos_}
-            if [ -n "$value" ] && [ $key != "mirrorlist" ]; then
-                is_need_quote "$value" &&
-                    finalos_cmdline+=" finalos_$key='$value'" ||
-                    finalos_cmdline+=" finalos_$key=$value"
-            fi
-        done
-    fi
-}
-
-build_extra_cmdline() {
-    # 使用 extra_xxx=yyy 而不是 extra.xxx=yyy
-    # 因为 debian installer /lib/debian-installer-startup.d/S02module-params
-    # 会将 extra.xxx=yyy 写入新系统的 /etc/modprobe.d/local.conf
-    # https://answers.launchpad.net/ubuntu/+question/249456
-    # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
-    for key in confhome hold force force_cn force_old_windows_setup cloud_image main_disk \
-        elts deb_mirror \
-        ssh_port rdp_port web_port allow_ping; do
-        value=${!key}
-        if [ -n "$value" ]; then
-            is_need_quote "$value" &&
-                extra_cmdline+=" extra_$key='$value'" ||
-                extra_cmdline+=" extra_$key=$value"
-        fi
-    done
-
-    # 指定最终安装系统的 mirrorlist，链接有&，在grub中是特殊字符，所以要加引号
-    if [ -n "$finalos_mirrorlist" ]; then
-        extra_cmdline+=" extra_mirrorlist='$finalos_mirrorlist'"
-    elif [ -n "$nextos_mirrorlist" ]; then
-        extra_cmdline+=" extra_mirrorlist='$nextos_mirrorlist'"
-    fi
-
-    # cloudcone 特殊处理
-    if is_grub_dir_linked; then
-        finalos_cmdline+=" extra_link_grub_dir=1"
-    fi
-}
-
-echo_tmp_ttys() {
-    if false; then
-        curl -L $confhome/ttys.sh | sh -s "console="
-    else
-        case "$basearch" in
-        x86_64) echo "console=ttyS0,115200n8 console=tty0" ;;
-        aarch64) echo "console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0" ;;
-        esac
-    fi
-}
-
-get_entry_name() {
-    printf 'reinstall ('
-    printf '%s' "$distro"
-    [ -n "$releasever" ] && printf ' %s' "$releasever"
-    [ "$distro" = alpine ] && [ "$hold" = 1 ] && printf ' Live OS'
-    printf ')'
-}
-
-# shellcheck disable=SC2154
-build_nextos_cmdline() {
-    if [ $nextos_distro = alpine ]; then
-        nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
-    elif is_distro_like_debian $nextos_distro; then
-        nextos_cmdline="lowmem/low=1 auto=true priority=critical"
-        nextos_cmdline+=" url=$nextos_ks"
-        nextos_cmdline+=" mirror/http/hostname=${nextos_udeb_mirror%/*}"
-        nextos_cmdline+=" mirror/http/directory=/${nextos_udeb_mirror##*/}"
-        nextos_cmdline+=" base-installer/kernel/image=$nextos_kernel"
-        # elts 的 debian 不能用 security 源，否则安装过程会提示无法访问
-        if [ "$nextos_distro" = debian ] && is_debian_elts; then
-            nextos_cmdline+=" apt-setup/services-select="
-        fi
-        # kali 安装好后网卡是 eth0 这种格式，但安装时不是
-        if [ "$nextos_distro" = kali ]; then
-            nextos_cmdline+=" net.ifnames=0"
-            nextos_cmdline+=" simple-cdd/profiles=kali"
-        fi
-    elif is_distro_like_redhat $nextos_distro; then
-        # redhat
-        nextos_cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks"
-    fi
-
-    if is_distro_like_debian $nextos_distro; then
-        if [ "$basearch" = "x86_64" ]; then
-            # debian installer 好像第一个 tty 是主 tty
-            # 设置ttyS0,tty0,安装界面还是显示在ttyS0
-            :
-        else
-            # debian arm 在没有ttyAMA0的机器上（aws t4g），最少要设置一个tty才能启动
-            # 只设置tty0也行，但安装过程ttyS0没有显示
-            nextos_cmdline+=" $(echo_tmp_ttys)"
-        fi
-    else
-        nextos_cmdline+=" $(echo_tmp_ttys)"
-    fi
-    # nextos_cmdline+=" mem=256M"
-    # nextos_cmdline+=" lowmem=+1"
-}
-
-build_cmdline() {
-    # nextos
-    build_nextos_cmdline
-
-    # finalos
-    # trans 需要 finalos_distro 识别是安装 alpine 还是其他系统
-    if [ "$distro" = alpine ]; then
-        finalos_distro=alpine
-    fi
-    if [ -n "$finalos_distro" ]; then
-        build_finalos_cmdline
-    fi
-
-    # extra
-    build_extra_cmdline
-
-    cmdline="$nextos_cmdline $finalos_cmdline $extra_cmdline"
-}
-
-# 脚本可能多次运行，先清理之前的残留
-mkdir_clear() {
-    dir=$1
-
-    if [ -z "$dir" ] || [ "$dir" = / ]; then
-        return
-    fi
-
-    # 再次运行时，有可能 mount 了 btrfs root，因此先要 umount_all
-    # 但目前不需要 mount ，因此用不到
-    # umount_all $dir
-    rm -rf $dir
-    mkdir -p $dir
-}
-
-mod_initrd_debian_kali() {
-    # hack 1
-    # 允许设置 ipv4 onlink 网关
-    sed -Ei 's,&&( onlink=),||\1,' etc/udhcpc/default.script
-
-    # hack 2
-    # 修改 /var/lib/dpkg/info/netcfg.postinst 运行我们的脚本
-    netcfg() {
-        #!/bin/sh
-        # shellcheck source=/dev/null
-        . /usr/share/debconf/confmodule
-        db_progress START 0 5 debian-installer/netcfg/title
-
-        : get_ip_conf_cmd
-
-        # 运行 trans.sh，保存配置
-        db_progress INFO base-installer/progress/netcfg
-        sh /trans.sh
-        db_progress STEP 1
-    }
-
-    # 直接覆盖 net-retriever，方便调试
-    # curl -Lo /usr/lib/debian-installer/retriever/net-retriever $confhome/net-retriever
-
-    postinst=var/lib/dpkg/info/netcfg.postinst
-    get_function_content netcfg >$postinst
-    get_ip_conf_cmd | insert_into_file $postinst after ": get_ip_conf_cmd"
-    # cat $postinst
-
-    change_priority() {
-        while IFS= read -r line; do
-            if [[ "$line" = Package:* ]]; then
-                package=$(echo "$line" | cut -d' ' -f2-)
-
-            elif [[ "$line" = Priority:* ]]; then
-                # shellcheck disable=SC2154
-                if [ "$line" = "Priority: standard" ]; then
-                    for p in $disabled_list; do
-                        if [ "$package" = "$p" ]; then
-                            line="Priority: optional"
-                            break
-                        fi
-                    done
-                elif [[ "$package" = ata-modules* ]]; then
-                    # 改成强制安装
-                    # 因为是 pata-modules sata-modules scsi-modules 的依赖
-                    # 但我们没安装它们，也就不会自动安装 ata-modules
-                    line="Priority: standard"
-                fi
-            fi
-            echo "$line"
-        done
-    }
-
-    # shellcheck disable=SC2012
-    kver=$(ls -d lib/modules/* | awk -F/ '{print $NF}')
-
-    net_retriever=usr/lib/debian-installer/retriever/net-retriever
-    # shellcheck disable=SC2016
-    sed -i 's,>> "$1",| change_priority >> "$1",' $net_retriever
-    insert_into_file $net_retriever after '#!/bin/sh' <<EOF
-disabled_list="
-depthcharge-tools-installer
-kickseed-common
-nobootloader
-partman-btrfs
-partman-cros
-partman-iscsi
-partman-jfs
-partman-md
-partman-xfs
-rescue-check
-wpasupplicant-udeb
-lilo-installer
-systemd-boot-installer
-nic-modules-$kver-di
-nic-pcmcia-modules-$kver-di
-nic-usb-modules-$kver-di
-nic-wireless-modules-$kver-di
-nic-shared-modules-$kver-di
-pcmcia-modules-$kver-di
-pcmcia-storage-modules-$kver-di
-cdrom-core-modules-$kver-di
-firewire-core-modules-$kver-di
-usb-storage-modules-$kver-di
-isofs-modules-$kver-di
-jfs-modules-$kver-di
-xfs-modules-$kver-di
-loop-modules-$kver-di
-pata-modules-$kver-di
-sata-modules-$kver-di
-scsi-modules-$kver-di
-"
-
-$(get_function change_priority)
-EOF
-
-    # https://github.com/linuxhw/LsPCI?tab=readme-ov-file#storageata-pci
-    # https://debian.pkgs.org/12/debian-main-amd64/linux-image-6.1.0-18-cloud-amd64_6.1.76-1_amd64.deb.html
-    # https://deb.debian.org/debian/pool/main/l/linux-signed-amd64/
-    # https://deb.debian.org/debian/dists/bookworm/main/debian-installer/binary-all/Packages.xz
-    # https://deb.debian.org/debian/dists/bookworm/main/debian-installer/binary-amd64/Packages.xz
-    # 以下是 debian-installer 有的驱动，这些驱动云内核不一定都有，(+)表示云内核有
-    # scsi-core-modules 默认安装（不用修改），是 ata-modules 的依赖
-    #                   包含 sd_mod.ko(+) scsi_mod.ko(+) scsi_transport_fc.ko(+) scsi_transport_sas.ko(+) scsi_transport_spi.ko(+)
-    # ata-modules       默认可选（改成必装），是下方模块的依赖。只有 ata_generic.ko(+) 和 libata.ko(+) 两个驱动
-
-    # pata-modules      默认安装（改成可选），里面的驱动都是 pata_ 开头，但只有 pata_legacy.ko(+) 在云内核中
-    # sata-modules      默认安装（改成可选），里面的驱动大部分是 sata_ 开头的，其他重要的还有 ahci.ko libahci.ko ata_piix.ko(+)
-    #                   云内核没有 sata 模块，也没有内嵌，有一个 CONFIG_SATA_HOST=y，libata-$(CONFIG_SATA_HOST)	+= libata-sata.o
-    # scsi-modules      默认安装（改成可选），包含 nvme.ko(+) 和各种虚拟化驱动(+)
-
-    download_and_extract_udeb() {
-        package=$1
-        extract_dir=$2
-
-        # 获取 udeb 列表
-        udeb_list=$tmp/udeb_list
-        if ! [ -f $udeb_list ]; then
-            # shellcheck disable=SC2154
-            curl -L http://$nextos_udeb_mirror/dists/$nextos_codename/main/debian-installer/binary-$basearch_alt/Packages.gz |
-                zcat | grep 'Filename:' | awk '{print $2}' >$udeb_list
-        fi
-
-        # 下载 udeb
-        curl -Lo $tmp/tmp.udeb http://$nextos_udeb_mirror/"$(grep -F /${package}_ $udeb_list)"
-
-        if false; then
-            # 使用 dpkg
-            # cygwin 没有 dpkg
-            install_pkg dpkg
-            dpkg -x $tmp/tmp.udeb $extract_dir
-        else
-            # 使用 ar tar xz
-            # cygwin 需安装 binutils
-            # centos7 ar 不支持 --output
-            install_pkg ar tar xz
-            (cd $tmp && ar x $tmp/tmp.udeb)
-            tar xf $tmp/data.tar.xz -C $extract_dir
-        fi
-    }
-
-    # 不用在 windows 判断是哪种硬盘控制器，因为 256M 运行 windows 只可能是 xp，而脚本本来就不支持 xp
-    # 在 debian installer 中判断能否用云内核
-    create_can_use_cloud_kernel_sh can_use_cloud_kernel.sh
-
-    # 下载 fix-eth-name 脚本
-    curl -LO "$confhome/fix-eth-name.sh"
-    curl -LO "$confhome/fix-eth-name.service"
-
-    # 有段时间 kali initrd 删除了原版 wget
-    # 但 initrd 的 busybox wget 又不支持 https
-    # 因此改成在这里下载
-    curl -LO "$confhome/get-xda.sh"
-    curl -LO "$confhome/ttys.sh"
-    if [ -n "$frpc_config" ]; then
-        curl -LO "$confhome/get-frpc-url.sh"
-        curl -LO "$confhome/frpc.service"
-    fi
-
-    # 可以节省一点内存？
-    echo 'export DEBCONF_DROP_TRANSLATIONS=1' |
-        insert_into_file lib/debian-installer/menu before 'exec debconf'
-
-    # 还原 kali netinst.iso 的 simple-cdd 机制
-    # 主要用于调用 kali.postinst 设置 zsh 为默认 shell
-    # 但 mini.iso 又没有这种机制
-    # https://gitlab.com/kalilinux/build-scripts/kali-live/-/raw/main/kali-config/common/includes.installer/kali-finish-install?ref_type=heads
-    # https://salsa.debian.org/debian/simple-cdd/-/blob/master/debian/14simple-cdd?ref_type=heads
-    # https://http.kali.org/pool/main/s/simple-cdd/simple-cdd-profiles_0.6.9_all.udeb
-    if [ "$distro" = kali ]; then
-        # 但我们没有使用 iso，因此没有 kali.postinst，需要另外下载
-        mkdir -p cdrom/simple-cdd
-        curl -Lo cdrom/simple-cdd/kali.postinst https://gitlab.com/kalilinux/build-scripts/kali-live/-/raw/main/kali-config/common/includes.installer/kali-finish-install?ref_type=heads
-        chmod a+x cdrom/simple-cdd/kali.postinst
-    fi
-
-    if [ "$distro" = debian ] && is_debian_elts; then
-        curl -Lo usr/share/keyrings/debian-archive-keyring.gpg https://deb.freexian.com/extended-lts/archive-key.gpg
-    fi
-
-    # 提前下载 fdisk
-    # 因为 fdisk-udeb 包含 fdisk 和 sfdisk，提前下载可减少占用
-    mkdir_clear $tmp/fdisk
-    download_and_extract_udeb fdisk-udeb $tmp/fdisk
-    cp -f $tmp/fdisk/usr/sbin/fdisk usr/sbin/
-
-    # >256M 或者当前系统是 windows
-    if [ $ram_size -gt 256 ] || is_in_windows; then
-        sed -i '/^pata-modules/d' $net_retriever
-        sed -i '/^sata-modules/d' $net_retriever
-        sed -i '/^scsi-modules/d' $net_retriever
-    else
-        # <=256M 极限优化
-        find_main_disk
-        extra_drivers=
-        for driver in $(get_disk_drivers $xda); do
-            echo "using driver: $driver"
-            case $driver in
-            nvme) extra_drivers+=" nvme nvme-core" ;;
-                # xen 的横杠特别不同
-            xen_blkfront) extra_drivers+=" xen-blkfront" ;;
-            xen_scsifront) extra_drivers+=" xen-scsifront" ;;
-            virtio_blk | virtio_scsi | hv_storvsc | vmw_pvscsi) extra_drivers+=" $driver" ;;
-            pata_legacy) sed -i '/^pata-modules/d' $net_retriever ;; # 属于 pata-modules
-            ata_piix) sed -i '/^sata-modules/d' $net_retriever ;;    # 属于 sata-modules
-            ata_generic) ;;                                          # 属于 ata-modules，不用处理，因为我们设置强制安装了 ata-modules
-            esac
-        done
-
-        # extra drivers
-        # xen 还需要以下两个？
-        # kernel/drivers/xen/xen-scsiback.ko
-        # kernel/drivers/block/xen-blkback/xen-blkback.ko
-        # 但反查也找不到 curl https://deb.debian.org/debian/dists/bookworm/main/Contents-udeb-amd64.gz | zcat | grep xen
-        if [ -n "$extra_drivers" ]; then
-            mkdir_clear $tmp/scsi
-            download_and_extract_udeb scsi-modules-$kver-di $tmp/scsi
-            relative_drivers_dir=lib/modules/$kver/kernel/drivers
-
-            udeb_drivers_dir=$tmp/scsi/$relative_drivers_dir
-            dist_drivers_dir=$initrd_dir/$relative_drivers_dir
-            (
-                cd $udeb_drivers_dir
-                for driver in $extra_drivers; do
-                    # debian 模块没有压缩
-                    # kali 模块有压缩
-                    # 因此要有 *
-                    if ! find $dist_drivers_dir -name "$driver.ko*" | grep -q .; then
-                        echo "adding driver: $driver"
-                        file=$(find . -name "$driver.ko*" | grep .)
-                        cp -fv --parents "$file" "$dist_drivers_dir"
-                    fi
-                done
-            )
-        fi
-    fi
-
-    # amd64)
-    # 	level1=737 # MT=754108, qemu: -m 780
-    # 	level2=424 # MT=433340, qemu: -m 460
-    # 	min=316    # MT=322748, qemu: -m 350
-
-    # 将 use_level 2 9 修改为 use_level 1
-    # x86 use_level 2 会出现 No root file system is defined.
-    # arm 即使 use_level 1 也会出现 No root file system is defined.
-    sed -i 's/use_level=[29]/use_level=1/' lib/debian-installer-startup.d/S15lowmem
-
-    # hack 3
-    # 修改 trans.sh
-    # 1. 直接调用 create_ifupdown_config
-    # shellcheck disable=SC2154
-    insert_into_file $initrd_dir/trans.sh after '^: main' <<EOF
-        distro=$nextos_distro
-        releasever=$nextos_releasever
-        create_ifupdown_config /etc/network/interfaces
-        exit
-EOF
-    # 2. 删除 debian busybox 无法识别的语法
-    # 3. 删除 apk 语句
-    # 4. debian 11/12 initrd 无法识别 > >
-    # 5. debian 11/12 initrd 无法识别 < <
-    # 6. debian 11 initrd 无法识别 set -E
-    # 7. debian 11 initrd 无法识别 trap ERR
-    # 8. debian 9 initrd 无法识别 ${string//find/replace}
-    # 9. debian 12 initrd 无法识别 . <(
-    # 删除或注释，可能会导致空方法而报错，因此改为替换成'\n: #'
-    replace='\n: #'
-    sed -Ei \
-        -e "s/> >/$replace/" \
-        -e "s/< </$replace/" \
-        -e "s/\. <\(/$replace/" \
-        -e "s/^[[:space:]]*apk[[:space:]]/$replace/" \
-        -e "s/^[[:space:]]*trap[[:space:]]/$replace/" \
-        -e "s/\\$\{.*\/\/.*\/.*\}/$replace/" \
-        -e "/^[[:space:]]*set[[:space:]]/s/E//" \
-        $initrd_dir/trans.sh
-}
-
-get_disk_drivers() {
-    get_drivers "/sys/block/$1"
-}
-
-get_net_drivers() {
-    get_drivers "/sys/class/net/$1"
-}
-
-# 不用在 windows 判断是哪种硬盘/网络驱动，因为 256M 运行 windows 只可能是 xp，而脚本本来就不支持 xp
-# 而且安装过程也有二次判断
-get_drivers() {
-    # 有以下结果组合出现
-    # sd_mod
-    # virtio_blk
-    # virtio_scsi
-    # virtio_pci
-    # pcieport
-    # xen_blkfront
-    # ahci
-    # nvme
-    # mptspi
-    # mptsas
-    # vmw_pvscsi
-    (
-        cd "$(readlink -f $1)"
-        while ! [ "$(pwd)" = / ]; do
-            if [ -d driver ]; then
-                if [ -d driver/module ]; then
-                    # 显示全名，例如 xen_blkfront sd_mod
-                    # 但 ahci 没有这个文件，所以 else 不能省略
-                    basename "$(readlink -f driver/module)"
-                else
-                    # 不显示全名，例如 vbd sd
-                    basename "$(readlink -f driver)"
-                fi
-            fi
-            cd ..
-        done
-    )
-}
-
-exit_if_cant_use_cloud_kernel() {
-    find_main_disk
-    collect_netconf
-
-    # shellcheck disable=SC2154
-    if ! can_use_cloud_kernel "$xda" $ipv4_ethx $ipv6_ethx; then
-        error_and_exit "Can't use cloud kernel. And not enough RAM to run normal kernel."
-    fi
-}
-
-can_use_cloud_kernel() {
-    # initrd 下也要使用，不要用 <<<
-
-    # 有些虚拟机用了 ahci，但云内核没有 ahci 驱动
-    cloud_eth_modules='ena|gve|mana|virtio_net|xen_netfront|hv_netvsc|vmxnet3|mlx4_en|mlx4_core|mlx5_core|ixgbevf'
-    cloud_blk_modules='ata_generic|ata_piix|pata_legacy|nvme|virtio_blk|virtio_scsi|xen_blkfront|xen_scsifront|hv_storvsc|vmw_pvscsi'
-
-    # disk
-    drivers="$(get_disk_drivers $1)"
-    shift
-    for driver in $drivers; do
-        echo "using disk driver: $driver"
-    done
-    echo "$drivers" | grep -Ewq "$cloud_blk_modules" || return 1
-
-    # net
-    # v4 v6 eth 相同，只检查一次
-    if [ "$1" = "$2" ]; then
-        shift
-    fi
-    while [ $# -gt 0 ]; do
-        drivers="$(get_net_drivers $1)"
-        shift
-        for driver in $drivers; do
-            echo "using net driver: $driver"
-        done
-        echo "$drivers" | grep -Ewq "$cloud_eth_modules" || return 1
-    done
-}
-
-create_can_use_cloud_kernel_sh() {
-    cat <<EOF >$1
-        $(get_function get_drivers)
-        $(get_function get_net_drivers)
-        $(get_function get_disk_drivers)
-        $(get_function can_use_cloud_kernel)
-
-        can_use_cloud_kernel "\$@"
-EOF
-}
-
-get_ip_conf_cmd() {
-    collect_netconf >&2
-    is_in_china && is_in_china=true || is_in_china=false
-
-    sh=/initrd-network.sh
-    if is_found_ipv4_netconf && is_found_ipv6_netconf && [ "$ipv4_mac" = "$ipv6_mac" ]; then
-        echo "'$sh' '$ipv4_mac' '$ipv4_addr' '$ipv4_gateway' '$ipv6_addr' '$ipv6_gateway' '$is_in_china'"
-    else
-        if is_found_ipv4_netconf; then
-            echo "'$sh' '$ipv4_mac' '$ipv4_addr' '$ipv4_gateway' '' '' '$is_in_china'"
-        fi
-        if is_found_ipv6_netconf; then
-            echo "'$sh' '$ipv6_mac' '' '' '$ipv6_addr' '$ipv6_gateway' '$is_in_china'"
-        fi
-    fi
-}
-
-mod_initrd_alpine() {
-    # hack 1 v3.19 和之前的 virt 内核需添加 ipv6 模块
-    if virt_dir=$(ls -d $initrd_dir/lib/modules/*-virt 2>/dev/null); then
-        ipv6_dir=$virt_dir/kernel/net/ipv6
-        if ! [ -f $ipv6_dir/ipv6.ko ] && ! grep -q ipv6 $initrd_dir/lib/modules/*/modules.builtin; then
-            mkdir -p $ipv6_dir
-            modloop_file=$tmp/modloop_file
-            modloop_dir=$tmp/modloop_dir
-            curl -Lo $modloop_file $nextos_modloop
-            if is_in_windows; then
-                # cygwin 没有 unsquashfs
-                7z e $modloop_file ipv6.ko -r -y -o$ipv6_dir
-            else
-                install_pkg unsquashfs
-                mkdir_clear $modloop_dir
-                unsquashfs -f -d $modloop_dir $modloop_file 'modules/*/kernel/net/ipv6/ipv6.ko'
-                find $modloop_dir -name ipv6.ko -exec cp {} $ipv6_dir/ \;
-            fi
-        fi
-    fi
-
-    # hack 下载 dhcpcd
-    # shellcheck disable=SC2154
-    download_and_extract_apk "$nextos_releasever" dhcpcd "$initrd_dir"
-    sed -i -e '/^slaac private/s/^/#/' -e '/^#slaac hwaddr/s/^#//' $initrd_dir/etc/dhcpcd.conf
-
-    # hack 2 /usr/share/udhcpc/default.script
-    # 脚本被调用的顺序
-    # udhcpc:  deconfig
-    # udhcpc:  bound
-    # udhcpc6: deconfig
-    # udhcpc6: bound
-    # shellcheck disable=SC2317
-    udhcpc() {
-        if [ "$1" = deconfig ]; then
-            return
-        fi
-        if [ "$1" = bound ] && [ -n "$ipv6" ]; then
-            # shellcheck disable=SC2154
-            ip -6 addr add "$ipv6" dev "$interface"
-            ip link set dev "$interface" up
-            return
-        fi
-    }
-
-    get_function_content udhcpc |
-        insert_into_file usr/share/udhcpc/default.script after 'deconfig\|renew\|bound'
-
-    # 允许设置 ipv4 onlink 网关
-    sed -Ei 's,(0\.0\.0\.0\/0),"\1 onlink",' usr/share/udhcpc/default.script
-
-    # hack 3 网络配置
-    # alpine 根据 MAC_ADDRESS 判断是否有网络
-    # https://github.com/alpinelinux/mkinitfs/blob/c4c0115f9aa5aa8884c923dc795b2638711bdf5c/initramfs-init.in#L914
-    insert_into_file init after 'configure_ip\(\)' <<EOF
-        depmod
-        [ -d /sys/module/ipv6 ] || modprobe ipv6
-        $(get_ip_conf_cmd)
-        MAC_ADDRESS=1
-        return
-EOF
-
-    # grep -E -A5 'configure_ip\(\)' init
-
-    # hack 4 运行 trans.start
-    # 1. alpine arm initramfs 时间问题 要添加 --no-check-certificate
-    # 2. aws t4g arm 如果没设置console=ttyx，在initramfs里面wget https会出现bad header错误，chroot后正常
-    # Connecting to raw.githubusercontent.com (185.199.108.133:443)
-    # 60C0BB2FFAFF0000:error:0A00009C:SSL routines:ssl3_get_record:http request:ssl/record/ssl3_record.c:345:
-    # ssl_client: SSL_connect
-    # wget: bad header line: �
-    insert_into_file init before '^exec switch_root' <<EOF
-        # trans
-        # echo "wget --no-check-certificate -O- $confhome/trans.sh | /bin/ash" >\$sysroot/etc/local.d/trans.start
-        # wget --no-check-certificate -O \$sysroot/etc/local.d/trans.start $confhome/trans.sh
-        cp /trans.sh \$sysroot/etc/local.d/trans.start
-        chmod a+x \$sysroot/etc/local.d/trans.start
-        ln -s /etc/init.d/local \$sysroot/etc/runlevels/default/
-
-        # 配置 + 自定义驱动
-        for dir in /configs /custom_drivers; do
-            if [ -d \$dir ]; then
-                cp -r \$dir \$sysroot/
-                rm -rf \$dir
-            fi
-        done
-EOF
-
-    # 判断云镜像 debain 能否用云内核
-    if is_distro_like_debian; then
-        create_can_use_cloud_kernel_sh can_use_cloud_kernel.sh
-        insert_into_file init before '^exec (/bin/busybox )?switch_root' <<EOF
-        cp /can_use_cloud_kernel.sh \$sysroot/
-        chmod a+x \$sysroot/can_use_cloud_kernel.sh
-EOF
-    fi
-}
-
-mod_initrd() {
-    info "mod $nextos_distro initrd"
-    install_pkg gzip cpio
-
-    # 解压
-    # 先删除临时文件，避免之前运行中断有残留文件
-    initrd_dir=$tmp/initrd
-    mkdir_clear $initrd_dir
-    cd $initrd_dir
-
-    # cygwin 下处理 debian initrd 时
-    # 解压/重新打包/删除 initrd 的 /dev/console /dev/null 都会报错
-    # cpio: dev/console: Cannot utime: Invalid argument
-    # cpio: ./dev/console: Cannot stat: Bad address
-    # 用 windows 文件管理器可删除
-
-    # 但同样运行 zcat /reinstall-initrd | cpio -idm
-    # 打开 C:\cygwin\Cygwin.bat ，运行报错
-    # 打开桌面的 Cygwin 图标，运行就没问题
-
-    # shellcheck disable=SC2046
-    # nonmatching 是精确匹配路径
-    zcat /reinstall-initrd | cpio -idm \
-        $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
-
-    curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
-    if ! grep -iq "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
-        error_and_exit "
-This script is outdated, please download reinstall.sh again.
-脚本有更新，请重新下载 reinstall.sh"
-    fi
-
-    curl -Lo $initrd_dir/initrd-network.sh $confhome/initrd-network.sh
-    chmod a+x $initrd_dir/trans.sh $initrd_dir/initrd-network.sh
-
-    # 保存配置
-    mkdir -p $initrd_dir/configs
-    if [ -n "$ssh_keys" ]; then
-        cat <<<"$ssh_keys" >$initrd_dir/configs/ssh_keys
-    else
-        save_password $initrd_dir/configs
-    fi
-    if [ -n "$frpc_config" ]; then
-        cat "$frpc_config" >$initrd_dir/configs/frpc.toml
-    fi
-
-    if is_distro_like_debian $nextos_distro; then
-        mod_initrd_debian_kali
-    else
-        mod_initrd_$nextos_distro
-    fi
-
-    # 添加自定义 windows 驱动
-    if [ "$distro" = windows ] && [ -n "$custom_infs" ]; then
-        # shellcheck disable=SC1090
-        . <(curl -L $confhome/windows-driver-utils.sh)
-        echo "$custom_infs" | while read -r inf; do
-            parse_inf_and_cp_driever "$inf" "$initrd_dir/custom_drivers" "$basearch_alt" true
-        done
-    fi
-
-    # alpine live 不精简 initrd
-    # 因为不知道用户想干什么，可能会用到精简的文件
-    if is_virt && ! is_alpine_live; then
-        remove_useless_initrd_files
-    fi
-
-    # 重建
-    # 注意要用 cpio -H newc 不要用 cpio -c ，不同版本的 -c 作用不一样，很坑
-    # -c    Use the old portable (ASCII) archive format
-    # -c    Identical to "-H newc", use the new (SVR4)
-    #       portable format.If you wish the old portable
-    #       (ASCII) archive format, use "-H odc" instead.
-    find . | cpio --quiet -o -H newc | gzip -1 >/reinstall-initrd
-    cd - >/dev/null
-}
-
-remove_useless_initrd_files() {
-    info "slim initrd"
-
-    # 显示精简前的大小
-    du -sh .
-
-    # 删除 initrd 里面没用的文件/驱动
-    rm -rf bin/brltty
-    rm -rf etc/brltty
-    rm -rf sbin/wpa_supplicant
-    rm -rf usr/lib/libasound.so.*
-    rm -rf usr/share/alsa
-    (
-        cd lib/modules/*/kernel/drivers/net/ethernet/
-        for item in *; do
-            case "$item" in
-            # 甲骨文 arm 用自定义镜像支持设为 mlx5 vf 网卡，且不是 azure 那样显示两个网卡
-            amazon | google | mellanox) ;;
-            intel)
-                (
-                    cd "$item"
-                    for sub_item in *; do
-                        case "$sub_item" in
-                        # 有 e100.ko e1000文件夹 e1000e文件夹
-                        e100* | lib* | *vf) ;;
-                        *) rm -rf $sub_item ;;
-                        esac
-                    done
-                )
-                ;;
-            *) rm -rf $item ;;
-            esac
-        done
-    )
-    (
-        cd lib/modules/*/kernel
-        for item in \
-            net/mac80211 \
-            net/wireless \
-            net/bluetooth \
-            drivers/hid \
-            drivers/mmc \
-            drivers/mtd \
-            drivers/usb \
-            drivers/ssb \
-            drivers/mfd \
-            drivers/bcma \
-            drivers/pcmcia \
-            drivers/parport \
-            drivers/platform \
-            drivers/staging \
-            drivers/net/usb \
-            drivers/net/bonding \
-            drivers/net/wireless \
-            drivers/input/rmi4 \
-            drivers/input/keyboard \
-            drivers/input/touchscreen \
-            drivers/bus/mhi \
-            drivers/char/pcmcia \
-            drivers/misc/cardreader; do
-            rm -rf $item
-        done
-    )
-
-    # 显示精简后的大小
-    du -sh .
-}
-
-get_unix_path() {
-    if is_in_windows; then
-        # 输入的路径是 / 开头也没问题
-        cygpath -u "$1"
-    else
-        printf '%s' "$1"
-    fi
-}
-
-# 脚本入口
-if mount | grep -q 'tmpfs on / type tmpfs'; then
-    error_and_exit "Can't run this script in Live OS."
-fi
-
-if is_in_windows; then
-    # win系统盘
-    c=$(echo $SYSTEMDRIVE | cut -c1)
-
-    # 64位系统 + 32位cmd/cygwin，需要添加 PATH，否则找不到64位系统程序，例如bcdedit
-    sysnative=$(cygpath -u $WINDIR\\Sysnative)
-    if [ -d $sysnative ]; then
-        PATH=$PATH:$sysnative
-    fi
-
-    # 更改 windows 命令输出语言为英文
-    # chcp 会清屏
-    mode.com con cp select=437 >/dev/null
-
-    # 为 windows 程序输出删除 cr
-    for exe in $WINDOWS_EXES; do
-        # 如果我们覆写了 wmic()，则先将 wmic() 重命名为 _wmic()
-        if get_function $exe >/dev/null 2>&1; then
-            eval "_$(get_function $exe)"
-        fi
-        # 使用以下方法重新生成 wmic()
-        # 调用链：wmic() -> run_with_del_cr(wmic) -> _wmic() -> command wmic
-        eval "$exe(){ $(get_function_content run_with_del_cr_template | sed "s/\$exe/$exe/g") }"
-    done
-fi
-
-# 检查 root
-if is_in_windows; then
-    # 64位系统 + 32位cmd/cygwin，运行 openfiles 报错：目标系统必须运行 32 位的操作系统
-    if ! fltmc >/dev/null 2>&1; then
-        error_and_exit "Please run as administrator."
-    fi
-else
-    if [ "$EUID" -ne 0 ]; then
-        error_and_exit "Please run as root."
-    fi
-fi
-
-long_opts=
-for o in ci installer debug minimal allow-ping force-cn help \
-    add-driver: \
-    hold: sleep: \
-    iso: \
-    image-name: \
-    boot-wim: \
-    img: \
-    lang: \
-    passwd: password: \
-    ssh-port: \
-    ssh-key: public-key: \
-    rdp-port: \
-    web-port: http-port: \
-    allow-ping: \
-    commit: \
-    frpc-conf: frpc-config: frpc-toml: \
-    force: \
-    force-old-windows-setup:; do
-    [ -n "$long_opts" ] && long_opts+=,
-    long_opts+=$o
+#!/bin/bash
+# 作者是 leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh 只是搬运一下，iilog 短域名能少打几个字。
+##
+## License: GPL
+## It can reinstall Debian, Ubuntu, Kali, AlpineLinux, CentOS, AlmaLinux, RockyLinux, Fedora and Windows OS via network automatically without any other external measures and manual operations.
+## Default root password: LeitboGi0ro
+## Written By MoeClub.org
+## Blog: https://moeclub.org
+## Modified By 秋水逸冰
+## Blog: https://teddysun.com/
+## Modified By VPS收割者
+## Blog: https://www.idcoffer.com/
+## Modified By airium
+## Blog: https://github.com/airium
+## Modified By 王煎饼
+## Github: https://github.com/bin456789/
+## Modified By nat.ee
+## Forum: https://hostloc.com/space-uid-49984.html
+## Modified By Bohan Yang
+## Twitter: https://twitter.com/brentybh
+## Modified By Leitbogioro
+## Blog: https://www.zhihu.com/column/originaltechnic
+
+# color
+underLine='\033[4m'
+aoiBlue='\033[36m'
+blue='\033[34m'
+yellow='\033[33m'
+green='\033[32m'
+red='\033[31m'
+plain='\033[0m'
+
+export tmpVER=''
+export tmpDIST=''
+export tmpURL=''
+export tmpWORD=''
+export tmpMirror=''
+export tmpDHCP=''
+export targetRelese=''
+export targetLang='en'
+export TimeZone=''
+export setIpStack=''
+export ipAddr=''
+export ipMask=''
+export ipGate=''
+export ipDNS='8.8.8.8 1.1.1.1'
+export ip6Addr=''
+export ip6Mask=''
+export ip6Gate=''
+export ip6DNS='2001:4860:4860::8888 2606:4700:4700::1111'
+export IncDisk=''
+export interface=''
+export interfaceSelect=''
+export setInterfaceName='0'
+export autoPlugAdapter='1'
+export IsCN=''
+export Relese=''
+export sshPORT=''
+export ddMode='0'
+export setNet='0'
+export setNetbootXyz='0'
+export setRDP='0'
+export tmpSetIPv6=''
+export setIPv6='1'
+export setRaid=''
+export setDisk=''
+export swapSpace='0'
+export partitionTable='mbr'
+export fileSystem=''
+export setMemCheck='1'
+export setCloudKernel=''
+export enableBBR='0'
+export isMirror='0'
+export FindDists='0'
+export setFileType=''
+export loaderMode='0'
+export setMotd=''
+export setDns=''
+export LANG="en_US.UTF-8"
+export LANGUAGE="en_US:en"
+export IncFirmware='0'
+export SpikCheckDIST='0'
+export UNKNOWHW='0'
+export UNVER='6.4'
+export GRUBDIR=''
+export GRUBFILE=''
+export GRUBVER=''
+export VER=''
+export setCMD=""
+export setConsole=''
+export setFail2ban=''
+export setAutoConfig='1'
+export FirmwareImage=''
+export AddNum='1'
+export DebianModifiedProcession=''
+
+while [[ $# -ge 1 ]]; do
+	case $1 in
+	-architecture)
+		shift
+		tmpVER="$1"
+		shift
+		;;
+	-debian | -Debian)
+		shift
+		Relese='Debian'
+		tmpDIST="$1"
+		shift
+		;;
+	-ubuntu | -Ubuntu)
+		shift
+		ddMode='1'
+		finalDIST="$1"
+		targetRelese='Ubuntu'
+		shift
+		;;
+	-kali | -Kali)
+		shift
+		Relese='Kali'
+		tmpDIST="$1"
+		shift
+		;;
+	-centos | -CentOS | -cent | -Cent)
+		shift
+		Relese='CentOS'
+		tmpDIST="$1"
+		shift
+		;;
+	-rocky | -rockylinux | -RockyLinux)
+		shift
+		Relese='RockyLinux'
+		tmpDIST="$1"
+		shift
+		;;
+	-alma | -almalinux | -AlmaLinux)
+		shift
+		Relese='AlmaLinux'
+		tmpDIST="$1"
+		shift
+		;;
+	-fedora | -Fedora)
+		shift
+		Relese='Fedora'
+		tmpDIST="$1"
+		shift
+		;;
+	-alpine | -alpinelinux | -AlpineLinux | -alpineLinux)
+		shift
+		Relese='AlpineLinux'
+		tmpDIST="$1"
+		shift
+		;;
+	-win | -windows)
+		shift
+		ddMode='1'
+		finalDIST="$1"
+		targetRelese='Windows'
+		shift
+		;;
+	-lang | -language)
+		shift
+		targetLang="$1"
+		shift
+		;;
+	-dd | --image)
+		shift
+		ddMode='1'
+		tmpURL="$1"
+		shift
+		;;
+	--networkstack)
+		shift
+		setIpStack="$1"
+		shift
+		;;
+	--ip-addr)
+		shift
+		ipAddr="$1"
+		shift
+		;;
+	--ip-mask)
+		shift
+		ipMask="$1"
+		shift
+		;;
+	--ip-gate)
+		shift
+		ipGate="$1"
+		shift
+		;;
+	--ip-dns)
+		shift
+		ipDNS="$1"
+		ipDNSChanged='1'
+		shift
+		;;
+	--ip6-addr)
+		shift
+		ip6Addr="$1"
+		shift
+		;;
+	--ip6-mask)
+		shift
+		ip6Mask="$1"
+		shift
+		;;
+	--ip6-gate)
+		shift
+		ip6Gate="$1"
+		shift
+		;;
+	--ip6-dns)
+		shift
+		ip6DNS="$1"
+		ip6DNSChanged='1'
+		shift
+		;;
+	--network)
+		shift
+		tmpDHCP="$1"
+		shift
+		;;
+	--adapter)
+		shift
+		interfaceSelect="$1"
+		shift
+		;;
+	--netdevice-unite)
+		shift
+		setInterfaceName='1'
+		;;
+	--autoplugadapter)
+		shift
+		autoPlugAdapter="$1"
+		shift
+		;;
+	--loader)
+		shift
+		loaderMode='1'
+		;;
+	--motd)
+		shift
+		setMotd='1'
+		;;
+	--fail2ban)
+		shift
+		setFail2ban="$1"
+		shift
+		;;
+	--setdns)
+		shift
+		setDns='1'
+		;;
+	-mirror)
+		shift
+		isMirror='1'
+		tmpMirror="$1"
+		shift
+		;;
+	-rdp)
+		shift
+		setRDP='1'
+		WinRemote="$1"
+		shift
+		;;
+	-raid)
+		shift
+		setRaid="$1"
+		shift
+		;;
+	-setdisk)
+		shift
+		setDisk="$1"
+		shift
+		;;
+	-swap | -virtualmemory | -virtualram)
+		shift
+		setSwap="$1"
+		shift
+		;;
+	-partition)
+		shift
+		partitionTable="$1"
+		shift
+		;;
+	-filesystem)
+		shift
+		setFileSystem="$1"
+		shift
+		;;
+	-timezone)
+		shift
+		TimeZone="$1"
+		shift
+		;;
+	-cmd)
+		shift
+		setCMD="$1"
+		shift
+		;;
+	-console)
+		shift
+		setConsole="$1"
+		shift
+		;;
+	-firmware)
+		shift
+		IncFirmware="1"
+		shift
+		;;
+	--cloudkernel)
+		shift
+		setCloudKernel="$1"
+		shift
+		;;
+	--cloudimage)
+		shift
+		useCloudImage="1"
+		;;
+	-filetype)
+		shift
+		setFileType="$1"
+		shift
+		;;
+	-port)
+		shift
+		sshPORT="$1"
+		shift
+		;;
+	-pwd | -password)
+		shift
+		tmpWORD="$1"
+		shift
+		;;
+	-hostname)
+		shift
+		tmpHostName="$1"
+		shift
+		;;
+	--setipv6)
+		shift
+		tmpSetIPv6="$1"
+		shift
+		;;
+	--bbr)
+		shift
+		enableBBR="1"
+		;;
+	--allbymyself)
+		shift
+		setAutoConfig='0'
+		;;
+	--nomemcheck)
+		shift
+		setMemCheck='0'
+		;;
+	-netbootxyz)
+		shift
+		setNetbootXyz='1'
+		shift
+		;;
+	*)
+		if [[ "$1" != 'error' ]]; then echo -ne "\nInvaild option: '$1'\n\n"; fi
+		echo -ne " Usage:\n\tbash $(basename $0)\t-debian          [${underLine}${yellow}dists-name${plain}]\n\t\t\t\t-ubuntu          [${underLine}dists-name${plain}]\n\t\t\t\t-kali            [${underLine}dists-name${plain}]\n\t\t\t\t-alpine          [${underLine}dists-name${plain}]\n\t\t\t\t-centos          [${underLine}dists-name${plain}]\n\t\t\t\t-rockylinux      [${underLine}dists-name${plain}]\n\t\t\t\t-almalinux       [${underLine}dists-name${plain}]\n\t\t\t\t-fedora          [${underLine}dists-name${plain}]\n\t\t\t\t-windows         [${underLine}dists-name${plain}]\n\t\t\t\t-architecture    [32/i386|64/${underLine}${yellow}amd64${plain}|arm/${underLine}${yellow}arm64${plain}]\n\t\t\t\t--ip-addr/--ip-gate/--ip-mask\n\t\t\t\t-apt/-yum/-mirror\n\t\t\t\t-dd/--image      [image-url]\n\t\t\t\t-pwd             [linux-password]\n\t\t\t\t-port            [linux-ssh-port]\n"
+		exit 1
+		;;
+	esac
 done
 
-# 整理参数
-if ! opts=$(getopt -n $0 -o "h" --long "$long_opts" -- "$@"); then
-    exit
+# Check Root
+[[ "$EUID" -ne '0' || $(id -u) != '0' ]] && echo -ne "\n[${red}Error${plain}] This script must be executed as root!\n\nTry to type:\n${yellow}sudo -s\n${plain}\nAfter entering the password, switch to root dir to execute this script:\n${yellow}cd ~${plain}\n\n" && exit 1
+
+# Ping delay to YouTube($2), Instagram($3), Wikipedia($4) and BBC($5), support both IPv4 and IPv6 access, $1 is $IPStackType
+function checkCN() {
+	for TestUrl in "$2" "$3" "$4" "$5"; do
+		# "rtt" result of ping command of Alpine Linux is "round-trip" and it can't handle "sed -n" well.
+		IPv4PingDelay=$(ping -4 -c 2 -w 2 "$TestUrl" | grep "rtt\|round-trip" | cut -d'/' -f5 | awk -F'.' '{print $NF}' | sed -E '/^[0-9]\+\(\.[0-9]\+\)\?$/p')
+		IPv6PingDelay=$(ping -6 -c 2 -w 2 "$TestUrl" | grep "rtt\|round-trip" | cut -d'/' -f5 | awk -F'.' '{print $NF}' | sed -E '/^[0-9]\+\(\.[0-9]\+\)\?$/p')
+		if [[ "$1"="BiStack" ]]; then
+			[[ "$IPv4PingDelay" != "" || "$IPv6PingDelay" != "" ]] && tmpIsCN+="" || tmpIsCN+="cn"
+		elif [[ "$1"="IPv4Stack" ]]; then
+			[[ "$IPv4PingDelay" != "" ]] && tmpIsCN+="" || tmpIsCN+="cn"
+		elif [[ "$1"="IPv6Stack" ]]; then
+			[[ "$IPv6PingDelay" != "" ]] && tmpIsCN+="" || tmpIsCN+="cn"
+		fi
+	done
+	# If testing servers are all unaccessible, the server may be in mainland of China.
+	[[ $(echo $tmpIsCN | grep -o "cn" | wc -l) == "4" ]] && {
+		IsCN="cn"
+		[[ "$ipDNSChanged" != "1" ]] && ipDNS="119.29.29.29 223.6.6.6"
+		[[ "$ip6DNSChanged" != "1" ]] && ip6DNS="2402:4e00:: 2400:3200::1"
+	}
+}
+
+# "$1" is "$ipDNS" or "$ip6DNS"
+# The delimiter of several dns settings in automatic response file of Debian is " "(space), for RedHat, it's ","(comma).
+# Reference: https://lists.debian.org/debian-user/2009/10/msg00149.html
+#            https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/installation_guide/sect-kickstart-syntax
+function checkDNS() {
+	if [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+		tmpDNS=$(echo $1 | sed 's/ /,/g')
+		echo "$tmpDNS"
+	else
+		echo "$1"
+	fi
+}
+
+function dependence() {
+	Full='0'
+	for BIN_DEP in $(echo "$1" | sed 's/,/\n/g'); do
+		if [[ -n "$BIN_DEP" ]]; then
+			Found='0'
+			for BIN_PATH in $(echo "$PATH" | sed 's/:/\n/g'); do
+				ls $BIN_PATH/$BIN_DEP >/dev/null 2>&1
+				if [ $? == '0' ]; then
+					Found='1'
+					break
+				fi
+			done
+			if [ "$Found" == '1' ]; then
+				echo -en "[${green}ok${plain}]\t"
+			else
+				Full='1'
+				echo -en "[${red}Not Install${plain}]"
+			fi
+			echo -en "\t$BIN_DEP\n"
+		fi
+	done
+	if [ "$Full" == '1' ]; then
+		echo -ne "\n[${red}Error${plain}] Please use '${yellow}apt-get${plain}' or '${yellow}yum / dnf${plain}' install it. \n\n"
+		exit 1
+	fi
+}
+
+function selectMirror() {
+	[ $# -ge 3 ] || exit 1
+	Relese=$(echo "$1" | sed -r 's/(.*)/\L\1/')
+	DIST=$(echo "$2" | sed 's/\ //g' | sed -r 's/(.*)/\L\1/')
+	VER=$(echo "$3" | sed 's/\ //g' | sed -r 's/(.*)/\L\1/')
+	New=$(echo "$4" | sed 's/\ //g')
+	[ -n "$Relese" ] && [ -n "$DIST" ] && [ -n "$VER" ] || exit 1
+	if [ "$Relese" == "debian" ] || [ "$Relese" == "ubuntu" ] || [ "$Relese" == "kali" ]; then
+		[ "$DIST" == "focal" ] && legacy="legacy-" || legacy=""
+		TEMP="SUB_MIRROR/dists/${DIST}/main/installer-${VER}/current/${legacy}images/netboot/${Relese}-installer/${VER}/initrd.gz"
+		[[ "$Relese" == "kali" ]] && TEMP="SUB_MIRROR/dists/${DIST}/main/installer-${VER}/current/images/netboot/debian-installer/${VER}/initrd.gz"
+	elif [ "$Relese" == "centos" ] || [ "$Relese" == "rockylinux" ] || [ "$Relese" == "almalinux" ]; then
+		if [ "$Relese" == "centos" ] && [[ "$RedHatSeries" -le "7" ]]; then
+			TEMP="SUB_MIRROR/${DIST}/os/${VER}/images/pxeboot/initrd.img"
+		else
+			TEMP="SUB_MIRROR/${DIST}/BaseOS/${VER}/os/images/pxeboot/initrd.img"
+		fi
+	elif [ "$Relese" == "fedora" ]; then
+		TEMP="SUB_MIRROR/releases/${DIST}/Server/${VER}/os/images/pxeboot/initrd.img"
+	elif [ "$Relese" == "alpinelinux" ]; then
+		TEMP="SUB_MIRROR/${DIST}/releases/${VER}/netboot/${InitrdName}"
+	fi
+	[ -n "$TEMP" ] || exit 1
+	mirrorStatus=0
+	declare -A MirrorBackup
+	if [[ "$IsCN" == "cn" ]]; then
+		MirrorBackup=(["debian0"]="" ["debian1"]="http://mirrors.ustc.edu.cn/debian" ["debian2"]="http://mirror.nju.edu.cn/debian" ["debian3"]="https://mirrors.tuna.tsinghua.edu.cn/debian" ["debian4"]="https://mirrors.aliyun.com/debian-archive/debian" ["ubuntu0"]="" ["ubuntu1"]="https://mirrors.ustc.edu.cn/ubuntu" ["ubuntu2"]="http://mirrors.xjtu.edu.cn/ubuntu" ["kali0"]="" ["kali1"]="https://mirrors.tuna.tsinghua.edu.cn/kali" ["kali2"]="http://mirrors.zju.edu.cn/kali" ["alpinelinux0"]="" ["alpinelinux1"]="http://mirror.nju.edu.cn/alpine" ["alpinelinux2"]="http://mirrors.tuna.tsinghua.edu.cn/alpine" ["centos0"]="" ["centos1"]="https://mirrors.ustc.edu.cn/centos-stream" ["centos2"]="https://mirrors.bfsu.edu.cn/centos-stream" ["centos3"]="https://mirrors.tuna.tsinghua.edu.cn/centos" ["centos4"]="http://mirror.nju.edu.cn/centos-altarch" ["centos5"]="https://mirrors.tuna.tsinghua.edu.cn/centos-vault" ["fedora0"]="" ["fedora1"]="https://mirrors.tuna.tsinghua.edu.cn/fedora" ["fedora2"]="https://mirrors.bfsu.edu.cn/fedora" ["rockylinux0"]="" ["rockylinux1"]="http://mirror.nju.edu.cn/rocky" ["rockylinux2"]="http://mirrors.sdu.edu.cn/rocky" ["almalinux0"]="" ["almalinux1"]="https://mirror.sjtu.edu.cn/almalinux" ["almalinux2"]="http://mirrors.neusoft.edu.cn/almalinux")
+	else
+		MirrorBackup=(["debian0"]="" ["debian1"]="http://deb.debian.org/debian" ["debian2"]="http://mirrors.ocf.berkeley.edu/debian" ["debian3"]="http://ftp.yz.yamagata-u.ac.jp/pub/linux/debian" ["debian4"]="http://archive.debian.org/debian" ["ubuntu0"]="" ["ubuntu1"]="http://archive.ubuntu.com/ubuntu" ["ubuntu2"]="http://ports.ubuntu.com" ["kali0"]="" ["kali1"]="https://mirrors.ocf.berkeley.edu/kali" ["kali2"]="http://ftp.yz.yamagata-u.ac.jp/pub/linux/kali" ["alpinelinux0"]="" ["alpinelinux1"]="http://dl-cdn.alpinelinux.org/alpine" ["alpinelinux2"]="https://mirrors.edge.kernel.org/alpine" ["centos0"]="" ["centos1"]="http://mirror.stream.centos.org" ["centos2"]="http://mirrors.ocf.berkeley.edu/centos-stream" ["centos3"]="http://mirror.centos.org/centos" ["centos4"]="http://mirror.centos.org/altarch" ["centos5"]="http://vault.centos.org" ["fedora0"]="" ["fedora1"]="http://mirrors.rit.edu/fedora/fedora/linux" ["fedora2"]="http://ftp.iij.ad.jp/pub/linux/Fedora/fedora/linux" ["rockylinux0"]="" ["rockylinux1"]="http://download.rockylinux.org/pub/rocky" ["rockylinux2"]="http://mirrors.iu13.net/rocky" ["almalinux0"]="" ["almalinux1"]="http://repo.almalinux.org/almalinux" ["almalinux2"]="http://ftp.iij.ad.jp/pub/linux/almalinux")
+	fi
+	echo "$New" | grep -q '^http://\|^https://\|^ftp://' && MirrorBackup[${Relese}0]="${New%*/}"
+	for mirror in $(echo "${!MirrorBackup[@]}" | sed 's/\ /\n/g' | sort -n | grep "^$Relese"); do
+		Current="${MirrorBackup[$mirror]}"
+		[ -n "$Current" ] || continue
+		MirrorURL=$(echo "$TEMP" | sed "s#SUB_MIRROR#${Current}#g")
+		wget --no-check-certificate --spider --timeout=3 -o /dev/null "$MirrorURL"
+		[ $? -eq 0 ] && mirrorStatus=1 && break
+	done
+	[ $mirrorStatus -eq 1 ] && echo "$Current" || exit 1
+}
+
+function getIPv4Address() {
+	# Differences from scope link, scope host and scope global of IPv4, reference: https://qiita.com/testnin2/items/7490ff01a4fe1c7ad61f
+	allI4Addrs=$(ip -4 addr show | grep -wA 1024 "$interface4" | grep -w "$interface4" | grep -wv "lo\|host" | grep -w "inet" | grep -w "scope global*\|link*" | awk -F " " '{for (i=2;i<=NF;i++)printf("%s ", $i);print ""}' | awk '{print$1}')
+	[[ -z "$allI4Addrs" ]] && allI4Addrs=$(ip -4 addr show | grep -wA 1024 "$interface4" | grep -wv "lo\|host" | grep -w "inet" | grep -w "scope global*\|link*" | awk -F " " '{for (i=2;i<=NF;i++)printf("%s ", $i);print ""}' | awk '{print$1}')
+	iAddr=$(echo "$allI4Addrs" | head -n 1)
+	iAddrNum=$(echo "$allI4Addrs" | wc -l)
+	collectAllIpv4Addresses "$iAddrNum"
+	ipAddr=$(echo ${iAddr} | cut -d'/' -f1)
+	ipPrefix=$(echo ${iAddr} | cut -d'/' -f2)
+	ipMask=$(netmask "$ipPrefix")
+	# Get real IPv4 subnet of current System
+	ip4RouteScopeLink=$(ip -4 route show scope link | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -w "$interface4" | grep -w "$ipAddr" | grep -m1 -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n 1)
+	actualIp4Prefix=$(ip -4 route show scope link | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -w "$interface4" | grep -w "$ip4RouteScopeLink" | head -n 1 | awk '{print $1}' | awk -F '/' '{print $2}')
+	[[ -z "$actualIp4Prefix" ]] && actualIp4Prefix="$ipPrefix"
+	actualIp4Subnet=$(netmask "$actualIp4Prefix")
+	# In most situation, at least 99.9% probability, the first hop of the network should be the same as the available gateway.
+	# But in 0.1%, they are actually different.
+	# Because one of the first hop of a tested machine is 5.45.72.1, I told Debian installer this router as a gateway
+	# But installer said the correct gateway should be 5.45.76.1, in a typical network, for example, your home,
+	# the default gateway is the same as the first route hop of the machine, it may be 192.168.0.1.
+	# If possible, we should configure out the real available gateway of the network.
+	FirstRoute=$(ip -4 route show default | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -w "via" | grep -w "dev $interface4*" | head -n 1 | awk -F " " '{for (i=3;i<=NF;i++)printf("%s ", $i);print ""}' | awk '{print$1}')
+	# We should find it in ARP, the first hop IP and gateway IP is managed by the same device, use device mac address to configure it out.
+	RouterMac=$(arp -n | grep "$FirstRoute" | awk '{print$3}')
+	FrFirst=$(echo "$FirstRoute" | cut -d'.' -f 1,2)
+	FrThird=$(echo "$FirstRoute" | cut -d'.' -f 3)
+	# Print all matched available gateway.
+	ipGates=$(ip -4 route show | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -v "via" | grep -w "dev $interface4*" | grep -w "proto*" | grep -w "scope global\|link src $ipAddr*" | awk '{print$1}')
+	# Figure out the line of this list.
+	ipGateLine=$(echo "$ipGates" | wc -l)
+	# The line determines the cycling times.
+	for ((i = 1; i <= "$ipGateLine"; i++)); do
+		# Current one gateway of the ip gateways. the formart is as of 10.0.0.0/22
+		tmpIpGate=$(echo "$ipGates" | sed -n ''$i'p')
+		# Intercept a standard IPv4 address.
+		tmpIgAddr=$(echo $tmpIpGate | cut -d'/' -f1)
+		# Intercept the prefix of the gateway.
+		tmpIgPrefix=$(echo $tmpIpGate | cut -d'/' -f2)
+		# Calculate the first ip in all network segment, it should be the the same range with gateway in this network.
+		minIpGate=$(ipv4Calc "$tmpIgAddr" "$tmpIgPrefix" | grep "FirstIP:" | awk '{print$2}')
+		# Intercept the A and B class of the current ip address of gateway.
+		tmpIpGateFirst=$(echo "$minIpGate" | cut -d'.' -f 1,2)
+		tmpIpGateThird=$(echo "$minIpGate" | cut -d'.' -f 3)
+		# If the class A and B class of the current local ip address is as same as current gateway, this gateway may a valid one.
+		[[ "$FrFirst" == "$tmpIpGateFirst" ]] && {
+			if [[ "$FrThird" == "$tmpIpGateThird" ]]; then
+				ipGate="$FirstRoute"
+				break
+			elif [[ "$FrThird" != "$tmpIpGateThird" ]]; then
+				# The A, B and C class address of min ip gate.
+				tmpMigFirst=$(echo $minIpGate | cut -d'.' -f 1,2,3)
+				# Search it in ARP, it's belonged to the same network device which has been distinguished by mac address of first hop of the IP.
+				ipGate=$(arp -n | grep "$tmpMigFirst" | grep "$RouterMac" | awk '{print$1}')
+				break
+			fi
+		}
+	done
+	# If there is no one of other gateway in this current network, use if access the public internet, the first hop route of this machine as the gateway.
+	[[ "$ipGates" == "" || "$ipGate" == "" ]] && ipGate="$FirstRoute"
+	transferIPv4AddressFormat "$ipAddr" "$ipGate"
+}
+
+# $1 is "$ipAddr", $2 is "$ipGate".
+function transferIPv4AddressFormat() {
+	# Some cloud providers like Godaddy, Arkecx, Hetzner(include DHCP) etc, the subnet mask of IPv4 static network configuration of their original template OS is incorrect.
+	# The following is the sample:
+	#
+	# auto eth0
+	#   iface eth0 inet static
+	#     address 190.168.23.175
+	#     netmask 255.255.255.240
+	#     dns-nameservers 8.8.8.8 8.8.4.4
+	#     up ip -4 route add default via 169.254.0.1 dev eth0 onlink
+	#
+	# The netmask tells the total number of IP in the network is only 15(240 - 255),
+	# but we obsessed that there are more than 15 IPv4 addresses between 169.254.0.1 and 190.168.23.175 clearly.
+	# So if netmask is 255.255.255.240(prefix is 28), the computer only find IP between 190.168.23.160 and 190.168.23.175,
+	# the gateway 169.254.0.1 is obviously not be included in this range.
+	# So we need to expand the range of the netmask(reduce the value number of the prefix) to make sure the IPv4 gateway can be contained.
+	# If this mistake has not be repaired, Debian installer will return error "untouchable gateway".
+	# DHCP IPv4 network(even IPv4 netmask is "32") may not be effected by this situation.
+	# The following consulted calculations are calculated by Vultr IPv4 subnet calculator, reference: https://www.vultr.com/resources/subnet-calculator/
+	ipv4SubnetCertificate "$1" "$2"
+	ipPrefix="$tmpIpMask"
+	ipMask=$(netmask "$tmpIpMask")
+	# Some servers' provided by Hetzner are so confused because the IPv4 configurations of them are static but they are not fitted with standard, here is a sample:
+	#
+	# auto ens3
+	# iface ens3 inet static
+	#     address: 89.163.208.5
+	#     netmask: 255.255.255.0
+	#     broadcast +
+	#     up ip -f inet route add 169.254.0.1 dev ens3
+	#     up ip -f inet route add default via 169.254.0.1 dev ens3
+	#
+	# The A class of address and gateway are entirely different, although we should make sure the value of the suggested subnet mask is "128.0.0.1"(prefix "1")
+	# to expand IPv4 range as large as possible, but in above situation, the largest IPv4 range is from 0.0.0.0 to 127.255.255.255, the IPv4 gate "169.254.0.1"
+	# can't be included, so the reserve approach is to get the result of "ip -4 route show scope link"(89.163.208.0/24) to ensure the correct subnet and gateway,
+	# then we can fix these weird settings from incorrect network router.
+	# IPv4 network from Hetzner support dhcp even though it's configurated by static in "/etc/network/interfaces".
+	# ip4RangeFirst=`ipv4Calc "$1" "$actualIp4Prefix" | grep "FirstIP:" | awk '{print$2}' | cut -d'.' -f1`
+	# ip4RangeLast=`ipv4Calc "$1" "$actualIp4Prefix" | grep "LastIP:" | awk '{print$2}' | cut -d'.' -f1`
+	ip4AddrFirst=$(echo $1 | cut -d'.' -f1)
+	ip4AddrSecond=$(echo $1 | cut -d'.' -f2)
+	ip4GateFirst=$(echo $2 | cut -d'.' -f1)
+	ip4GateSecond=$(echo $2 | cut -d'.' -f2)
+	# Common ranges of IPv4 intranet:
+	# Reference: https://hczhang.cn/network/reserved-ip-addresses.html
+	[[ "$ip4AddrFirst""$ip4AddrSecond" != "$ip4GateFirst""$ip4GateSecond" ]] && {
+		checkIfIpv4AndIpv6IsLocalOrPublic "$2" ""
+		[[ "$ipv4LocalOrPublicStatus" == '1' ]] || [[ "$ip4AddrFirst" != "$ip4GateFirst" ]] || [[ "$ip4AddrSecond" != "$ip4GateSecond" ]] && {
+			# [[ -z "$ip4RouteScopeLink" ]] && ipGate=`ipv4Calc "$1" "$ipPrefix" | grep "FirstIP:" | awk '{print$2}'` || ipGate=`ipv4Calc "$ip4RouteScopeLink" "$ipPrefix" | grep "FirstIP:" | awk '{print$2}'`
+			if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]] || [[ "$linux_relese" == 'alpinelinux' ]]; then
+				ipPrefix="$actualIp4Prefix"
+				ipMask="$actualIp4Subnet"
+				Network4Config="isStatic"
+				# Redirecting all actual names of network adapters to "eth0", "eth1"... by force aims to make a convenience to adding gateway(route) in soft hacking process.
+				setInterfaceName='1'
+			fi
+			# Temporary installation of Debian 12 and Kali can't handle IPv4 public address and IPv4 private gateway well, so we prefer to invoke irregular IPv6 parameters to configure network in "busybox" and write static configs for IPv4 in later stage of the installation.
+			[[ "$IPStackType" == "BiStack" ]] && {
+				[[ "$linux_relese" == 'debian' || "$linux_relese" == 'kali' ]] && {
+					BiStackPreferIpv6Status='1'
+				}
+			}
+			# Installation environment of Debian 11 and former releases can't handle either irregular(gateway is not within the range of which is calculated by IP/mask) IPv4 or IPv6 parameters, so we need to execute a "ip route add" trick to make sure the networking of pure IPv4 stack servers works normally in "busybox".
+			[[ "$IPStackType" == "IPv4Stack" || "$linux_relese" == 'alpinelinux' ]] && BurnIrregularIpv4Status='1'
+		}
+	}
+	[[ "$interfacesNum" -ge "2" ]] && {
+		# If there are two and more network adapters on the system like "eth0" and "eth1" and the first adapter "eth0" plays a role of connecting to the public network by dhcp method,
+		# AlpineLinux will prefer to use the last order of the adapter like "eth1" to configure the network instead of "eth0" if assign "ip=dhcp" parameter to the netboot kernel,
+		# so we need to switch the network configuration method to static to make sure the expect valid network adapter "eth0" can be activated.
+		[[ "$linux_relese" == 'alpinelinux' ]] && Network4Config="isStatic"
+	}
+}
+
+function netmask() {
+	n="${1:-32}"
+	b=""
+	m=""
+	for ((i = 0; i < 32; i++)); do
+		[ $i -lt $n ] 2>/dev/null && b="${b}1" || b="${b}0"
+	done
+	for ((i = 0; i < 4; i++)); do
+		s=$(echo "$b" | cut -c$(($(($i * 8)) + 1))-$(($(($i + 1)) * 8)))
+		[ "$m" == "" ] && m="$((2#${s}))" || m="${m}.$((2#${s}))"
+	done
+	echo "$m"
+}
+
+# $1 is IPv4 address, $2 is IPv4 subnet.
+function ipv4Calc() {
+	tmpIp4="$1"
+	tmpIp4Mask=$(netmask "$2")
+
+	IFS=. read -r i1 i2 i3 i4 <<<"$tmpIp4"
+	IFS=. read -r m1 m2 m3 m4 <<<"$tmpIp4Mask"
+
+	tmpNetwork="$((i1 & m1)).$((i2 & m2)).$((i3 & m3)).$((i4 & m4))"
+	tmpBroadcast="$((i1 & m1 | 255 - m1)).$((i2 & m2 | 255 - m2)).$((i3 & m3 | 255 - m3)).$((i4 & m4 | 255 - m4))"
+	tmpFirstIP="$((i1 & m1)).$((i2 & m2)).$((i3 & m3)).$(((i4 & m4) + 1))"
+	tmpFiLast="$(echo "$tmpFirstIP" | cut -d'.' -f 4)"
+	FirstIP="$tmpFirstIP"
+	tmpLastIP="$((i1 & m1 | 255 - m1)).$((i2 & m2 | 255 - m2)).$((i3 & m3 | 255 - m3)).$(((i4 & m4 | 255 - m4) - 1))"
+	tmpLiLast="$(echo "$tmpLastIP" | cut -d'.' -f 4)"
+	LastIP="$tmpLastIP"
+	[[ "$tmpFiLast" > "$tmpLiLast" ]] && {
+		FirstIP="$tmpLastIP"
+		LastIP="$tmpFirstIP"
+	}
+	[[ "$2" > "31" ]] && {
+		FirstIP="$tmpNetwork"
+		LastIP="$tmpNetwork"
+	}
+	echo -e "Network:   $tmpNetwork\nBroadcast: $tmpBroadcast\nFirstIP:   $FirstIP\nLastIP:    $LastIP\n"
+}
+
+# Unsuitable settings of subnet will cause not only "Death Red" of Debian installer which is called "unreachable gateway"
+# but also contributes to some additional negative results as of if it's wider than the actual,
+# this host will lose communications with some other servers which are serving in public internet because these will be treated as intranet hosts.
+# To the opposite, if the subnet of one server is narrower than the actual, this host will lose communications with some local hosts because these will be treated as public servers.
+# As an environment of a VPS, a narrower subnet causes less bad subsequentials than a wider prefer because VPS is usually be used by individual.
+# If it's in a cluster such as home, office or company which is a place of that usually needs to transmit data with other hosts within LAN(local area network),
+# the better opinion is to setting a wider value if you don't know them well.
+# To figure out the most suitable subnet of a class segment of one IP or just a specific IP address,
+# you can visit: https://bgp.tools/ which allows you to inquire announced allocations of IP addresses that were assigned by Internet Organizations.
+#
+# $1 is "$ipAddr", $2 is "$ipGate"
+function ipv4SubnetCertificate() {
+	# If the IP and gateway are not in the same IPv4 A class, the prefix of netmask should be "1", transfer to whole IPv4 address is 128.0.0.1
+	# The range of 190.168.23.175/1 is 128.0.0.0 - 255.255.255.255, the gateway 169.254.0.1 can be included.
+	[[ $(echo $1 | cut -d'.' -f 1) != $(echo $2 | cut -d'.' -f 1) ]] && tmpIpMask="1"
+	# If the IP and gateway are in the same IPv4 A class, not in the same IPv4 B class, the prefix of netmask should less equal than "8", transfer to whole IPv4 address is 255.0.0.0
+	# The range of 190.168.23.175/8 is 190.0.0.0 - 190.255.255.255, the gateway 169... can't be included.
+	[[ $(echo $1 | cut -d'.' -f 1) == $(echo $2 | cut -d'.' -f 1) ]] && tmpIpMask="8"
+	# If the IP and gateway are in the same IPv4 A B class, not in the same IPv4 C class, the prefix of netmask should less equal than "16", transfer to whole IPv4 address is 255.255.0.0
+	# The range of 190.168.23.175/16 is 190.168.0.0 - 190.168.255.255, the gateway 169... can't be included.
+	[[ $(echo $1 | cut -d'.' -f 1,2) == $(echo $2 | cut -d'.' -f 1,2) ]] && tmpIpMask="16"
+	# If the IP and gateway are in the same IPv4 A B C class, not in the same IPv4 D class, the prefix of netmask should less equal than "24", transfer to whole IPv4 address is 255.255.255.0
+	# The range of 190.168.23.175/24 is 190.168.23.0 - 190.168.23.255, the gateway 169... can't be included.
+	[[ $(echo $1 | cut -d'.' -f 1,2,3) == $(echo $2 | cut -d'.' -f 1,2,3) ]] && tmpIpMask="24"
+	# So in summary of the IPv4 sample in above, we should assign subnet mask "128.0.0.1"(prefix "1") for it.
+}
+
+# $1 is "$setDisk", $2 is "linux_relese"
+function getDisk() {
+	# $disks is definited as the default disk, if server has 2 and more disks, the first disk will be responsible of the grub booting.
+	rootPart=$(lsblk -ip | grep -v "fd[0-9]*\|sr[0-9]*\|ram[0-9]*\|loop[0-9]*" | sed 's/[[:space:]]*$//g' | grep -w "part /\|part /boot" | head -n 1 | cut -d' ' -f1 | sed 's/..//')
+	# majorMin=`lsblk -ip | grep -w "$rootPart" | head -n 1 | awk '{print $2}' | sed -r 's/:(.*)/:0/g'`
+	diskSuffix=${rootPart: -4}
+	# ssd like NVMe(/dev/nvme0n1), MMC sd card(/dev/mmcblk0) are parted with "p number" suffix like: "/dev/nvme0n1p1" "/dev/mmcblk0p2",
+	# The partitions of vda and sda devices are ended with number "/dev/sda1" "/dev/vda2".
+	[[ -n $(echo $diskSuffix | grep -o "[0-9]p[0-9]") ]] && disks=$(echo $rootPart | sed 's/p[0-9]*.$//') || disks=$(echo $rootPart | sed 's/[0-9]*.$//')
+	# disks=`lsblk -ip | grep -w "$majorMin" | head -n 1 | awk '{print $1}'`
+	[[ -z "$disks" ]] && disks=$(lsblk -ip | grep -v "fd[0-9]*\|sr[0-9]*\|ram[0-9]*\|loop[0-9]*" | sed 's/[[:space:]]*$//g' | grep -w "disk /\|disk /boot" | head -n 1 | cut -d' ' -f1)
+	[[ -z "$disks" ]] && disks=$(lsblk -ip | grep -v "fd[0-9]*\|sr[0-9]*\|ram[0-9]*\|loop[0-9]*" | sed 's/[[:space:]]*$//g' | grep -w "disk" | grep -i "[0-9]g\|[0-9]t\|[0-9]p\|[0-9]e\|[0-9]z\|[0-9]y" | head -n 1 | cut -d' ' -f1)
+	[ -n "$disks" ] || echo ""
+	echo "$disks" | grep -q "/dev"
+	[ $? -eq 0 ] && IncDisk="$disks" || IncDisk="/dev/$disks"
+	AllDisks=""
+	# Find all disks on this server.
+	for Count in $(lsblk -ipd | grep -v "fd[0-9]*\|sr[0-9]*\|ram[0-9]*\|loop[0-9]*" | sed 's/[[:space:]]*$//g' | grep -w "disk" | grep -i "[0-9]g\|[0-9]t\|[0-9]p\|[0-9]e\|[0-9]z\|[0-9]y" | cut -d' ' -f1); do
+		AllDisks+="$Count "
+	done
+	AllDisks=$(echo "$AllDisks" | sed 's/.$//')
+	# All numbers of disks' statistic of this server.
+	disksNum=$(echo $AllDisks | grep -o "/dev/*" | wc -l)
+
+	# Some cloud providers using first SCSI/SATA device like "sda" to mount ISO image instead of using "sr0":
+	#
+	# root@node:~# lsblk -ipf
+	# NAME        FSTYPE  FSVER            LABEL  UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
+	# /dev/sda    iso9660 Joliet Extension cidata 2023-07-13-09-35-07-00
+	# /dev/sr0
+	# /dev/vda
+	# |-/dev/vda1
+	# |-/dev/vda2 vfat    FAT32                   0BBB-E1CA                            119.9M  0%     /boot/efi
+	# `-/dev/vda3 xfs                             0c93f6bc-ef9c-468d-be02-84b4a70d3678 44.4G   11%    /
+	#
+	# Because of "sda" can't be written, If system is selected to install on "sda", the installation will meet a fatal,
+	# So we should exclude all these devices.
+	for ((d = 1; d <= $disksNum; d++)); do
+		currentDisk=$(echo "$AllDisks" | cut -d' ' -f$d)
+		checkIfIsoPartition=$(lsblk -ipf | grep "$currentDisk" | head -n 1 | awk '{print $2}' | grep -i "iso")
+		[[ -z "$checkIfIsoPartition" ]] && tmpAllDisks+="$currentDisk "
+	done
+	tmpAllDisks=$(echo "$tmpAllDisks" | sed 's/.$//')
+
+	[[ "$AllDisks" != "$tmpAllDisks" ]] && {
+		AllDisks="$tmpAllDisks"
+		disksNum=$(echo $AllDisks | grep -o "/dev/*" | wc -l)
+		[[ "$IncDisk" =~ "$AllDisks" ]] || IncDisk=$(echo "$AllDisks" | cut -d' ' -f1)
+	}
+
+	# Allow user to install system to one disk manually.
+	[[ -n "$1" && "$1" != "all" && "$(echo $1 | cut -d '/' -f 3)" =~ ^[a-z0-9]+$ || "$(echo $1 | cut -d '/' -f 3)" =~ ^[a-z]+$ ]] && {
+		[[ "$1" =~ "/dev/" ]] && IncDisk="$1" || IncDisk="/dev/$1"
+	}
+
+	# Remove all lvm volumes by force for Debian and Kali.
+	[[ -z "$1" && "$disksNum" -ge "2" && -n $(lsblk -ip | awk '{print $6}' | grep -io "lvm") ]] && {
+		[[ "$2" == 'debian' || "$2" == 'kali' ]] && setDisk="all"
+	}
+
+	# Redhat cloud init install needs at least 10GB drive space.
+	# Windows needs at least 15GB drive space.
+	diskCapacity=$(lsblk -ipb | grep -w "$IncDisk" | awk {'print $4'})
+}
+
+# Check if there are several cloud init configs in CD drive.
+function detectCloudinit() {
+	internalCloudinitStatus="0"
+	[[ $(blkid -tTYPE=iso9660 -odevice) ]] && {
+		umount /mnt 2>/dev/null
+		for cloudinitCdDrive in $(blkid -tTYPE=iso9660 -odevice); do
+			mount $cloudinitCdDrive /mnt 2>/dev/null
+			[[ $(find /mnt -name "meta_data*" -print -or -name "user_data*" -print -or -name "meta-data*" -print -or -name "user-data*" -print) ]] && {
+				internalCloudinitStatus="1"
+				umount /mnt 2>/dev/null
+				break
+			}
+			umount /mnt 2>/dev/null
+		done
+	}
+}
+
+function diskType() {
+	echo $(udevadm info --query all "$1" 2>/dev/null | grep 'ID_PART_TABLE_TYPE' | cut -d'=' -f2)
+}
+
+# Default to make a GPT partition to support 3TB hard drive or larger.
+# To remove LVM VGM PVM force automatically:
+# https://serverfault.com/questions/571363/unable-to-automatically-remove-lvm-data
+# To part all disks for preseed:
+# https://unix.stackexchange.com/questions/341253/using-d-i-partman-recipe-strings
+#
+# Recipes for parting disk in BIOS or UEFI manually for kickstart.
+# https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/installation_guide/sect-kickstart-syntax
+# https://blog.adachin.me/archives/3621
+# https://www.cnblogs.com/hukey/p/14919346.html
+#
+# $1 is "$linux_relese", $2 is "$disksNum", $3 is "$setSwap", $4 is "$setDisk", $5 is "$partitionTable", $6 is "$setFileSystem", $7 is "$EfiSupport", $8 is "$diskCapacity", $9 is "$IncDisk", ${10} is "$AllDisks".
+function setNormalRecipe() {
+	[[ -n "$3" && $(echo "$3" | grep -o '[0-9]') ]] && swapSpace="$setSwap" || swapSpace='0'
+	if [[ "$1" == 'debian' ]] || [[ "$1" == 'kali' ]]; then
+		[[ "$lowMemMode" == "1" ]] && {
+			[[ -z "$swapSpace" || "$swapSpace" -lt "512" ]] && swapSpace="512"
+		}
+		if [[ -n "$swapSpace" && "$swapSpace" -gt "0" ]]; then
+			swapSpace=$(awk 'BEGIN{print '${swapSpace}'*1.05078125 }' | cut -d '.' -f '1')
+			swapRecipe=''${swapSpace}' 200 '${swapSpace}' linux-swap method{ swap } format{ } .'
+		else
+			swapRecipe=""
+		fi
+		if [[ "$6" == "xfs" ]]; then
+			fileSystem="xfs"
+		else
+			fileSystem="ext4"
+		fi
+		defaultFileSystem='d-i partman/default_filesystem string '${fileSystem}''
+		mainRecipe='1076 150 -1 '${fileSystem}' method{ format } format{ } use_filesystem{ } filesystem{ '${fileSystem}' } mountpoint{ / } .'
+		if [[ "$2" -gt "1" && "$4" == "all" ]]; then
+			PartmanEarlyCommand='debconf-set partman-auto/disk '${10}';'
+			selectDisks='d-i partman-auto/disk string '${10}''
+		else
+			PartmanEarlyCommand='debconf-set partman-auto/disk "$(list-devices disk | grep '${9}' | head -n 1)";'
+			selectDisks='d-i partman-auto/disk string '${9}''
+		fi
+		if [[ "$5" == "gpt" || "$7" == "enabled" || "$8" -ge "2199023255552" ]]; then
+			gptPartitionPreseed=$(echo -e "d-i partman-basicfilesystems/choose_label string gpt
+d-i partman-basicfilesystems/default_label string gpt
+d-i partman-partitioning/choose_label string gpt
+d-i partman-partitioning/default_label string gpt
+d-i partman/choose_label string gpt
+d-i partman/default_label string gpt")
+			gptForBios='1 100 1 free $iflabel{ gpt } $reusemethod{ } method{ biosgrub } .'
+		else
+			gptPartitionPreseed=""
+			gptForBios=""
+		fi
+		if [[ "$7" == "enabled" ]]; then
+			normalRecipes=$(echo -e "d-i partman-auto/choose_recipe select normal
+d-i partman-auto/expert_recipe string normal ::                                   \
+    538 100 1076 free \$iflabel{ gpt } \$reusemethod{ } method{ efi } format{ } . \
+    $swapRecipe                                                                   \
+    $mainRecipe
+d-i partman-efi/non_efi_system boolean true")
+		else
+			normalRecipes=$(echo -e "d-i partman-auto/choose_recipe select normal
+d-i partman-auto/expert_recipe string normal :: \
+    $gptForBios                                 \
+    $swapRecipe                                 \
+    $mainRecipe
+")
+		fi
+		FormatDisk=$(echo -e "$selectDisks
+d-i partman-auto/method string regular
+d-i partman-basicfilesystems/no_swap boolean false
+$normalRecipes
+$gptPartitionPreseed
+")
+	elif [[ "$1" == 'centos' ]] || [[ "$1" == 'rockylinux' ]] || [[ "$1" == 'almalinux' ]] || [[ "$1" == 'fedora' ]]; then
+		ksIncDisk=$(echo $9 | cut -d'/' -f 3)
+		ksAllDisks=$(echo ${10} | sed 's/\/dev\///g' | sed 's/ /,/g')
+		if [[ -n "$swapSpace" && "$swapSpace" -gt "512" ]]; then
+			swapRecipe='part swap --ondisk='${ksIncDisk}' --size='${swapSpace}'\n'
+		elif [[ -z "$swapSpace" || "$swapSpace" -le "512" ]]; then
+			# Not distributing any capacity of swap will cause installing of Kickstart collapse.
+			swapRecipe='part swap --ondisk='${ksIncDisk}' --size=512\n'
+		fi
+		[[ "$2" -le "1" || "$4" != "all" ]] && {
+			clearPart="clearpart --drives=${ksIncDisk} --all --initlabel"
+			if [[ "$7" == "enabled" ]]; then
+				FormatDisk=$(echo -e "part / --fstype="xfs" --ondisk="$ksIncDisk" --grow --size="0"\n${swapRecipe}part /boot --fstype="xfs" --ondisk="$ksIncDisk" --size="1024"\npart /boot/efi --fstype="efi" --ondisk="$ksIncDisk" --size="512"")
+			else
+				FormatDisk=$(echo -e "part / --fstype="xfs" --ondisk="$ksIncDisk" --grow --size="0"\n${swapRecipe}part /boot --fstype="xfs" --ondisk="$ksIncDisk" --size="1024"\npart biosboot --fstype=biosboot --ondisk="$ksIncDisk" --size=1")
+			fi
+		}
+		[[ "$4" == "all" || -n "$setRaid" ]] && {
+			clearPart="clearpart --all --initlabel"
+			FormatDisk="autopart"
+		}
+	fi
+}
+
+# $1 is "$setRaid", $2 is "$disksNum", $3 is "$AllDisks", $4 is "$linux_relese".
+function setRaidRecipe() {
+	[[ -n "$1" ]] && {
+		# Soft Raid 0, 1, 5, 6 and 10 methods are supported by Debian, only one disk can't be as a component for any Raid method.
+		# Raid 0 needs at least two disks, all space of the disks will be exploited, and it's the most dangerous for the safety of the data.
+		# Raid 1 needs at least two disks, the space can be exploited is always equal one disk, it's safest for the date but a bit wasteful.
+		# Raid 5 needs at least three disks, it storages data on two disks and storages parity checking data on one disk, it's not save on any single disk over 4TB.
+		# Raid 6 needs at least four disks, it's an enhanced version of Raid 5, it uses two parity stripes by practicing of dividing data across the set of drives,
+		# it allows for two disk failures within the RAID set before any data is lost.
+		# Raid 10 needs at least four disks, it's a combination of Raid 0 and Raid 1, the disk 0 and disk 1 as a set of Raid 0, the same as disk 2 and disk 3,
+		# and then the sets of disk 0,1 and disk 2,3 are composed as one Raid 1.
+		# These Raid recipes are also applicable to Kali, fuck Canonical again! you deperated the compatibility of "preseed.cfg" installation procession from Ubuntu 22.04 and later.
+		if [[ "$1" == "0" || "$1" == "1" || "$1" == "5" || "$1" == "6" || "$1" == "10" ]]; then
+			[[ "$1" == "0" || "$1" == "1" ]] && [[ "$2" -lt "2" ]] && {
+				echo -ne "\n[${red}Error${plain}] There are $2 drives on your machine, Raid $1 partition recipe only supports a basic set of dual drive or more!\n"
+				exit 1
+			}
+			[[ "$1" == "5" ]] && [[ "$2" -lt "3" ]] && {
+				echo -ne "\n[${red}Error${plain}] There are $2 drives on your machine, Raid $1 partition recipe only supports a basic set of triple drive or more!\n"
+				exit 1
+			}
+			[[ "$1" == "6" || "$1" == "10" ]] && [[ "$2" -lt "4" ]] && {
+				echo -ne "\n[${red}Error${plain}] There are $2 drives on your machine, Raid $1 partition recipe only supports a basic set of quad drive or more!\n"
+				exit 1
+			}
+		else
+			echo -ne "\n[${red}Error${plain}] Raid $1 partition recipe is not suitable, only Raid 0, 1, 5, 6 or 10 is supported!\n"
+			exit 1
+		fi
+		if [[ "$4" == 'debian' ]] || [[ "$4" == 'kali' ]]; then
+			defaultFileSystem='d-i partman/default_filesystem string ext4'
+			for ((r = 1; r <= "$2"; r++)); do
+				tmpAllDisksPart=$(echo "$3" | cut -d ' ' -f"$r")
+				# Some NVME controller hard drives like "/dev/nvme0n1" etc are end of a number in there names must add "p" with partition numbers for "d-i partman-auto-raid/recipe string",
+				# SCSI controller or Virtual controller drives like "/dev/sda" or "/dev/vda" are not effected by this situation.
+				# Drives and their partitions must be connected with "#" like "/dev/nvme0n1p2#/dev/nvme0n2p2".
+				echo "${tmpAllDisksPart: -1}" | [[ -n "$(sed -n '/^[0-9][0-9]*$/p')" ]] && tmpAllDisksPart="$tmpAllDisksPart""p" || tmpAllDisksPart="$tmpAllDisksPart"
+				AllDisksPart1+="$tmpAllDisksPart""1#"
+				AllDisksPart2+="$tmpAllDisksPart""2#"
+				AllDisksPart3+="$tmpAllDisksPart""3#"
+			done
+			AllDisksPart1=$(echo "$AllDisksPart1" | sed 's/.$//')
+			AllDisksPart2=$(echo "$AllDisksPart2" | sed 's/.$//')
+			AllDisksPart3=$(echo "$AllDisksPart3" | sed 's/.$//')
+			# Remove existed raid md devices without confirming; select raid recipe and all disks; don't assign swap; when one device on raid 1 is offline, the system still can be booted.
+			# Reference: https://wiki.ubuntu.com/BootDegradedRaid
+			RaidRecipes=$(echo -e "d-i partman-md/confirm boolean true
+d-i partman-md/confirm_nooverwrite boolean true
+d-i partman-md/confirm_nochanges boolean false
+d-i partman-basicfilesystems/no_swap boolean false
+d-i partman-auto/method string raid
+d-i partman-auto/disk string $3
+d-i mdadm/boot_degraded boolean true")
+			# In environment of UEFI firmware motherboard computers, it's not suggested to creat any Raid recipe for "/boot/efi" partition,
+			# in any virtual machine which created by VMware Workstation Pro, version up to the current 17.0.2(2023/6), host OS is Windows 10 Enterprise x64,
+			# we must assign an additional Raid 1 recipe for "/boot" partition to prevent the case of following to happen：
+			# otherwise except of the first reboot of the Debian 12 installed soon, the next time hard reboot the system, it will failed into "GNU GRUB version 2.0x"
+			# and we must type "exit" to fallback to "Boot Manager", select and enter the default opinion of "Boot normally" and then find that Debian can be booted by grub.
+			# This is a particularly fatal for those servers which has no permission to access VNC in website back-end management and impossible to manipulate UEFI boot manager to boot the system normally.
+			if [[ "$EfiSupport" == "enabled" ]]; then
+				FormatDisk=$(echo -e "$RaidRecipes
+d-i partman-auto-raid/recipe string     \
+    1  $2 0 ext4 /boot $AllDisksPart2 . \
+    $1 $2 0 ext4 /     $AllDisksPart3 .
+d-i partman-auto/expert_recipe string multiraid ::                                                            \
+    538  100 1076 free \$bootable{ } \$primary{ } method{ efi } \$iflabel{ gpt } \$reusemethod{ } format{ } . \
+    1076 150 2152 raid               \$primary{ } method{ raid } .                                            \
+    100  200 -1   raid               \$primary{ } method{ raid } .
+d-i partman-efi/non_efi_system boolean true
+d-i partman-partitioning/choose_label select gpt
+d-i partman-partitioning/default_label string gpt")
+			else
+				# GPT table partition should not be included in BIOS Raid recipes so that it will cause Debian installer "Unable to install GRUB in /dev/sda" by installing grub.
+				FormatDisk=$(echo -e "$RaidRecipes
+d-i partman-auto-raid/recipe string     \
+    1  $2 0 ext4 /boot $AllDisksPart1 . \
+    $1 $2 0 ext4 /     $AllDisksPart2 .
+d-i partman-auto/expert_recipe string multiraid ::                 \
+    1076 100 2152 raid \$bootable{ } \$primary{ } method{ raid } . \
+    100  200 -1   raid               \$primary{ } method{ raid } .
+")
+			fi
+			# Reference: https://github.com/airium/Linux-Reinstall/blob/master/install-raid0.sh
+			#            https://www.debian.org/releases/bookworm/example-preseed.txt
+			#            https://www.cnblogs.com/zhangshan-log/articles/14542166.html
+			#            https://gist.github.com/jnerius/6573343
+			#            https://gist.github.com/bearice/331a954d86d890d9dbeacdd7de3aabe8
+			#            https://lala.im/7911.html
+			#            https://github.com/office-itou/Linux/blob/master/installer/source/preseed_debian.cfg
+			#            https://qiita.com/YasuhiroABE/items/ff233459035d8187263d
+		elif [[ "$4" == 'centos' ]] || [[ "$4" == 'rockylinux' ]] || [[ "$4" == 'almalinux' ]] || [[ "$4" == 'fedora' ]]; then
+			tmpKsAllDisks=$(echo "$3" | sed 's/\/dev\///g')
+			ksRaidVolumes=()
+			ksRaidConfigs=""
+			ksRaidRecipes=""
+			if [[ "$EfiSupport" == "enabled" ]]; then
+				for ((partitionIndex = 0; partitionIndex <= "2"; partitionIndex++)); do
+					disksIndex="1"
+					for currentDisk in $tmpKsAllDisks; do
+						tmpKsRaidVolumes="raid."$partitionIndex""$disksIndex""
+						if [[ "$partitionIndex" == "0" ]]; then
+							tmpKsRaidConfigs="part "$tmpKsRaidVolumes" --size="1024" --ondisk="$currentDisk""
+						elif [[ "$partitionIndex" == "1" ]]; then
+							tmpKsRaidConfigs="part "$tmpKsRaidVolumes" --size="512" --ondisk="$currentDisk""
+						elif [[ "$partitionIndex" == "2" ]]; then
+							tmpKsRaidConfigs="part "$tmpKsRaidVolumes" --size="0" --grow --ondisk="$currentDisk""
+						fi
+						disksIndex=$(expr "$disksIndex" + 1)
+						ksRaidVolumes[$partitionIndex]+=""$tmpKsRaidVolumes" "
+						ksRaidConfigs+=""$tmpKsRaidConfigs"\n"
+					done
+				done
+				ksRaidConfigs=$(echo -e "$ksRaidConfigs")
+				ksRaidRecipes=$(echo -e "raid /boot --fstype="xfs" --device="boot" --level="1" ${ksRaidVolumes[0]}
+raid /boot/efi --fstype="efi" --device="boot-efi" --level="1" ${ksRaidVolumes[1]}
+raid / --fstype="xfs" --device="root" --level="$1" ${ksRaidVolumes[2]}
+")
+			else
+				for ((partitionIndex = 0; partitionIndex <= "2"; partitionIndex++)); do
+					disksIndex="1"
+					for currentDisk in $tmpKsAllDisks; do
+						tmpKsRaidVolumes="raid."$partitionIndex""$disksIndex""
+						if [[ "$partitionIndex" == "0" ]]; then
+							tmpKsRaidConfigs="part biosboot --fstype="biosboot" --size="1" --ondisk="$currentDisk""
+						elif [[ "$partitionIndex" == "1" ]]; then
+							tmpKsRaidConfigs="part "$tmpKsRaidVolumes" --size="1024" --ondisk="$currentDisk""
+						elif [[ "$partitionIndex" == "2" ]]; then
+							tmpKsRaidConfigs="part "$tmpKsRaidVolumes" --size="0" --grow --ondisk="$currentDisk""
+						fi
+						disksIndex=$(expr "$disksIndex" + 1)
+						ksRaidVolumes[$partitionIndex]+=""$tmpKsRaidVolumes" "
+						ksRaidConfigs+=""$tmpKsRaidConfigs"\n"
+					done
+				done
+				ksRaidConfigs=$(echo -e "$ksRaidConfigs")
+				ksRaidRecipes=$(echo -e "raid /boot --fstype="xfs" --device="boot" --level="1" ${ksRaidVolumes[1]}
+raid / --fstype="xfs" --device="root" --level="$1" ${ksRaidVolumes[2]}
+")
+			fi
+			FormatDisk="${ksRaidConfigs}
+${ksRaidRecipes}"
+			# Reference: <Example 27.4. Using the raid Kickstart command>. https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/installation_guide/sect-kickstart-syntax
+			#            https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/installation_guide/sect-kickstart-examples
+			#            https://gist.github.com/micmoyles/587131aa19089e5c18916949c26b65e7
+			#            <4.3.3.1. ソフトウェアRAID1でのシステムパーティションの作成>. https://dl.acronis.com/u/software-defined/html/AcronisCyberInfrastructure_3_5_installation_guide_ja-JP/installing-using-pxe/creating-kickstart-file.html#kickstart-file-example
+		else
+			echo -ne "\n[${red}Warning${plain}] Raid $1 recipe is not supported by target system!\n"
+			exit 1
+		fi
+	}
+}
+
+# $1 is timezone checkfile direction, $2 $3 $4 $5 and $6/$7/$8 are different IP geography location data providers to avoid if any of them has a downtime.
+function getUserTimeZone() {
+	if [[ ! "$TimeZone" =~ ^[a-zA-Z] ]]; then
+		loginUser=$(who am i | awk '{print $1}' | sed 's/(//g' | sed 's/)//g')
+		[[ -z "$loginUser" ]] && loginUser="root"
+		# "azureuser" can't be shown compeletely in output of "netstat" and it's the default username in official template of Azure.
+		[[ "${#loginUser}" -ge "7" ]] && loginUser=$(echo ${loginUser:0:7})
+		# Alpine Linux doesn't support "who am i".
+		# In some situations, there are several users with different IPs to connect to server by ssh service,
+		# So we need to filter a list of "Send-Q" and IPs from netstat and sort from largest to smallest by "Sent-Q" to ensure which IP is the current user,
+		# because the "Sent-Q" can record the data packs which IP is active for current ssh user.
+		# The same as for IPv6s.
+		GuestIP=$(netstat -naputeoW | grep -i 'established' | grep -i 'sshd: '$loginUser'' | grep -iw '^tcp\|udp' | awk '{print $3,$5}' | sort -t ' ' -k 1 -rn | awk '{print $2}' | head -n 1 | cut -d':' -f'1')
+		if [[ ! -z "$GuestIP" ]]; then
+			checkIfIpv4AndIpv6IsLocalOrPublic "$GuestIP" ""
+			# If some users are connecting to ssh service via private IPs, the actual location of this server may be the same as the public IP of this server like:
+			# I created a virtual machine by VMware on my laptop and access it with as "192.168.0.217", to determine timezone of current user according to this IP is meaningless.
+			[[ "$ipv4LocalOrPublicStatus" == '1' ]] && {
+				GuestIP=$(timeout 0.3s dig -4 TXT +short o-o.myaddr.l.google.com @ns3.google.com | sed 's/\"//g')
+				[[ "$GuestIP" == "" ]] && GuestIP=$(timeout 0.3s dig -4 TXT CH +short whoami.cloudflare @1.0.0.3 | sed 's/\"//g')
+			}
+		else
+			GuestIP=$(netstat -naputeoW | grep -i 'established' | grep -i 'sshd: '$loginUser'' | grep -iw '^tcp6\|udp6' | awk '{print $3,$5}' | sort -t ' ' -k 1 -rn | awk '{print $2}' | head -n 1 | awk -F':' '{for (i=1;i<=NF-1;i++)printf("%s:", $i);print ""}' | sed 's/.$//')
+			checkIfIpv4AndIpv6IsLocalOrPublic "" "$GuestIP"
+			[[ "$ipv6LocalOrPublicStatus" == '1' ]] && {
+				GuestIP=$(timeout 0.3s dig -6 TXT +short o-o.myaddr.l.google.com @ns3.google.com | sed 's/\"//g')
+				[[ "$GuestIP" == "" ]] && GuestIP=$(timeout 0.3s dig -6 TXT CH +short whoami.cloudflare @2606:4700:4700::1003 | sed 's/\"//g')
+			}
+		fi
+		for Count in "$2$GuestIP" "$3$GuestIP" "$4$GuestIP" "$5$GuestIP/json/" "$6" "$7" "$8"; do
+			[[ "$TimeZone" == "Asia/Shanghai" ]] && break
+			if [[ "$Count" =~ ^[a-zA-Z0-9]+$ ]]; then
+				tmpApi=$(echo -n "$Count" | base64 -d)
+				Count="https://api.ipgeolocation.io/timezone?apiKey=$tmpApi&ip=$GuestIP"
+			fi
+			TimeZone=$(curl -s "$Count" -A firefox 2>/dev/null | jq '.timezone, .time_zone' 2>/dev/null | grep -v "null" | tr -d '"')
+			checkTz=$(echo $TimeZone | cut -d'/' -f 1)
+			[[ -n "$checkTz" && "$checkTz" =~ ^[a-zA-Z] ]] && break
+		done
+		[[ -z "$TimeZone" ]] && TimeZone="Asia/Tokyo"
+	else
+		echo $(timedatectl list-timezones) >>"$1"
+		[[ $(grep -c "$TimeZone" "$1") == "0" || ! "/usr/share/zoneinfo/$1" ]] && TimeZone="Asia/Tokyo"
+		rm -rf "$1"
+	fi
+}
+
+function checkEfi() {
+	EfiStatus=$(efibootmgr l)
+	EfiVars=""
+	for Count in "$1" "$2" "$3" "$4"; do
+		EfiVars=$(ls -Sa $Count | wc -l)
+		[[ "$EfiVars" -ge "1" ]] && break
+	done
+	if [[ "$EfiStatus" == "" ]] || [[ "$EfiVars" == "0" ]]; then
+		EfiSupport="disabled"
+	elif [[ -n $(echo "$EfiStatus" | grep -i "bootcurrent" | awk '{print $2}' | sed -n '/^[[:xdigit:]]*$/p' | head -n 1) || -n $(echo "$EfiStatus" | grep -i "bootorder" | awk '{print $2}' | awk -F ',' '{print $NF}' | sed -n '/^[[:xdigit:]]*$/p' | head -n 1) ]] && [[ "$EfiVars" != "0" ]]; then
+		EfiSupport="enabled"
+	else
+		echo -ne "\n[${red}Error${plain}] UEFI boot firmware of your system could not be confirmed!\n"
+		exit 1
+	fi
+}
+
+# $1 is "/boot/grub/", $2 is "/boot/grub2/", $3 is "/etc/", $4 is "grub.cfg", $5 is "grub.conf", $6 is "/boot/efi/EFI/"
+# In some templates of Redhat series 7-8, UEFI firmware from Hetzner and etc. , there are two directions of grub configure files like:
+#
+# /boot/efi/EFI/rocky/grub.cfg
+# /boot/grub2/grub.cfg
+#
+# The contents of the above two files are almost equal, but the new boot menuentry which we need to write in file "/etc/grub.d/40_custom"
+# can only valid after reboot by using "grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg", "grub2-mkconfig -o /boot/grub2/grub.cfg" doesn't cause any effect,
+# So in this situation, to find out the valid grub config file like "/boot/efi/EFI/rocky/grub.cfg" at first is necessary.
+# For Redhat series 9 and later, including Fedora 36+, the valid direction of grub config files are unified back to "/boot/grub2/grub.cfg" now,
+# so we won't have to consider the troubles which were caused by Redhat 7-8 series's abnormal settings.
+function checkGrub() {
+	GRUBDIR=""
+	GRUBFILE=""
+	for Count in "$4" "$5"; do
+		GRUBFILE=$(find "$6" -name "$Count")
+		if [[ -n "$GRUBFILE" ]]; then
+			GRUBDIR=$(echo "$GRUBFILE" | sed "s/$Count//g")
+			GRUBFILE="$Count"
+			break
+		fi
+	done
+	GRUBDIR=$(echo $GRUBDIR | awk '{print $1}')
+	if [[ -z "$GRUBFILE" ]] || [[ $(grep -c "insmod*" $GRUBDIR$GRUBFILE) == "0" ]] || [[ -n "$GRUBFILE" && $(grep -c "insmod*" $GRUBDIR$GRUBFILE) != "0" && "$EfiSupport" == "disabled" ]]; then
+		for Count in "$1" "$2" "$3"; do
+			# Don't support grub1 of CentOS/Redhat Enterprise Linux/Oracle Linux 6.x
+			if [[ -f "$Count""$4" ]] && [[ $(grep -c "insmod*" $Count$4) -ge "1" ]]; then
+				GRUBDIR="$Count"
+				GRUBFILE="$4"
+			elif [[ -f "$Count""$5" ]] && [[ $(grep -c "insmod*" $Count$5) -ge "1" ]]; then
+				GRUBDIR="$Count"
+				GRUBFILE="$5"
+			fi
+		done
+	fi
+	GRUBDIR=$(echo ${GRUBDIR%?})
+	if [[ $(awk '/menuentry*/{print NF}' $GRUBDIR/$GRUBFILE | head -n 1) -ge "1" ]] || [[ $(awk '/feature*/{print $a}' $GRUBDIR/$GRUBFILE | head -n 1) != "" ]] || [[ $(awk '/insmod*/{print $a}' $GRUBDIR/$GRUBFILE | head -n 1) != "" ]]; then
+		if [[ -n $(grep -w "grub2-.*" $GRUBDIR/$GRUBFILE) ]] || [[ $(type grub2-mkconfig) != "" ]]; then
+			GRUBTYPE="isGrub2"
+		elif [[ -n $(grep -w "grub-.*" $GRUBDIR/$GRUBFILE) ]] || [[ $(type grub-mkconfig) != "" ]]; then
+			GRUBTYPE="isGrub1"
+		elif [[ "$CurrentOS" == "CentOS" || "$CurrentOS" == "OracleLinux" ]] && [[ "$CurrentOSVer" -le "6" ]]; then
+			GRUBTYPE="isGrub1"
+		fi
+	fi
+}
+
+# We found out an expedite and critical bug of Alpine Linux 3.19+ and edge(based on testing version of 3.20 at Mar. 2024) is that
+# when restarting Ubuntu 22.04 or Redhat series to boot on grub in order to start Alpine's netboot kernel will be failed because of Alpine was updated
+# the new grub version of 2.12 and added a new parameter of 'fwsetup --is-supported' but it could not be recognized by grub 2.06 only on arm64 hardware.
+# Debian 12 was not effected.
+#
+# A valid solution is to download an always up-to-date 'grub.efi' file which offered by OpenSUSE and replace the original one before restart.
+# Grub 2.12 is compatible with 2.06 .
+#
+# In official image of Ubuntu 22.04 provided by Hetzner arm64, directory of "/boot/efi/EFI/ubuntu/" was not existed, we should use "grub-install" to rebuild it.
+#
+# http://ftp.kddilabs.jp/pub/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/grubaa64.efi
+#
+# Reference: https://wiki.alpinelinux.org/wiki/Release_Notes_for_Alpine_3.20.0
+#            https://gitlab.alpinelinux.org/alpine/aports/-/issues/15263
+#            https://fosstodon.org/@alpinelinux/111703786706332100
+function checkAndReplaceEfiGrub() {
+	if [[ "$VER" == "aarch64" || "$VER" == "arm64" ]] && [[ "$EfiSupport" == "enabled" ]] && [[ "$linux_relese" == 'alpinelinux' ]]; then
+		[[ "$AlpineVer1" == "3" && "$AlpineVer2" -ge "19" ]] || [[ "$DIST" == "edge" ]] && {
+			efiGrubFull=$(find "/boot/efi/EFI/" -name "*.efi" | grep -i "grub" | head -n 1)
+			[[ -z "$efiGrubFull" ]] && {
+				grub-install
+				efiGrubFull=$(find "/boot/efi/EFI/" -name "*.efi" | grep -i "grub" | head -n 1)
+			}
+			efiGrubDir=$(echo ${efiGrubFull%/*}"/")
+			efiGrubFile=$(echo $efiGrubFull | awk -F "/" '{print $NF}')
+			mv "$efiGrubFull" "$efiGrubFull"".bak"
+			if [[ "$IsCN" == "cn" ]]; then
+				aarch64EfiGrubMirror="https://mirrors.tuna.tsinghua.edu.cn/opensuse/ports/aarch64/tumbleweed/repo/oss/EFI/BOOT/"
+			else
+				aarch64EfiGrubMirror="http://download.opensuse.org/ports/aarch64/tumbleweed/repo/oss/EFI/BOOT/"
+			fi
+			aarch64EfiGrubUrl="$aarch64EfiGrubMirror""grub.efi"
+			wget --no-check-certificate -qO "$efiGrubDir$efiGrubFile" "$aarch64EfiGrubUrl"
+		}
+	fi
+}
+
+# $1 is "$VER".
+# For AWS arm64, "console=tty1 console=ttyS0,115200n8" must be added to menuentry of the grub in order to successfully rebooting to the netboot installer kernel and viewing graphis on serial console.
+# Note: When booting into a new grub menuentry that we generated, this is not suitable for amd64 architecture otherwise it will cause boot with "RETBleed attacks, data leaks possible!" and failed.
+#       Arm64 instances of Oracle Cloud need "console=tty1".
+#       Guest video display will be disabled on VNC of Oracle Cloud if arm64 cloud kernel installed.
+#       Native Debian installation and generic cloud image of Debian will boot failed on arm64 instance of AWS EC2 because of missing drivers of ssd.
+#
+# Serial console parameters of default grub in official cloud images of several linux distributions:
+# Debian 12 amd64:           console=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 consoleblank=0
+# AlmaLinux 9.2 arm64:       console=tty0 console=ttyS0,115200n8
+# RockyLinux 9.2 arm64:      console=ttyS0,115200n8
+# Ubuntu 22.04+ amd/arm64:   console=tty1 console=ttyS0
+# For Ampere A1 arm64 processor, "console=ttyS0" is necessary.
+# Serial console parameters of "yitian 710" arm64 processor in servers of AlibabaCloud ECS:
+# Ubuntu 18.04+ arm64:       console=tty0 console=ttyAMA0,115200n8
+# Cloud images of Ubuntu 20.04-22.04 will boot fail on "yitian 710".
+function checkConsole() {
+	for ttyItems in "console=tty" "console=ttyAMA" "console=ttyS"; do
+		[[ $(grep "$ttyItems" $GRUBDIR/$GRUBFILE) ]] && {
+			ttyConsole+="${ttyItems}0 "
+		}
+	done
+	if [[ "$1" == "aarch64" || "$1" == "arm64" ]]; then
+		[[ ! "$ttyConsole" =~ "ttyS" ]] && {
+			if [[ $(echo "$ttyConsole" | grep "tty[0-9]") ]]; then
+				ttyConsole="${ttyConsole} console=ttyS0 "
+			else
+				ttyConsole="${ttyConsole} console=tty1 console=ttyS0 "
+			fi
+		}
+	fi
+	ttyConsole=$(echo "$ttyConsole" | sed 's/console=tty[0-9]/console=tty1/g' | sed 's/console=ttyAMA[0-9]/console=ttyAMA0,115200n8/g' | sed 's/console=ttyS[0-9]/console=ttyS0,115200n8/g' | sed 's/.$//')
+	[[ "$ttyConsole" =~ "ttyS" ]] && serialConsolePropertiesForGrub="$ttyConsole earlyprintk=ttyS0,115200n8 consoleblank=0"
+	[[ "$1" == "aarch64" || "$1" == "arm64" ]] || ttyConsole=""
+}
+
+# $1 is $linux_relese, $2 is $RedHatSeries, $3 is $targetRelese
+function checkMem() {
+	# "dmesg" is most accurate to detect the actually valuable memory.
+	# Reference: https://blog.csdn.net/imliuqun123/article/details/126120360
+	# The constant ratio of threshold value(triggering the following conditions) and nominal value(the space of the memory which announced by cloud provider) is coefficient of "0.99".
+	# If it can't be divisible by number "4", we'll take a value that is the multiple of 4 and litter less than the former one.
+	TotalMem=$(($(dmesg | grep -i 'memory' | grep -i 'available' | awk -F ':' '{print $2}' | awk '{print $1}' | cut -d '/' -f 2 | tr -d "a-zA-Z") / 1024))
+	# Alternate methods but not clearly accurate for example "kdump" service occupied a part of memory.
+	[[ -z "$TotalMem" ]] && TotalMem=$(lsmem -b | grep -i "online memory" | awk '{print $NF/1024/1024}')
+	[[ -z "$TotalMem" ]] && TotalMem=$(($(cat /proc/meminfo | grep "^MemTotal:" | sed 's/kb//i' | grep -o "[0-9]*" | awk -F' ' '{print $NF}') / 1024))
+	[[ -z "$TotalMem" ]] && TotalMem=$(free -m | grep -wi "mem*" | awk '{printf $2}')
+
+	# "lowmem=+0, 1 or 2" is only for Debian/Kali.
+	# "lowmem=+2" is dangerous because it will cause net-installer-kernel booting failed in any memory capacity.
+	# "lowmem=+1" will disable many features including load other drivers to save memory to make installation successful.
+	# "lowmem=+0" is to avoid Debian installer to enable low memory mode by force so that it can urge Debian installer to read "d-i non-free-firmware" from "preseed.cfg" to load many drivers like NVME disks to improve hardware compatibility, tested succeed on 512MB memory servers with Debian, Kali.
+	# The actual available capacity of memory on AWS ec2 arm64 t4g model is 472mb in spite of the hardware which was announced by Amazon is "0.5G"
+	# so that in this situation, distributing 512mb swap for target machine is necessary to avoid of installing linux kernel will meet a fatal for Debian series.
+	# I decided to set a baseline of 672mb(any ram of current machine is lower than this) to deal with it at current(2023.11).
+	[[ "$1" == 'debian' ]] || [[ "$1" == 'ubuntu' ]] || [[ "$1" == 'kali' ]] && {
+		[[ "$TotalMem" -le "672" ]] && lowMemMode="1"
+		if [[ "$TotalMem" -le "448" ]]; then
+			lowmemLevel="lowmem=+1"
+		elif [[ "$TotalMem" -le "1500" ]]; then
+			lowmemLevel="lowmem=+0"
+		else
+			lowmemLevel=""
+		fi
+		[[ "$setMemCheck" == '1' ]] && {
+			[[ "$TotalMem" -le "336" ]] && {
+				echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 384 MB!\n"
+				exit 1
+			}
+		}
+	}
+	# Without the function of OS re-installation templates in control panel which provided by cloud companies(many companies even have not).
+	# A independent VPS with only one hard drive is lack of the secondary hard drive to format and copy new OS file to main hard drive.
+	# So PXE installation need to use memory as a 'hard drive' temporary.
+	# For redhat series, the main OS installation file is 'squashfs.img', for example, this is the link of rockylinux 8 LiveOS iso file:
+	# http://dl.rockylinux.org/pub/rocky/8/Live/x86_64/Rocky-8-MATE-x86_64-latest.iso
+	# If you download and mount it, you will found that the size of '/LiveOS/squashfs.img' is 1.55GB!
+	# It means in first step of netboot installation, this 1.55GB file will be all downloaded and loaded in memory!
+	# So and consider other install programs if necessary, even 2GB memory is not enough, 2.5GB only just pass, it's so ridiculous!
+	# Debian 11 PXE installation will be able in low memory mode just 512M, why redhat loves swallow memory so much, is shame on you!
+	# Redhat 9 slightly improved the huge occupy of the memory, 2GB RAM machine can run it successfully, but CentOS 9-stream needs 2.5GB RAM more.
+	# Technology companies usually add useless functions and redundant code in new version of software increasingly.
+	# They never optimize or improve it, just tell users they need to pay more to expand their hardware performance and adjust to the endless demand of them. it's not a correct decision.
+	[[ "$setMemCheck" == '1' ]] && {
+		[[ "$1" == 'fedora' || "$1" == 'rockylinux' || "$1" == 'almalinux' || "$1" == 'centos' ]] && {
+			[[ "$TotalMem" -le "448" ]] && {
+				echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 512 MB!\n"
+				exit 1
+			}
+			if [[ "$1" == 'rockylinux' || "$1" == 'almalinux' || "$1" == 'centos' ]]; then
+				if [[ "$2" == "8" ]] || [[ "$2" == "9" ]]; then
+					[[ "$TotalMem" -le "2228" ]] && {
+						echo -ne "\n[${red}Warning${plain}] Minimum system memory requirement is 2.2 GB for ${blue}KickStart${plain} native method.\n"
+						lowMemMode="1"
+						if [[ "$2" == "8" ]]; then
+							echo -ne "\nSwitching to ${yellow}Rocky $2${plain} by ${blue}Cloud Init${plain} Installation... \n"
+						elif [[ "$2" == "9" ]]; then
+							echo -ne "\nSwitching to ${blue}Cloud Init${plain} Installation... \n"
+						fi
+					}
+				elif [[ "$2" == "7" ]]; then
+					[[ "$TotalMem" -le "1500" ]] && {
+						echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 1.5 GB!\n"
+						exit 1
+					}
+				fi
+			elif [[ "$1" == 'fedora' ]]; then
+				[[ "$TotalMem" -le "1722" ]] && {
+					echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 1.7 GB!\n"
+					exit 1
+				}
+			fi
+		}
+		[[ "$1" == 'alpinelinux' || "$3" == 'Ubuntu' ]] && {
+			if [[ "$3" == 'Ubuntu' ]]; then
+				[[ "$TotalMem" -le "448" ]] && {
+					echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 512 MB!\n"
+					exit 1
+				}
+			elif [[ "$1" == 'alpinelinux' ]]; then
+				[[ "$TotalMem" -le "228" ]] && {
+					echo -ne "\n[${red}Error${plain}] Minimum system memory requirement is 256 MB!\n"
+					exit 1
+				}
+				[[ "$TotalMem" -le "736" ]] && {
+					lowMemMode="1"
+					setMotd="0"
+				}
+			fi
+		}
+		if [[ "$TotalMem" -le "2028" ]]; then
+			setFail2banStatus="0"
+			[[ "$setFail2ban" == "1" ]] && setFail2banStatus="1"
+		else
+			[[ "$setFail2ban" == "0" ]] && setFail2banStatus="0" || setFail2banStatus="1"
+		fi
+		[[ "$linux_relese" == 'debian' && "$DebianDistNum" -le "8" ]] && setFail2banStatus="0"
+	}
+}
+
+function checkVirt() {
+	virtWhat=""
+	virtType=""
+	[[ -n $(virt-what) ]] && {
+		for virtItem in $(virt-what); do
+			virtWhat+="$virtItem "
+		done
+		# Does not support OpenVZ or LXC.
+		[[ $(echo $virtWhat | grep -i "openvz") || $(echo $virtWhat | grep -i "lxc") ]] && {
+			echo -ne "\n[${red}Error${plain}] Virtualization of ${yellow}$virtWhat${plain}could not be supported!\n"
+			echo -ne "\nTry to refer to the ${blue}following project${plain}: \n\n${underLine}https://github.com/LloydAsp/OsMutation${plain} \n\nfor learning more and then execute it as the re-installation.\n"
+			exit 1
+		}
+	}
+	for virtItem in $(dmidecode -s system-manufacturer | sed 's/[[:space:]]//g' | sed 's/[A-Z]/\l&/g') $(systemd-detect-virt | sed 's/[A-Z]/\l&/g') $(lscpu | grep -i "hypervisor vendor" | cut -d ':' -f 2 | sed 's/^[ \t]*//g' | sed 's/[A-Z]/\l&/g'); do
+		virtType+="$virtItem "
+	done
+	showAllVirts=$(echo "$virtType$virtWhat" | sed 's/[[:space:]]/\n/g' | sort -u | tr -s '\n' ' ' | sed 's/^[ \t]*//g' | sed 's/[ \t]*$//g')
+}
+
+function checkSys() {
+	# Remove AliYunDun(a guard process to support monitoring hardware status, scanning security breaches for alarm etc.) from Alibaba Cloud otherwise it will impede the installation.
+	aliyundunProcess=$(ps -ef | grep -i 'aegis\|aliyun\|aliyundun\|assist-daemon' | grep -v 'grep\|-i' | awk -F ' ' '{print $NF}')
+	[[ -n "$aliyundunProcess" ]] && {
+		timeout 5s wget --no-check-certificate -qO /root/Fuck_Aliyun.sh 'https://git.io/fpN6E' && chmod a+x /root/Fuck_Aliyun.sh
+		if [[ $? -ne 0 ]]; then
+			wget --no-check-certificate -qO /root/Fuck_Aliyun.sh 'https://gitee.com/mb9e8j2/Fuck_Aliyun/raw/master/Fuck_Aliyun.sh' && sed -i 's/\r//g' /root/Fuck_Aliyun.sh && chmod a+x /root/Fuck_Aliyun.sh
+		fi
+		bash /root/Fuck_Aliyun.sh
+		rm -rf /root/Fuck_Aliyun.sh
+	}
+
+	rm -rf /swapspace
+	# Allocate 512 MB temporary swap to provent yum dead.
+	if [[ ! -e "/swapspace" ]]; then
+		fallocate -l 512M /swapspace
+		chmod 600 /swapspace
+		mkswap /swapspace
+		swapon /swapspace
+		# Prefer to divert temporary data from RAM to virtual memory when there are 70% left and below of RAM to pull out a biggest effort to make sure the allowance of RAM is sufficient for installing dependence.
+		# In RAM that less and equal than 512 MB environment, the occupation of "yum / dnf" process could reach to nearly 49% at highest, the original value of swappiness in official templates of Simple Application Servers from Alibaba Cloud is "0".
+		# The default number of this value is "60" for a standard Linux distribution like Debian/Kali/Redhat series, it's "90" on Alpine.
+		# Mem:  446028(total)  216752(used)
+		[[ $(cat /proc/sys/vm/swappiness | sed 's/[^0-9]//g') -lt "70" ]] && sysctl vm.swappiness=70
+	fi
+
+	# Fix debian security sources 404 not found (only of default sources)
+	sed -i 's/^\(deb.*security.debian.org\/\)\(.*\)\/updates/\1debian-security\2-security/g' /etc/apt/sources.list
+
+	CurrentOSVer=$(cat /etc/os-release | grep -w "VERSION_ID=*" | awk -F '=' '{print $2}' | sed 's/\"//g' | cut -d'.' -f 1)
+
+	apt update -y
+	# Try to fix error of connecting to current mirror for Debian.
+	if [[ $? -ne 0 ]]; then
+		apt update -y >/root/apt_execute.log
+		if [[ $(grep -i "debian" /root/apt_execute.log) ]] && [[ $(grep -i "err:[0-9]" /root/apt_execute.log) || $(grep -i "404  not found" /root/apt_execute.log) ]]; then
+			currentDebianMirror=$(sed -n '/^deb /'p /etc/apt/sources.list | head -n 1 | awk '{print $2}' | sed -e 's|^[^/]*//||' -e 's|/.*$||')
+			if [[ "$CurrentOSVer" -gt "9" ]]; then
+				# Replace invalid mirror of Debian to 'deb.debian.org' if current version has not been 'EOL'(End Of Life).
+				sed -ri "s/$currentDebianMirror/deb.debian.org/g" /etc/apt/sources.list
+			else
+				# Replace invalid mirror of Debian to 'archive.debian.org' because it had been marked with 'EOL'.
+				sed -ri "s/$currentDebianMirror/archive.debian.org/g" /etc/apt/sources.list
+			fi
+			# Disable get security update.
+			sed -ri 's/^deb-src/# deb-src/g' /etc/apt/sources.list
+			apt update -y
+		fi
+		rm -rf /root/apt_execute.log
+	fi
+	apt install lsb-release -y
+
+	# Delete mirrors from elrepo.org because it will causes dnf/yum checking updates continuously(maybe some of the server mirror lists are in the downtime?)
+	[[ $(grep -wri "elrepo.org" /etc/yum.repos.d/) != "" ]] && {
+		elrepoFile=$(grep -wri "elrepo.org" /etc/yum.repos.d/ | head -n 1 | cut -d':' -f 1)
+		mv "$elrepoFile" "$elrepoFile.bak"
+	}
+	yum install redhat-lsb -y
+	OsLsb=$(lsb_release -d | awk '{print$2}')
+
+	RedHatRelease=""
+	for Count in $(cat /etc/redhat-release | awk '{print$1}') $(cat /etc/system-release | awk '{print$1}') $(cat /etc/os-release | grep -w "ID=*" | awk -F '=' '{print $2}' | sed 's/\"//g') "$OsLsb"; do
+		[[ -n "$Count" ]] && RedHatRelease=$(echo -e "$Count")"$RedHatRelease"
+	done
+
+	DebianRelease=""
+	IsUbuntu=$(uname -a | grep -i "ubuntu")
+	IsDebian=$(uname -a | grep -i "debian")
+	IsKali=$(uname -a | grep -i "kali")
+	for Count in $(cat /etc/os-release | grep -w "ID=*" | awk -F '=' '{print $2}') $(cat /etc/issue | awk '{print $1}') "$OsLsb"; do
+		[[ -n "$Count" ]] && DebianRelease=$(echo -e "$Count")"$DebianRelease"
+	done
+
+	AlpineRelease=""
+	apk update
+	for Count in $(cat /etc/os-release | grep -w "ID=*" | awk -F '=' '{print $2}') $(cat /etc/issue | awk '{print $3}' | head -n 1) $(uname -v | awk '{print $1}' | sed 's/[^a-zA-Z]//g'); do
+		[[ -n "$Count" ]] && AlpineRelease=$(echo -e "$Count")"$AlpineRelease"
+	done
+
+	if [[ $(echo "$RedHatRelease" | grep -i 'centos') != "" ]]; then
+		CurrentOS="CentOS"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'cloudlinux') != "" ]]; then
+		CurrentOS="CloudLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'alma') != "" ]]; then
+		CurrentOS="AlmaLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'rocky') != "" ]]; then
+		CurrentOS="RockyLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'fedora') != "" ]]; then
+		CurrentOS="Fedora"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'virtuozzo') != "" ]]; then
+		CurrentOS="Vzlinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'ol\|oracle') != "" ]]; then
+		CurrentOS="OracleLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'opencloud') != "" ]]; then
+		CurrentOS="OpenCloudOS"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'alibaba\|alinux\|aliyun') != "" ]]; then
+		CurrentOS="AlibabaCloudLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'amazon\|amzn') != "" ]]; then
+		CurrentOS="AmazonLinux"
+		amazon-linux-extras install epel -y
+	elif [[ $(echo "$RedHatRelease" | grep -i 'red\|rhel') != "" ]]; then
+		CurrentOS="RedHatEnterpriseLinux"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'anolis') != "" ]]; then
+		CurrentOS="OpenAnolis"
+	elif [[ $(echo "$RedHatRelease" | grep -i 'scientific') != "" ]]; then
+		CurrentOS="ScientificLinux"
+	elif [[ $(echo "$AlpineRelease" | grep -i 'alpine') != "" ]]; then
+		CurrentOS="AlpineLinux"
+	elif [[ "$IsUbuntu" ]] || [[ $(echo "$DebianRelease" | grep -i 'ubuntu') != "" ]]; then
+		CurrentOS="Ubuntu"
+		CurrentOSVer=$(lsb_release -r | awk '{print$2}' | cut -d'.' -f1)
+	elif [[ "$IsDebian" ]] || [[ $(echo "$DebianRelease" | grep -i 'debian') != "" ]]; then
+		CurrentOS="Debian"
+		CurrentOSVer=$(lsb_release -r | awk '{print$2}' | cut -d'.' -f1)
+	elif [[ "$IsKali" ]] || [[ $(echo "$DebianRelease" | grep -i 'kali') != "" ]]; then
+		CurrentOS="Kali"
+		CurrentOSVer=$(lsb_release -r | awk '{print$2}' | cut -d'.' -f1)
+	else
+		echo -ne "\n[${red}Error${plain}] Does't support your system!\n"
+		exit 1
+	fi
+	# Don't support Redhat like linux OS under 6 version.
+	if [[ "$CurrentOS" == "CentOS" || "$CurrentOS" == "OracleLinux" ]] && [[ "$CurrentOSVer" -le "6" ]]; then
+		echo -e "Does't support your system!\n"
+		exit 1
+	fi
+
+	# Remove "inetutils-ping" because it does not support the statement of "ping -4" or "ping -6".
+	# "kexec-tools" is also need to be removed because in environment of official template of Debian 12 on Tencent Cloud, whether it is executing on instance of "Lighthouse" or "CVM"(Cloud Virtual Machine).
+	# This component may cause the menuentry of grub which we had generated and wrote can't be booted successfully when rebooting the system.
+	# "kdump-tools" is a dependence of "kexec-tools".
+	apt purge inetutils-ping kdump-tools kexec-tools -y
+	# Debian like linux OS necessary components.
+	apt install cpio curl dmidecode dnsutils efibootmgr fdisk file gzip iputils-ping jq net-tools openssl tuned util-linux virt-what wget xz-utils -y
+
+	# Redhat like Linux OS prefer to use dnf instead of yum because former has a higher execute efficiency.
+	yum install dnf -y
+	if [[ $? -eq 0 ]]; then
+		# To avoid "Failed loading plugin "osmsplugin": No module named 'librepo'"
+		# Reference: https://anatolinicolae.com/failed-loading-plugin-osmsplugin-no-module-named-librepo/
+		[[ "$CurrentOS" == "CentOS" && "$CurrentOSVer" == "8" ]] && dnf install python3-librepo -y
+		# Redhat like linux OS necessary components.
+		dnf install epel-release -y
+		dnf install bind-utils cpio curl dmidecode dnsutils efibootmgr file gzip jq net-tools openssl redhat-lsb syslinux tuned util-linux virt-what wget xz --skip-broken -y
+	else
+		yum install dnf -y >/root/yum_execute.log 2>&1
+		# In some versions of CentOS 8 which are not subsumed into CentOS-stream are end of supporting by CentOS official, so the source is failure.
+		# We need to change the source from http://mirror.centos.org to http://vault.centos.org to make repository is still available.
+		# Reference: https://techglimpse.com/solve-failed-synchronize-cache-repo-appstream/
+		#            https://qiita.com/yamada-hakase/items/cb1b6124e11ca65e2a2b
+		if [[ $(grep -i "failed to\|no urls in mirrorlist" /root/yum_execute.log) ]]; then
+			if [[ "$CurrentOS" == "CentOS" ]]; then
+				cd /etc/yum.repos.d/
+				sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
+				baseRepo=$(ls /etc/yum.repos.d/ | grep -i "base\|cr" | head -n 1)
+				currentRedhatMirror=$(sed -n '/^#baseurl=\|^baseurl=/'p /etc/yum.repos.d/$baseRepo | head -n 1 | awk -F '=' '{print $2}' | sed -e 's|^[^/]*//||' -e 's|/.*$||')
+				sed -ri 's/#baseurl/baseurl/g' /etc/yum.repos.d/CentOS-*
+				sed -ri 's/'$currentRedhatMirror'/vault.centos.org/g' /etc/yum.repos.d/CentOS-*
+				[[ "$CurrentOSVer" == "8" ]] && dnf install python3-librepo -y
+			fi
+			yum install dnf -y
+			# Run dnf update and install components.
+			# In official template of AlmaLinux 9 of Linode, "tuned" must be installed otherwise "grub2-mkconfig" can't work formally.
+			# Reference: https://phanes.silogroup.org/fips-disa-stig-hardening-on-centos9/
+			dnf install epel-release -y
+			dnf install bind-utils cpio curl dmidecode dnsutils efibootmgr file gzip jq net-tools openssl redhat-lsb syslinux tuned util-linux virt-what wget xz --skip-broken -y
+			# Oracle Linux 7 doesn't support DNF.
+		elif [[ $(grep -i "no package" /root/yum_execute.log) ]]; then
+			yum install epel-release -y
+			yum install bind-utils cpio curl dmidecode dnsutils efibootmgr file gzip jq net-tools openssl redhat-lsb syslinux tuned util-linux virt-what wget xz --skip-broken -y
+		fi
+		rm -rf /root/yum_execute.log
+	fi
+
+	# Alpine Linux necessary components and configurations.
+	[[ "$CurrentOS" == "AlpineLinux" ]] && {
+		# Get current version number of Alpine Linux
+		CurrentAlpineVer=$(cut -d. -f1,2 </etc/alpine-release)
+		# Try to remove comments of any valid mirror.
+		sed -i 's/#//' /etc/apk/repositories
+		# Add community mirror.
+		[[ ! $(grep -i "community" /etc/apk/repositories) ]] && sed -i '$a\http://dl-cdn.alpinelinux.org/alpine/v'${CurrentAlpineVer}'/community' /etc/apk/repositories
+		# Add testing mirror.
+		# [[ ! `grep -i "testing" /etc/apk/repositories` ]] && sed -i '$a\http://ftp.udx.icscoe.jp/Linux/alpine/edge/testing' /etc/apk/repositories
+		# Alpine Linux use "apk" as package management.
+		apk update
+		apk add bash bind-tools coreutils cpio curl dmidecode efibootmgr file gawk grep gzip jq lsblk net-tools openssl sed shadow tzdata util-linux virt-what wget xz
+		# Use bash to replace ash.
+		sed -i 's/root:\/bin\/ash/root:\/bin\/bash/g' /etc/passwd
+	}
+}
+
+function checkVER() {
+	# Get architecture of current os automatically
+	ArchName=$(uname -m)
+	[[ -z "$ArchName" ]] && ArchName=$(echo $(hostnamectl status | grep "Architecture" | cut -d':' -f 2))
+	case $ArchName in arm64) VER="arm64" ;; aarch64) VER="aarch64" ;; x86 | i386 | i686) VER="i386" ;; x86_64) VER="x86_64" ;; x86-64) VER="x86-64" ;; amd64) VER="amd64" ;; *) VER="" ;; esac
+	# Exchange architecture name
+	if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]] || [[ "$linux_relese" == 'kali' ]]; then
+		# In debian 12, the result of "uname -m" is "x86_64";
+		# the result of "echo `hostnamectl status | grep "Architecture" | cut -d':' -f 2`" is "x86-64"
+		if [[ "$VER" == "x86_64" ]] || [[ "$VER" == "x86-64" ]]; then
+			VER="amd64"
+		elif [[ "$VER" == "aarch64" ]]; then
+			VER="arm64"
+		fi
+	elif [[ "$linux_relese" == 'alpinelinux' ]] || [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+		if [[ "$VER" == "amd64" ]] || [[ "$VER" == "x86-64" ]]; then
+			VER="x86_64"
+		elif [[ "$VER" == "arm64" ]]; then
+			VER="aarch64"
+		fi
+	fi
+
+	# Check and exchange input architecture name
+	tmpVER="$(echo "$tmpVER" | sed -r 's/(.*)/\L\1/')"
+	if [[ -n "$tmpVER" ]]; then
+		case "$tmpVER" in
+		i386 | i686 | x86 | 32)
+			VER="i386"
+			;;
+		amd64 | x86_64 | x64 | 64)
+			[[ "$linux_relese" == 'alpinelinux' ]] || [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]] && VER='x86_64' || VER='amd64'
+			;;
+		aarch64 | arm64 | arm)
+			[[ "$linux_relese" == 'alpinelinux' ]] || [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]] && VER='aarch64' || VER='arm64'
+			;;
+		*)
+			VER=''
+			;;
+		esac
+	fi
+
+	[[ ! -n "$VER" ]] && {
+		echo -ne "\n[${red}Error${plain}] Unknown architecture.\n"
+		bash $0 error
+		exit 1
+	}
+}
+
+function checkDIST() {
+	if [[ "$Relese" == 'Debian' ]]; then
+		SpikCheckDIST='0'
+		DIST="$(echo "$tmpDIST" | sed -r 's/(.*)/\L\1/')"
+		DebianDistNum="${DIST}"
+		echo "$DIST" | grep -q '[0-9]'
+		[[ $? -eq '0' ]] && {
+			isDigital="$(echo "$DIST" | grep -o '[\.0-9]\{1,\}' | sed -n '1h;1!H;$g;s/\n//g;$p' | cut -d'.' -f1)"
+			[[ -n $isDigital ]] && {
+				[[ "$isDigital" == '7' ]] && DIST='wheezy'
+				[[ "$isDigital" == '8' ]] && DIST='jessie'
+				[[ "$isDigital" == '9' ]] && DIST='stretch'
+				[[ "$isDigital" == '10' ]] && DIST='buster'
+				[[ "$isDigital" == '11' ]] && DIST='bullseye'
+				[[ "$isDigital" == '12' ]] && DIST='bookworm'
+				[[ "$isDigital" == '13' ]] && DIST='trixie'
+				# [[ "$isDigital" == '14' ]] && DIST='forky'
+				# Debian releases TBA reference: https://wiki.debian.org/DebianReleases
+				#                                https://en.wikipedia.org/wiki/Debian_version_history#Release_table
+			}
+		}
+		LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
+	fi
+	if [[ "$Relese" == 'Kali' ]]; then
+		SpikCheckDIST='0'
+		DIST="$(echo "$tmpDIST" | sed -r 's/(.*)/\L\1/')"
+		[[ ! "$DIST" =~ "kali-" ]] && DIST="kali-""$DIST"
+		# Kali Linux releases reference: https://www.kali.org/releases/
+		LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
+	fi
+	if [[ "$Relese" == 'AlpineLinux' ]]; then
+		SpikCheckDIST='0'
+		DIST="$(echo "$tmpDIST" | sed -r 's/(.*)/\L\1/')"
+		# Recommend "edge" version of Alpine Linux to make sure to keep always updating.
+		AlpineVer1=$(echo "$DIST" | sed 's/[a-z][A-Z]*//g' | cut -d"." -f 1)
+		AlpineVer2=$(echo "$DIST" | sed 's/[a-z][A-Z]*//g' | cut -d"." -f 2)
+		if [[ "$AlpineVer1" -lt "3" || "$AlpineVer2" -le "15" ]] && [[ "$DIST" != "edge" ]]; then
+			echo -ne "\n[${red}Warning${plain}] $Relese $DIST is not supported!\n"
+			exit 1
+		fi
+		# Alpine Linux releases reference: https://alpinelinux.org/releases/
+		[[ "$DIST" != "edge" && ! "$DIST" =~ "v" ]] && DIST="v""$DIST"
+		if [[ "$setCloudKernel" == "" ]]; then
+			[[ -n "$virtWhat" ]] && virtualizationStatus='1' || virtualizationStatus='0'
+		elif [[ "$setCloudKernel" == "1" ]]; then
+			virtualizationStatus='1'
+		fi
+		# Virtual linux kernel of "vmlinuz-virt" of Alpine is unable to probe modules of IPv6 at the beginning so that "modloop" can't be downloaded and loaded!
+		if [[ "$virtualizationStatus" == "1" && "$IPStackType" != "IPv6Stack" ]]; then
+			InitrdName="initramfs-virt"
+			VmLinuzName="vmlinuz-virt"
+			ModLoopName="modloop-virt"
+		else
+			InitrdName="initramfs-lts"
+			VmLinuzName="vmlinuz-lts"
+			ModLoopName="modloop-lts"
+		fi
+		LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
+	fi
+	if [[ "$Relese" == 'CentOS' ]] || [[ "$Relese" == 'RockyLinux' ]] || [[ "$Relese" == 'AlmaLinux' ]] || [[ "$Relese" == 'Fedora' ]]; then
+		SpikCheckDIST='1'
+		DISTCheck="$(echo "$tmpDIST" | grep -o '[\.0-9]\{1,\}' | head -n1)"
+		RedHatSeries=$(echo "$tmpDIST" | cut -d"." -f 1 | cut -d"-" -f 1)
+		# CentOS and CentOS stream releases history:
+		# https://endoflife.date/centos
+		# https://endoflife.date/centos-stream
+		if [[ "$linux_relese" == 'centos' ]]; then
+			[[ "$RedHatSeries" =~ [0-9]{${#1}} ]] && {
+				if [[ "$RedHatSeries" == "6" ]]; then
+					DISTCheck="6.10"
+					echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck is not supported!\n"
+					exit 1
+				elif [[ "$RedHatSeries" == "7" ]]; then
+					DISTCheck="7.9.2009"
+				elif [[ "$RedHatSeries" -ge "8" ]] && [[ ! "$RedHatSeries" =~ "-stream" ]]; then
+					DISTCheck="$RedHatSeries""-stream"
+				elif [[ "$RedHatSeries" -le "5" ]]; then
+					echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck is not supported!\n"
+				else
+					echo -ne "\n[${red}Error${plain}] Invaild $DIST! version!\n"
+				fi
+			}
+			LinuxMirror=$(selectMirror "$Relese" "$DISTCheck" "$VER" "$tmpMirror")
+			DIST="$DISTCheck"
+		fi
+		if [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+			[[ "$RedHatSeries" =~ [0-9]{${#1}} ]] && {
+				# RockyLinux releases history:
+				# https://wiki.rockylinux.org/rocky/version/
+				# AlmaLinux releases history:
+				# https://wiki.almalinux.org/release-notes/
+				if [[ "$linux_relese" == 'rockylinux' || "$linux_relese" == 'almalinux' ]] && [[ "$RedHatSeries" -le "7" ]]; then
+					echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck is not supported!\n"
+					exit 1
+					# Fedora releases history:
+					# https://fedorapeople.org/groups/schedule/
+				elif [[ "$linux_relese" == 'fedora' ]] && [[ "$RedHatSeries" -le "37" ]]; then
+					echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck is not supported!\n"
+					exit 1
+				fi
+			}
+			LinuxMirror=$(selectMirror "$Relese" "$DISTCheck" "$VER" "$tmpMirror")
+			DIST="$DISTCheck"
+		fi
+		[[ -z "$DIST" ]] && {
+			echo -ne "\nThe dists version not found in this mirror, Please check it! \n\n"
+			bash $0 error
+			exit 1
+		}
+		if [[ "$linux_relese" == 'centos' ]] && [[ "$RedHatSeries" -le "7" ]]; then
+			wget --no-check-certificate -qO- "$LinuxMirror/$DIST/os/$VER/.treeinfo" | grep -q 'general'
+			[[ $? != '0' ]] && {
+				echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck was not found in this mirror, Please change mirror try again!\n"
+				exit 1
+			}
+		elif [[ "$linux_relese" == 'centos' && "$RedHatSeries" -ge "8" ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]]; then
+			wget --no-check-certificate -qO- "$LinuxMirror/$DIST/BaseOS/$VER/os/media.repo" | grep -q 'mediaid'
+			[[ $? != '0' ]] && {
+				echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck was not found in this mirror, Please change mirror try again!\n"
+				exit 1
+			}
+		elif [[ "$linux_relese" == 'fedora' ]]; then
+			wget --no-check-certificate -qO- "$LinuxMirror/releases/$DIST/Server/$VER/os/media.repo" | grep -q 'mediaid'
+			[[ $? != '0' ]] && {
+				echo -ne "\n[${red}Warning${plain}] $Relese $DISTCheck was not found in this mirror, Please change mirror try again!\n"
+				exit 1
+			}
+		fi
+	fi
+}
+
+# $1 is "$ipAddr", $2 is "$ip6Addr"
+# "1.1.1.1" of CloudFlare was banned in mainland of China, "1.0.0.3" will meet the same death soon later, maybe.
+function checkIpv4OrIpv6() {
+	for ((w = 1; w <= 2; w++)); do
+		IPv4DNSLookup=$(timeout 0.3s dig -4 TXT +short o-o.myaddr.l.google.com @ns3.google.com | sed 's/\"//g')
+		[[ "$IPv4DNSLookup" == "" ]] && IPv4DNSLookup=$(timeout 0.3s dig -4 TXT CH +short whoami.cloudflare @1.0.0.3 | sed 's/\"//g')
+		[[ "$IPv4DNSLookup" != "" ]] && break
+	done
+	for ((x = 1; x <= 2; x++)); do
+		IPv6DNSLookup=$(timeout 0.3s dig -6 TXT +short o-o.myaddr.l.google.com @ns3.google.com | sed 's/\"//g')
+		[[ "$IPv6DNSLookup" == "" ]] && IPv6DNSLookup=$(timeout 0.3s dig -6 TXT CH +short whoami.cloudflare @2606:4700:4700::1003 | sed 's/\"//g')
+		[[ "$IPv6DNSLookup" != "" ]] && break
+	done
+	for y in "$3" "$4" "$5" "$6"; do
+		IPv4PingDNS=$(timeout 0.3s ping -4 -c 1 "$y" | grep "rtt\|round-trip" | cut -d'/' -f5 | awk -F'.' '{print $NF}' | sed -E '/^[0-9]\+\(\.[0-9]\+\)\?$/p')"$IPv4PingDNS"
+		[[ "$IPv4PingDNS" != "" ]] && break
+	done
+	for z in "$7" "$8" "$9" "${10}"; do
+		IPv6PingDNS=$(timeout 0.3s ping -6 -c 1 "$z" | grep "rtt\|round-trip" | cut -d'/' -f5 | awk -F'.' '{print $NF}' | sed -E '/^[0-9]\+\(\.[0-9]\+\)\?$/p')"$IPv6PingDNS"
+		[[ "$IPv6PingDNS" != "" ]] && break
+	done
+
+	# Use ping -4/-6 to replace dig -4/-6 because some IPv4 network will callback IPv6 address from DNS even if we use "dig -4" to get DNS result.
+	[[ "$IPv4PingDNS" =~ ^[0-9] && "$IPv6PingDNS" =~ ^[0-9] ]] && IPStackType="BiStack"
+	[[ "$IPv4PingDNS" =~ ^[0-9] && ! "$IPv6PingDNS" =~ ^[0-9] ]] && IPStackType="IPv4Stack"
+	[[ ! "$IPv4PingDNS" =~ ^[0-9] && "$IPv6PingDNS" =~ ^[0-9] ]] && IPStackType="IPv6Stack"
+	[[ -n "$1" || -n "$2" ]] && {
+		if [[ -n "$1" && -z "$2" ]]; then
+			for ipCheck in "$1" "$ipGate"; do
+				verifyIPv4FormatLawfulness "$ipCheck"
+			done
+		elif [[ -n "$1" && -n "$2" ]]; then
+			for ipCheck in "$1" "$ipGate"; do
+				verifyIPv4FormatLawfulness "$ipCheck"
+			done
+			for ipCheck in "$2" "$ip6Gate"; do
+				verifyIPv6FormatLawfulness "$ipCheck"
+			done
+			IPStackType="BiStack"
+		elif [[ -z "$1" && -n "$2" ]]; then
+			for ipCheck in "$2" "$ip6Gate"; do
+				verifyIPv6FormatLawfulness "$ipCheck"
+			done
+		fi
+	}
+
+	[[ $(echo "$setIpStack" | grep -i "bi\|bistack\|dual\|two") ]] && IPStackType="BiStack"
+	[[ $(echo "$setIpStack" | grep -i "4\|i4\|ip4\|ipv4") ]] && IPStackType="IPv4Stack"
+	[[ $(echo "$setIpStack" | grep -i "6\|i6\|ip6\|ipv6") ]] && IPStackType="IPv6Stack"
+
+	# [[ "$IPStackType" == "IPv4Stack" ]] && setIPv6="0" || setIPv6="1"
+	[[ "$tmpSetIPv6" == "0" ]] && setIPv6="0" || setIPv6="1"
+}
+
+function verifyIPv4FormatLawfulness() {
+	[[ -n "$1" ]] && IP_Check="$1"
+	if expr "$IP_Check" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; then
+		for i in 1 2 3 4; do
+			if [ $(echo "$IP_Check" | cut -d. -f$i) -gt 255 ]; then
+				echo "fail ($IP_Check)"
+				exit 1
+			fi
+		done
+		IP_Check="isIPv4"
+	fi
+	[[ "$IP_Check" != "isIPv4" ]] && {
+		echo -ne "\n[${red}Error${plain}] Invalid inputted IPv4 format!\n"
+		exit 1
+	}
+}
+
+function verifyIPv6FormatLawfulness() {
+	[[ -n "$1" ]] && IPv6_Check="$1"
+	# If the last two strings of IPv6 is "::", we should replace ":" to "0" for the last string to make sure it's a valid IPv6(can't end with ":").
+	[[ "${IPv6_Check: -1}" == ":" ]] && IPv6_Check=$(echo "$IPv6_Check" | sed 's/.$/0/')
+	# If the first two strings of IPv6 is "::", we should replace ":" to "0" for the first string to make sure it's a valid IPv6(can't start with ":").
+	[[ "${IPv6_Check:0:1}" == ":" ]] && IPv6_Check=$(echo "$IPv6_Check" | sed 's/^./0/')
+	# Add ":" in the last of the IPv6 address for cut all items infront of the ":" by split by symbol ":".
+	IP6_Check_Temp="$IPv6_Check"":"
+	# Total numbers of the hex blocks in IPv6 address includes with empty value(abbreviation of "0000").
+	IP6_Hex_Num=$(echo "$IP6_Check_Temp" | tr -cd ":" | wc -c)
+	# Default number of empty values of the hex block is "0".
+	IP6_Hex_Abbr="0"
+	# The first filter plays a role of:
+	# 1. check if 0-9 or a-z and ":" in original IPv6;
+	# 2. the longest number of ":" in IPv6 is "7", because of variable "IP6_Check_Temp" one more ":" has been add,
+	# so the total number of ":" in variable "IP6_Check_Temp" should be less or equal "8".
+	if [[ $(echo "$IPv6_Check" | grep -i '[[:xdigit:]]' | grep ':') ]] && [[ "$IP6_Hex_Num" -le "8" ]]; then
+		# IPv6 address doesn't allow two "::" existed, the number of ":" should not above 7.
+		# If number of ":" is less than 6, at least one "::" is required.
+		# IPv6 can't end with "hex_number:"
+		[[ $(echo "$1" | grep -o ":::" | wc -l) -gt "0" ]] || [[ $(echo "$1" | grep -o "::" | wc -l) -gt "1" || $(echo "$1" | grep -o ":" | wc -l) -gt "7" ]] || [[ "$IP6_Hex_Num" -le "7" && $(echo "$1" | grep -o "::" | wc -l) -lt "1" ]] || [[ "${1: -2}" != "::" && "${1: -1}" == ":" ]] && {
+			echo -ne "\n[${red}Error${plain}] Invalid inputted IPv6 format!\n"
+			exit 1
+		}
+		# Total cycles of the check(sequence of the current hex block).
+		for ((i = 1; i <= "$IP6_Hex_Num"; i++)); do
+			# Every IPv6 hex block of current cycle.
+			IP6_Hex=$(echo "$IP6_Check_Temp" | cut -d: -f$i)
+			# Count "::" abbreviations for this IPv6.
+			[[ "$IP6_Hex" == "" ]] && IP6_Hex_Abbr=$(expr $IP6_Hex_Abbr + 1)
+			# String number of letters or numbers in one block should less or equal "4".
+			if [[ $(echo "$IP6_Hex" | wc -m) -le "5" ]]; then
+				# The second filter plays a reversion role of the following to exclude an effective IPv6 hex block:
+				# 1. Except 0-9 and a-f;
+				# 2. Abbreviation of hex block should be appeared less than or equal one time in principle.
+				[[ $(echo "$IP6_Hex" | grep -iE '[^0-9a-f]') || "$IP6_Hex_Abbr" -gt "1" ]] && {
+					echo -ne "\n[${red}Error${plain}] Invalid inputted IPv6 format!\n"
+					exit 1
+				}
+			else
+				echo -ne "\n[${red}Error${plain}] Invalid inputted IPv6 format!\n"
+				exit 1
+			fi
+		done
+		IP6_Check="isIPv6"
+	fi
+	[[ "$IP6_Check" != "isIPv6" ]] && {
+		echo -ne "\n[${red}Error${plain}] Invalid inputted IPv6 format!\n"
+		exit 1
+	}
+}
+
+# $1 is for IPv4s, $2 is for IPv6s, '1' is private to each stack.
+function checkIfIpv4AndIpv6IsLocalOrPublic() {
+	ipv4LocalOrPublicStatus=''
+	ipv6LocalOrPublicStatus=''
+	ip4CertFirst=''
+	ip4CertSecond=''
+	ip4CertThird=''
+	ip6CertAddrWhole=''
+	ip6CertAddrFirst=''
+	[[ -n "$1" ]] && {
+		ip4CertFirst=$(echo $1 | cut -d'.' -f1)
+		ip4CertSecond=$(echo $1 | cut -d'.' -f2)
+		ip4CertThird=$(echo $1 | cut -d'.' -f3)
+		[[ "$ip4CertFirst" == "169" && "$ip4CertSecond" == "254" ]] || [[ "$ip4CertFirst" == "172" && "$ip4CertSecond" -ge "16" && "$ip4CertSecond" -le "31" ]] || [[ "$ip4CertFirst" == "192" && "$ip4CertSecond" == "168" ]] || [[ "$ip4CertFirst" == "100" && "$ip4CertSecond" -ge "64" && "$ip4CertSecond" -le "127" ]] || [[ "$ip4CertFirst" == "10" && "$ip4CertSecond" -ge "0" && "$ip4CertSecond" -le "255" ]] || [[ "$ip4CertFirst" == "127" && "$ip4CertSecond" -ge "0" && "$ip4CertSecond" -le "255" ]] || [[ "$ip4CertFirst" == "198" && "$ip4CertSecond" -ge "18" && "$ip4CertSecond" -le "19" ]] || [[ "$ip4CertFirst" == "192" && "$ip4CertSecond" == "0" && "$ip4CertThird" == "0" || "$ip4CertThird" == "2" ]] || [[ "$ip4CertFirst" == "198" && "$ip4CertSecond" == "51" && "$ip4CertThird" == "100" ]] || [[ "$ip4CertFirst" == "203" && "$ip4CertSecond" == "0" && "$ip4CertThird" == "113" ]] && {
+			ipv4LocalOrPublicStatus='1'
+		}
+	}
+	[[ -n "$2" ]] && {
+		ip6CertAddrWhole=$(ultimateFormatOfIpv6 "$2")
+		ip6CertAddrFirst=$(echo $ip6CertAddrWhole | sed 's/\(.\{4\}\).*/\1/' | sed 's/[a-z]/\u&/g')
+		[[ "$((16#$ip6CertAddrFirst))" -ge "$((16#FE80))" && "$((16#$ip6CertAddrFirst))" -le "$((16#FEBF))" ]] || [[ "$((16#$ip6CertAddrFirst))" -ge "$((16#FC00))" && "$((16#$ip6CertAddrFirst))" -le "$((16#FDFF))" ]] && {
+			ipv6LocalOrPublicStatus='1'
+		}
+	}
+}
+
+# Some "BiStack" types are accomplished by Warp which provided by CloudFlare, so we need to distinguish whether IPv4 or IPv6 stack is enabled by Warp then exclude it.
+# $1 is "warp*.conf", maybe "warp.conf" or "warp-profile.conf"; $2 is "wgcf*.conf", maybe "wgcf.conf" or "wgcf-profile.conf"; $3 is "wg[0-9]", maybe "wg0.conf" or etc.
+# $4/$5/$6 are "warp*/wgcf*/wg[0-9]", $7/$8 are "PrivateKey/PublicKey".
+function checkWarp() {
+	warpConfFiles=$(find / -maxdepth 6 -name "$1" -print -or -name "$2" -print -or -name "$3" -print)
+	sysctlWarpProcess=$(systemctl 2>&1 | grep -i "$4\|$5\|$6" | wc -l)
+	rcWarpProcess=$(rc-status 2>&1 | grep -i "$4\|$5\|$6" | wc -l)
+	[[ "$IPStackType" == "BiStack" ]] && {
+		[[ -n "$warpConfFiles" ]] && {
+			for warpConfFile in $(find / -maxdepth 6 -name "$1" -print -or -name "$2" -print -or -name "$3" -print); do
+				if [[ $(grep -ic "$7" "$warpConfFile") -ge "1" || $(grep -ic "$8" "$warpConfFile") -ge "1" ]]; then
+					warpStatic="1"
+					break
+				fi
+			done
+		}
+		[[ "$sysctlWarpProcess" -gt "0" || "$rcWarpProcess" -gt "0" ]] && warpStatic="1"
+	}
+	[[ "$warpStatic" == "1" ]] && {
+		[[ -z "$ipGate" ]] && IPStackType="IPv6Stack"
+		[[ -z "$ip6Gate" ]] && IPStackType="IPv4Stack"
+	}
+}
+
+# Examples:
+# input:    ::
+# output:   0:0:0:0:0:0:0:0
+# input:    2620:119:35::c4
+# output:   2620:119:35:0:0:0:0:c4
+function fillAbbrOfIpv6() {
+	inputIpv6="$1"
+	# Static of how many delimiters of ":" are in one ipv6 address, only one abbreviation of "::" is allowed in one IPv6 address in principle.
+	delimiterNum=$(echo $inputIpv6 | awk '{print gsub(/:/, "")}')
+	replaceStr=""
+	# A standard of IPv6 should have 7 colons, the number "7" minus total numbers of colons in an abbreviated IPv6 address and add "0" after every ":" can help us to fulfill the whole IPv6 address.
+	for ((i = 0; i <= $((7 - $delimiterNum)); i++)); do
+		replaceStr="$replaceStr"":0"
+	done
+	# Must add one ":" after the last of expanded "0" to separate with the following IPv6 block which is not been abbreviated.
+	replaceStr="$replaceStr"":"
+	# Replace abbreviated IPv6 address "::" to expanded IPv6 address($replaceStr).
+	ipv6Expanded=${inputIpv6/::/$replaceStr}
+	# If the last two strings of abbreviated IPv6 is "::", we should add a "0" for the last ":" to pledge the validation of this IPv6(can't end with ":").
+	[[ "$ipv6Expanded" == *: ]] && ipv6Expanded="$ipv6Expanded""0"
+	# If the first two strings of abbreviated IPv6 is "::", we should add a "0" for the first ":" to pledge the validation of this IPv6(can't begin with ":").
+	[[ "$ipv6Expanded" == :* ]] && ipv6Expanded="0""$ipv6Expanded"
+	# Return IPv6 which is filled with one "0" in every abbreviated block.
+	echo "$ipv6Expanded"
+}
+
+# Examples:
+# input:    0:0:0:0:0:0:0:0
+# output:   0000:0000:0000:0000:0000:0000:0000:0000
+# input:    2620:119:35:0:0:0:0:c4
+# output:   2620:0119:0035:0000:0000:0000:0000:00c4
+function ultimateFormatOfIpv6() {
+	abbrExpandedOfIpv6=$(fillAbbrOfIpv6 "$1")
+	# To make a new array names "$ipv6Hex" to storage every hex block like "2620" "119e" of IPv6, this array should have 8 indices.
+	ipv6Hex=(${abbrExpandedOfIpv6//:/ })
+	for ((j = 0; j < 8; j++)); do
+		# Static number of strings in every hex block of IPv6.
+		length="${#ipv6Hex[j]}"
+		# Use decrement cycle to count how many zeroes need to be fulfilled because there are most 4 strings in one hex block in theory.
+		for ((k = 4; k > $length; k--)); do
+			# Zeroes which must be added on the head if number of digits of a hexadecimal number in one hex block is less than 4.
+			ipv6Hex[j]="0${ipv6Hex[j]}"
+		done
+	done
+	# Return all elements of array of "$ipv6Hex" which is filled with 4 digits in every hexadecimal block and use colon to stitch with hexes instead of space to achieve the recovery of an abbreviated IPv6 address.
+	echo ${ipv6Hex[@]} | sed 's/ /\:/g'
+}
+
+function getIPv6Address() {
+	# Differences from scope link, scope host and scope global of IPv6, reference: https://qiita.com/_dakc_/items/4eefa443306860bdcfde
+	allI6Addrs=$(ip -6 addr show | grep -wA 32768 "$interface6" | grep -wv "lo" | grep -wv "link\|host" | grep -w "inet6" | grep "scope" | grep "global" | awk -F " " '{for (i=2;i<=NF;i++)printf("%s ", $i);print ""}' | awk '{print $1}')
+	i6Addr=$(echo "$allI6Addrs" | head -n 1)
+	i6AddrNum=$(echo "$allI6Addrs" | wc -l)
+	collectAllIpv6Addresses "$i6AddrNum"
+	ip6Addr=$(echo ${i6Addr} | cut -d'/' -f1)
+	ip6Mask=$(echo ${i6Addr} | cut -d'/' -f2)
+	ip6Gate=$(ip -6 route show default | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -w "$interface6" | grep -w "via" | grep "dev" | head -n 1 | awk -F " " '{for (i=3;i<=NF;i++)printf("%s ", $i);print ""}' | awk '{print$1}')
+	# Get real IPv6 subnet of current System
+	actualIp6Prefix=$(ip -6 route show | grep -iv "warp\|wgcf\|wg[0-9]\|docker[0-9]" | grep -w "$interface6" | grep -v "default" | grep -v "multicast" | grep -P '../[0-9]{1,3}' | head -n 1 | awk '{print $1}' | awk -F '/' '{print $2}')
+	[[ -z "$actualIp6Prefix" || "$i6AddrNum" -ge "2" ]] && actualIp6Prefix="$ip6Mask"
+	transferIPv6AddressFormat "$ip6Addr" "$ip6Gate"
+}
+
+# $1 is "$ip6Addr", $2 is "$ip6Gate".
+function transferIPv6AddressFormat() {
+	# Some Bi-Stack server has a public IPv4 address with a private IPv4 gateway and has a dhcp configuration for IPv6 stack,
+	# so we need to tell Debian installer IPv6 static configurations to config IPv6 network first by force.
+	[[ "$BiStackPreferIpv6Status" == "1" ]] && Network6Config="isStatic"
+	# In some original template OS of cloud provider like Akile.io etc,
+	# if prefix of IPv6 mask is 128 in static network configuration, it means there is only one IPv6(current server itself) in the network.
+	# The following is the sample:
+	#
+	# auto eth0
+	#   iface eth0 inet6 static
+	#     address 2603:c020:8:a19b::ffff:e6da
+	#     gateway 2603:c020:8:a19b::ffff
+	#     netmask 128
+	#     dns-nameservers 2001:4860:4860::8888
+	#
+	# In this condition, if IPv6 gateway has a different address with IPv6 address, the Debian installer couldn't find the correct gateway.
+	# The installation will fail in the end. The reason is mostly the upstream wrongly configurated the current network of this system.
+	# So we try to revise this value for 8 levels to expand the range of the IPv6 network and help installer to find the correct gateway.
+	# DHCP IPv6 network(even IPv6 netmask is "128") may not be effected by this situation.
+	# The result of function ' ipv6SubnetCalc "$ip6Mask" ' is "$ip6Subnet"
+	# The following consulted calculations are calculated by Vultr IPv6 subnet calculator and IPv6 subnet range calculator which is provided by iP Jisuanqi.
+	# Reference: https://www.vultr.com/resources/subnet-calculator-ipv6/
+	#            https://ipjisuanqi.com/ipv6.html
+	[[ "$Network6Config" == "isStatic" ]] && {
+		# IPv6 expansion algorithm code reference: https://blog.caoyu.info/expand-ipv6-by-shell.html
+		ip6AddrWhole=$(ultimateFormatOfIpv6 "$1")
+		ip6GateWhole=$(ultimateFormatOfIpv6 "$2")
+		tmpIp6AddrFirst=$(echo $ip6AddrWhole | sed 's/\(.\{4\}\).*/\1/' | sed 's/[a-z]/\u&/g')
+		tmpIp6GateFirst=$(echo $ip6GateWhole | sed 's/\(.\{4\}\).*/\1/' | sed 's/[a-z]/\u&/g')
+		if [[ "$tmpIp6AddrFirst" != "$tmpIp6GateFirst" ]]; then
+			# If some brave guys set --network "static" by force, IPv6 address, mask and gateway of IPv6 DHCP configurations like Oracle Cloud etc. are:
+			# a public IPv6 address, a "128" mask, a local IPv6 gateway(starts with "fe80" mostly, like "fe80::200:f1e9:dec3:4ab").
+			# The value of mask must be set as "128", not "1" which determined by first condition of above because the local IPv6 address is unique in its' network
+			# and plays the role of IPv6 network discovery and identical authentication to ensure that authenticated device is certificated by upstream.
+			# Explanation of using local IPv6 address as gateway quoted from Scott Hogg:
+			#
+			# Link-local IPv6 addresses are on every interface of every IPv6-enabled host and router. They are essential for LAN-based Neighbor Discovery communication.
+			# After the host has gone through the Duplicate Address Detection (DAD) process ensuring that its link-local address (and associated IID) is unique on the LAN segment,
+			# it then proceeds to sending an ICMPv6 Router Solicitation (RS) message sourced from that address.
+			#
+			# There are total three IPv6 address ranges divided into local address: fe80::/10, fec0::/10, fc00::/7.
+			# "fe80::/10" is similar with "169.254.0.0/16" of IPv4 of February, 2006 according to RFC 4291, ranges from fe80:0000:0000:0000:0000:0000:0000:0000 to febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff.
+			# "fec0::/10" is similar with "192.168.0.0/16" of IPv4 which was deprecated and returned to public IPv6 address again of September, 2004 according to RFC 3879.
+			# The function of "fec0::/10" was replaced by "fc00::/7" of October, 2005 according to RFC 4193, ranges from fc00:0000:0000:0000:0000:0000:0000:0000 to fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff.
+			# So we need to calculate ranges of "fe80::/10" and "fc00::/7", if IPv6 address is public and IPv6 gateway belongs to local IPv6 address.
+			# English strings in hexadecimal must be converted as capital alphabets that comparison operations can be processed by shell.
+			# Reference: https://blogs.infoblox.com/ipv6-coe/fe80-1-is-a-perfectly-valid-ipv6-default-gateway-address/ chapter: Link-Local Address as Default Gateway
+			#            https://www.wdic.org/w/WDIC/IPv6%E3%82%A2%E3%83%89%E3%83%AC%E3%82%B9 chapter: アドレスの種類(Types of address) → エニキャストアドレス(Anycast address)
+			#            https://www.wdic.org/w/WDIC/IPv6%E3%82%A2%E3%83%89%E3%83%AC%E3%82%B9 chapter: サイトローカルアドレス(Site local address)
+			#            https://www.wdic.org/w/WDIC/%E3%83%A6%E3%83%8B%E3%83%BC%E3%82%AF%E3%83%AD%E3%83%BC%E3%82%AB%E3%83%AB%E3%83%A6%E3%83%8B%E3%82%AD%E3%83%A3%E3%82%B9%E3%83%88%E3%82%A2%E3%83%89%E3%83%AC%E3%82%B9
+			#            https://www.ipentec.com/document/network-format-ipv6-local-adddress chapter: IPv6のリンクローカルアドレス(Link local address of IPv6)
+			#            https://www.rfc-editor.org/rfc/rfc4291.html#section-2.4 chapter: 2.4. Address Type Identification
+			checkIfIpv4AndIpv6IsLocalOrPublic "" "$2"
+			if [[ "$ipv6LocalOrPublicStatus" == '1' ]]; then
+				tmpIp6Mask="64"
+				# Installer of Debian 11 and former doesn't support irregular IPv6 configs.
+				[[ "$linux_relese" == 'debian' && -n $(echo $tmpDIST | grep -o "[0-9]") && "$tmpDIST" -le "11" && "$IPStackType" == "IPv6Stack" && "$Network6Config" == "isStatic" ]] && BurnIrregularIpv6Status='1'
+			else
+				# If the IPv6 and IPv6 gateway are not in the same IPv6 A class, the prefix of netmask should be "1",
+				# transfer to whole IPv6 subnet address is 8000:0000:0000:0000:0000:0000:0000:0000.
+				# The range of 2603:c020:8:a19b::ffff:e6da/1 is 0000:0000:0000:0000:0000:0000:0000:0000 - 7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff, the gateway 2603:c020:0008:a19b:0000:0000:0000:ffff can be included.
+				tmpIp6Mask="1"
+			fi
+		else
+			ipv6SubnetCertificate "$ip6AddrWhole" "$ip6GateWhole"
+		fi
+		# Too narrow of IPv6 prefix may cause some unpredictable risks.
+		[[ "$tmpIp6Mask" -le "16" ]] && {
+			[[ "$BiStackPreferIpv6Status" == "1" ]] || [[ "$linux_relese" == 'debian' || "$linux_relese" == 'kali' && "$IPStackType" == "IPv6Stack" && "$Network6Config" == "isStatic" ]] && BurnIrregularIpv6Status='1'
+		}
+		ip6Mask="$tmpIp6Mask"
+		# Because of function "ipv6SubnetCalc" includes self-increment,
+		# so we need to confirm the goal of IPv6 prefix and make function to operate only one time in the last to save performance and avoid all
+		# gears of IPv6 prefix which meets well with the conditions of above are transformed to whole IPv6 addresses in one variable.
+		# The same thought of moving function "netmask" to the last, only need to transform IPv4 prefix to whole IPv4 address for one time.
+		ipv6SubnetCalc "$ip6Mask"
+		# So in summary of the IPv6 sample in above, we should assign subnet mask "ffff:ffff:ffff:ffff:ffff:ffff:0000:0000"(prefix is "96") for it.
+	}
+}
+
+# $1 is "$ip6AddrWhole", $2 is "$$ip6GateWhole".
+function ipv6SubnetCertificate() {
+	# If the IP and gateway are in the same IPv6 A class, not in the same IPv6 B class, the prefix of netmask should less equal than "16",
+	# transfer to whole IPv6 subnet address is ffff:0000:0000:0000:0000:0000:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/16 is 2603:0000:0000:0000:0000:0000:0000:0000 - 2603:ffff:ffff:ffff:ffff:ffff:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1) == $(echo $2 | cut -d':' -f 1) ]] && tmpIp6Mask="16"
+	# If the IP and gateway are in the same IPv6 A B class, not in the same IPv6 C class, the prefix of netmask should less equal than "32",
+	# transfer to whole IPv6 subnet address is ffff:ffff:0000:0000:0000:0000:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/32 is 2603:c020:0000:0000:0000:0000:0000:0000 - 2603:c020:ffff:ffff:ffff:ffff:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1,2) == $(echo $2 | cut -d':' -f 1,2) ]] && tmpIp6Mask="32"
+	# If the IP and gateway are in the same IPv6 A B C class, not in the same IPv6 D class, the prefix of netmask should less equal than "48",
+	# transfer to whole IPv6 subnet address is ffff:ffff:ffff:0000:0000:0000:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/48 is 2603:c020:0008:0000:0000:0000:0000:0000 - 2603:c020:0008:ffff:ffff:ffff:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1,2,3) == $(echo $2 | cut -d':' -f 1,2,3) ]] && tmpIp6Mask="48"
+	# If the IP and gateway are in the same IPv6 A B C D class, not in the same IPv6 E class, the prefix of netmask should less equal than "64",
+	# transfer to whole IPv6 subnet address is ffff:ffff:ffff:ffff:0000:0000:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/64 is 2603:c020:0008:a19b:0000:0000:0000:0000 - 2603:c020:0008:a19b:ffff:ffff:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1,2,3,4) == $(echo $2 | cut -d':' -f 1,2,3,4) ]] && tmpIp6Mask="64"
+	# If the IP and gateway are in the same IPv6 A B C D E class, not in the same IPv6 F class, the prefix of netmask should less equal than "80",
+	# transfer to whole IPv6 subnet address is ffff:ffff:ffff:ffff:ffff:0000:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/80 is 2603:c020:0008:a19b:0000:0000:0000:0000 - 2603:c020:0008:a19b:0000:ffff:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1,2,3,4,5) == $(echo $2 | cut -d':' -f 1,2,3,4,5) ]] && tmpIp6Mask="80"
+	# If the IP and gateway are in the same IPv6 A B C D E F class, not in the same IPv6 G class, the prefix of netmask should less equal than "96",
+	# transfer to whole IPv6 subnet address is ffff:ffff:ffff:ffff:ffff:ffff:0000:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/96 is 2603:c020:0008:a19b:0000:0000:0000:0000 - 2603:c020:0008:a19b:0000:0000:ffff:ffff, the gateway 2603:... can be included.
+	[[ $(echo $1 | cut -d':' -f 1,2,3,4,5,6) == $(echo $2 | cut -d':' -f 1,2,3,4,5,6) ]] && tmpIp6Mask="96"
+	# If the IP and gateway are in the same IPv6 A B C D E F G class, not in the same IPv6 H class, the prefix of netmask should less equal than "112",
+	# transfer to whole IPv6 subnet address is ffff:ffff:ffff:ffff:ffff:ffff:ffff:0000.
+	# The range of 2603:c020:8:a19b::ffff:e6da/112 is 2603:c020:0008:a19b:0000:0000:ffff:0000 - 2603:c020:0008:a19b:0000:0000:ffff:ffff, the gateway 2603:c020:0008:a19b:0000:0000:0000:ffff can't be included.
+	[[ $(echo $1 | cut -d':' -f 1,2,3,4,5,6,7) == $(echo $2 | cut -d':' -f 1,2,3,4,5,6,7) ]] && tmpIp6Mask="112"
+}
+
+# $1 is $ip6Mask
+function ipv6SubnetCalc() {
+	tmpIp6Subnet=""
+	ip6Subnet=""
+	ip6SubnetEleNum=$(expr $1 / 4)
+	ip6SubnetEleNumRemain=$(expr $1 - $ip6SubnetEleNum \* 4)
+	if [[ "$ip6SubnetEleNumRemain" == 0 ]]; then
+		ip6SubnetHex="0"
+	elif [[ "$ip6SubnetEleNumRemain" == 1 ]]; then
+		ip6SubnetHex="8"
+	elif [[ "$ip6SubnetEleNumRemain" == 2 ]]; then
+		ip6SubnetHex="c"
+	elif [[ "$ip6SubnetEleNumRemain" == 3 ]]; then
+		ip6SubnetHex="e"
+	fi
+	for ((i = 1; i <= "$ip6SubnetEleNum"; i++)); do
+		tmpIp6Subnet+="f"
+	done
+	tmpIp6Subnet=$tmpIp6Subnet$ip6SubnetHex
+	for ((j = 1; j <= $(expr 32 - $ip6SubnetEleNum); j++)); do
+		tmpIp6Subnet+="0"
+	done
+	if [[ $(echo $tmpIp6Subnet | wc -c) -ge "33" ]]; then
+		tmpIp6Subnet=$(echo $tmpIp6Subnet | sed 's/.$//')
+	fi
+	for ((k = 0; k <= 7; k++)); do
+		ip6Subnet+=$(echo ${tmpIp6Subnet:$(expr $k \* 4):4})":"
+	done
+	ip6Subnet=$(echo ${ip6Subnet%?})
+}
+
+# $1 is "$iAddrNum".
+function collectAllIpv4Addresses() {
+	[[ "$1" -ge "2" && "$IPStackType" != "IPv6Stack" ]] && {
+		Network4Config="isStatic"
+		iAddrs=()
+		for tmpIp in $allI4Addrs; do
+			iAddrs[${#iAddrs[@]}]=$tmpIp
+		done
+	}
+}
+
+# $1 is "$iAddrNum", $2 is "in-target", $3 is 'netconfig file'.
+function writeMultipleIpv4Addresses() {
+	[[ "$1" -ge "2" && "$IPStackType" != "IPv6Stack" ]] && {
+		if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]]; then
+			unset iAddrs[0]
+			for writeIps in ${iAddrs[@]}; do
+				ipAddrItem="up ip addr add $writeIps dev $interface4"
+				tmpWriteIpsCmd+=''$2' sed -i '\''$a\\t'$ipAddrItem''\'' '$3'; '
+			done
+			writeIpsCmd=$(echo $tmpWriteIpsCmd)
+			SupportMultipleIPv4="$writeIpsCmd"
+		elif [[ "$targetRelese" == 'Ubuntu' ]] || [[ "$targetRelese" == 'AlmaLinux' ]] || [[ "$targetRelese" == 'Rocky' ]]; then
+			for writeIps in ${iAddrs[@]}; do
+				ipAddrItem="$writeIps"
+				tmpWriteIpsCmd+=''$ipAddrItem','
+			done
+			writeIpsCmd=$(echo ''$tmpWriteIpsCmd'' | sed 's/.$//')
+		elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+			unset iAddrs[0]
+			for writeIps in ${iAddrs[@]}; do
+				ipAddrItem="up ip addr add $writeIps dev $interface4"
+				tmpWriteIpsCmd+='\t'$ipAddrItem'\n'
+			done
+			writeIpsCmd=$(echo $tmpWriteIpsCmd | sed 's/..$//')
+		elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+			for ((tmpIpIndex = "0"; tmpIpIndex < "$1"; tmpIpIndex++)); do
+				writeIps="${iAddrs[$tmpIpIndex]}"
+				ipv4AddressOrder=$(expr $tmpIpIndex + 1)
+				ipAddrItem+='address'$ipv4AddressOrder'='$writeIps','$ipGate'\n'
+			done
+			ipAddrItem=$(echo ''$ipAddrItem'' | sed 's/..$//')
+			deleteOriginalIpv4Coning='sed -ri '\''/address1.*/d'\'' '$3''
+			addIpv4AddrsForRedhat='sed -i '\''/\[ipv4\]/a\'$ipAddrItem''\'' '$3''
+		fi
+	}
+}
+
+# $1 is "$i6AddrNum".
+function collectAllIpv6Addresses() {
+	[[ "$1" -ge "2" && "$IPStackType" != "IPv4Stack" ]] && {
+		Network6Config="isStatic"
+		i6Addrs=()
+		for tmpIp6 in $allI6Addrs; do
+			# The best way to add several elements into an array by using "for" loop in the shell.
+			# Reference: https://linuxhandbook.com/bash-append-array/
+			i6Addrs[${#i6Addrs[@]}]=$tmpIp6
+		done
+		if [[ "$IPStackType" == "IPv6Stack" ]] || [[ "$IPStackType" == "BiStack" && -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]]; then
+			# A sample result of the following arrays which were programmed by "for" loops:
+			#
+			# ${i6Addrs[@]}                         : 2606:a8c0:3:6f::b/64 2606:a8c0:3:6f::a/64 2606:a8c0:3::64/128
+			# ${allI6AddrsWithoutSuffix[@]}         : 2606:a8c0:3:6f::b 2606:a8c0:3:6f::a 2606:a8c0:3::64
+			# ${allI6AddrsWithUltimateFormat[@]}    : 2606:a8c0:0003:006f:0000:0000:0000:000b 2606:a8c0:0003:006f:0000:0000:0000:000a 2606:a8c0:0003:0000:0000:0000:0000:0064
+			# ${allI6AddrsWithOmittedClassesNum[@]} : 3 3 4
+			# $omittedClassesMaxNum                 : 4
+			# $mainIp6Index                         : 2
+			# $i6Addr                               : 2606:a8c0:3::64/128
+			#
+			# To find out the segment with the largest range of one IPv6 in all of the IPv6s as default to config IPv6 network in netboot environment for machines of IPv6 stack.
+			allI6AddrsWithoutSuffix=()
+			for tmpIp6 in ${i6Addrs[@]}; do
+				tmpIp6=$(echo $tmpIp6 | cut -d'/' -f1)
+				allI6AddrsWithoutSuffix[${#allI6AddrsWithoutSuffix[@]}]=$tmpIp6
+			done
+			allI6AddrsWithUltimateFormat=()
+			for tmpIp6 in ${allI6AddrsWithoutSuffix[@]}; do
+				tmpIp6=$(ultimateFormatOfIpv6 "$tmpIp6")
+				allI6AddrsWithUltimateFormat[${#allI6AddrsWithUltimateFormat[@]}]=$tmpIp6
+			done
+			allI6AddrsWithOmittedClassesNum=()
+			for tmpIp6 in ${allI6AddrsWithUltimateFormat[@]}; do
+				tmpIp6=$(echo $tmpIp6 | grep -oi "0000" | wc -l)
+				allI6AddrsWithOmittedClassesNum[${#allI6AddrsWithOmittedClassesNum[@]}]=$tmpIp6
+			done
+			omittedClassesMaxNum=${allI6AddrsWithOmittedClassesNum[0]}
+			for tmpIp6 in ${!allI6AddrsWithOmittedClassesNum[@]}; do
+				if [[ "$omittedClassesMaxNum" -le "${allI6AddrsWithOmittedClassesNum[${tmpIp6}]}" ]]; then
+					omittedClassesMaxNum=${allI6AddrsWithOmittedClassesNum[${tmpIp6}]}
+				fi
+			done
+			getArrItemIdx "${allI6AddrsWithOmittedClassesNum[*]}" "$omittedClassesMaxNum"
+			mainIp6Index="$index"
+			i6Addr=${i6Addrs[$mainIp6Index]}
+		fi
+	}
+}
+
+# Debian installer can't accept any command that writing multi lines by one "sed -i" or "echo -e" etc in "preseed.cfg".
+# For example, if we want to add two lines or more like "up ip addr add IPv6one/48 dev eth0" and "up ip addr add IPv6two/40 dev eth0" to "network file",
+# using "sed -i '$a\\tup ip addr add IPv6one/48 dev eth0' 'network file';" and then "sed -i '$a\\tup ip addr add IPv6two/40 dev eth0' 'network file';" is necessary.
+# Otherwise, if try to use "sed -i '$a\\tup ip addr add IPv6one/48 dev eth0\n\tup ip addr add IPv6two/40 dev eth0' 'network file';"
+# to add two IPv6 addresses config lines in the same "sed -i", Debian installer will meet a fatal.
+#
+# An excellent method to add multiple IPv6 addresses and the IPv6 gateway of them in Bi-stack(dual-stack) network configuration file for Debian/Kali, here is the sample:
+#
+# allow-hotplug eth0
+# iface eth0 inet static
+#     address 59.67.82.30
+#     gateway 59.67.82.1
+#     netmask 255.255.255.0
+#     dns-nameservers 1.0.0.1 8.8.4.4 2606:4700:4700::1001 2001:4860:4860::8844
+#     up ip addr add 2a12:a520:d420::736f/48 dev eth0
+#     up ip addr add 2a12:a520:2e0b::a89c:11de/40 dev eth0
+#     up ip -6 route add 2a12:a520:2e0b:0000:0000:0000:0000:0001 dev eth0
+#     up ip -6 route add default via 2a12:a520:2e0b:0000:0000:0000:0000:0001 dev eth0
+#
+# A standard format of adding multiple IPv6 configs into IPv6 stack server for Debian series:
+#
+# allow-hotplug enp3s0
+# iface enp3s0 inet6 static
+#	    address 2606:a8c0:3::64/128
+#	    gateway 2606:a8c0:3::1
+#	    dns-nameservers 2606:4700:4700::1001 2001:4860:4860::8844
+#   	dns-search debian
+# 	  up ip addr add 2606:a8c0:3:6f::3b/64 dev enp3s0
+#	    up ip addr add 2606:a8c0:3:6f::a/64 dev enp3s0
+#
+# A standard formart of adding multiple IPv6 addresses for the second network adapter in Bi-stack(dual-stack) server for Debian series:
+# The first network adapter which is called such as "eth0" plays a role of establishing IPv4 stack network,
+# and then the second network adapter of "eth1" is responsible of creating multiple terms of IPv6 stack networking configurations.
+# This uncommon and extreme situation can only be applied for Debian series at current because the file of "/etc/network/interfaces" is easily to be modified.
+#
+# allow-hotplug eth0
+# iface eth0 inet static
+#     address 104.36.84.237/32
+#     gateway 104.36.84.1
+#     dns-nameservers 1.0.0.1 8.8.4.4
+#
+# allow-hotplug eth1
+# iface eth1 inet6 static
+#     address 2606:a8c0:3::64/128
+#     gateway 2606:a8c0:3::1
+#     dns-nameservers 2606:4700:4700::1001 2001:4860:4860::8844
+#     up ip -6 addr add 2606:a8c0:3:6f::2f/64 dev eth1
+#     up ip -6 addr add 2606:a8c0:3:6f::1c/64 dev eth1
+#
+# $1 is "$i6AddrNum", $2 is "in-target", $3 is 'netconfig file'.
+function writeMultipleIpv6Addresses() {
+	[[ "$1" -ge "2" && "$IPStackType" != "IPv4Stack" ]] && {
+		# For environment of IPv6 stack, one main IPv6 config will be written to system by "preseed" or "kickstart" into the unattend file to config the network firstly.
+		# So the main IPv6 config should be excluded in the array of "i6Addrs[@]" for the later stage of writing other IPv6s to the network config file in the newly installed system.
+		if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]]; then
+			if [[ "$IPStackType" == "IPv6Stack" ]] || [[ "$IPStackType" == "BiStack" && -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]]; then
+				unset i6Addrs[$mainIp6Index]
+			fi
+			for writeIp6s in ${i6Addrs[@]}; do
+				[[ "$IPStackType" == "BiStack" && -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && ip6AddrItem="up ip -6 addr add $writeIp6s dev $interface6" || ip6AddrItem="up ip addr add $writeIp6s dev $interface6"
+				tmpWriteIp6sCmd+=''$2' sed -i '\''$a\\t'$ip6AddrItem''\'' '$3'; '
+			done
+			writeIp6sCmd=$(echo $tmpWriteIp6sCmd)
+			writeIp6GateCmd=''$2' sed -i '\''$a\\tup ip -6 route add '$ip6Gate' dev '$interface6''\'' '$3'; '$2' sed -i '\''$a\\tup ip -6 route add default via '$ip6Gate' dev '$interface6''\'' '$3';'
+			addIpv6DnsForPreseed=''$2' sed -ri '\''s/'$ipDNS'/'$ipDNS' '$ip6DNS'/g'\'' '$3';'
+			preferIpv6Access=''$2' sed -i '\''$alabel 2002::/16'\'' /etc/gai.conf; '$2' sed -i '\''$alabel 2001:0::/32'\'' /etc/gai.conf;'
+			SupportMultipleIPv6=''$writeIp6sCmd' '$writeIp6GateCmd' '$addIpv6DnsForPreseed' '$preferIpv6Access''
+			[[ "$IPStackType" == "IPv6Stack" ]] && SupportIPv6orIPv4=''$writeIp6sCmd' '$preferIpv6Access''
+			[[ "$IPStackType" == "BiStack" && -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && {
+				addIpv6Adapter=''$2' sed -i '\''$a\ '\'' '$3'; '$2' sed -i '\''$aallow-hotplug '$interface6''\'' '$3';'
+				addFirstIpv6Config=''$2' sed -i '\''$aiface '$interface6' inet6 static'\'' '$3'; '$2' sed -i '\''$a\\taddress '$i6Addr''\'' '$3'; '$2' sed -i '\''$a\\tgateway '$ip6Gate''\'' '$3'; '$2' sed -i '\''$a\\tdns-nameservers '$ip6DNS''\'' '$3';'
+				SupportMultipleIPv6=''$addIpv6Adapter' '$addFirstIpv6Config' '$writeIp6sCmd' '$preferIpv6Access''
+			}
+		elif [[ "$targetRelese" == 'Ubuntu' ]] || [[ "$targetRelese" == 'AlmaLinux' ]] || [[ "$targetRelese" == 'Rocky' ]]; then
+			for writeIp6s in ${i6Addrs[@]}; do
+				ip6AddrItem="$writeIp6s"
+				tmpWriteIp6sCmd+=''$ip6AddrItem','
+			done
+			writeIp6sCmd=$(echo ''$tmpWriteIp6sCmd'' | sed 's/.$//')
+		elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+			[[ "$IPStackType" == "IPv6Stack" ]] && unset i6Addrs[$mainIp6Index]
+			for writeIp6s in ${i6Addrs[@]}; do
+				if [[ "$IPStackType" == "BiStack" ]]; then
+					ip6AddrItem="up ip addr add $writeIp6s dev $interface6"
+					tmpWriteIp6sCmd+='\t'$ip6AddrItem'\n'
+				elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+					ip6AddrItem="up ip -6 addr add $writeIp6s dev $interface6"
+					tmpWriteIp6sCmd+='\t'$ip6AddrItem'\n'
+				fi
+			done
+			if [[ "$IPStackType" == "BiStack" ]]; then
+				writeIp6sCmd=''$tmpWriteIp6sCmd'\tup ip -6 route add '$ip6Gate' dev '$interface6'\n\tup ip -6 route add default via '$ip6Gate' dev '$interface6''
+			elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+				writeIp6sCmd=$(echo $tmpWriteIp6sCmd | sed 's/..$//')
+			fi
+		elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+			# The following strategy of adding multiple IPv6 addresses with subnet, gateway and DNS parameters is only suitable for
+			# Redhat series(9+, Fedora 30+) which are using "NetworkManager" to manage the configurations of the networking by default.
+			# The first IPv6 address will be written to the target system which has a native syntax support was provided by kickstart from Redhat,
+			# so we just need to add the second and more IPv6 addresses in the late command of the kickstart which area is involved from "%post" to "%end".
+			for ((tmpI6Index = "0"; tmpI6Index < "$1"; tmpI6Index++)); do
+				writeIp6s="${i6Addrs[$tmpI6Index]}"
+				ipv6AddressOrder=$(expr $tmpI6Index + 1)
+				ip6AddrItem+='address'$ipv6AddressOrder'='$writeIp6s','$ip6Gate'\n'
+			done
+			ip6AddrItems=''$ip6AddrItem''
+			addIpv6DnsForRedhat='dns='$ip6DNS1';'$ip6DNS2';'
+			addIpv6AddrsForRedhat='sed -i '\''/addr-gen-mode=eui64/a\'$ip6AddrItems''$addIpv6DnsForRedhat''\'' '$3''
+			# Make sure to match "method=auto" only for IPv6 selection so that to avoid if some situations of "method=auto" as of IPv4 configuration.
+			setIpv6ConfigMethodForRedhat='sed -ri '\'':label;N;s/addr-gen-mode=eui64\nmethod=auto/addr-gen-mode=eui64\nmethod=manual/;b label'\'' '$3''
+			[[ "$IPStackType" == "IPv6Stack" ]] && {
+				ip6AddrItems=$(echo $ip6AddrItem | sed 's/..$//')
+				deleteOriginalIpv6Coning='sed -ri '\''/address1.*/d'\'' '$3''
+				addIpv6AddrsForRedhat='sed -i '\''/addr-gen-mode=eui64/a\'$ip6AddrItems''\'' '$3''
+				setIpv6ConfigMethodForRedhat=""
+			}
+		fi
+	}
+}
+
+# This function help us to sort sizes for different files from different directions.
+# "$FilesDirArr" storages original absolute pathes of files.
+# "$FilesLineArr" receives amount of alphabets and numbers etc. in one file from "$FilesDirNum"
+# "$FilesDir" is the list of absolute files' pathes those are executed by command like "grep" etc.
+# According to file size, "$tmpSizeArray" sorts "$FilesLineArr"'s numbers from smallest to largest(-sort h) or from largest to smallest(-sort hr).
+# "$1" are direction of files, "$2" is sort method.
+function sortFileSize() {
+	FilesDirArr=()
+	FilesLineArr=()
+	FilesDir="$1"
+
+	for Count in $FilesDir; do
+		FilesDirArr+=($Count)
+		FilesDirNum=$(cat $Count | wc -c)
+		FilesLineArr+=($FilesDirNum)
+	done
+
+	tmpSizeArray=($(echo ${FilesLineArr[*]} | tr ' ' '\n' | $2))
+}
+
+# This function may help us to find the index order in one array if we provide a random data in this array.
+# "$1" is one array like "${FilesLineArr[*]}", "$2" is one element which index of this array needs to be found like "${tmpSizeArray[0]}"
+function getArrItemIdx() {
+	arr=$1
+	item=$2
+	index=0
+
+	for i in ${arr[*]}; do
+		[[ $item == $i ]] && {
+			echo $index >>/dev/null 2>&1
+			return
+		}
+		index=$(($index + 1))
+	done
+}
+
+# "$1" is the absolute path of a file.
+function splitDirAndFile() {
+	FileName=$(echo $1 | awk -F/ '{print $NF}')
+	FileDirection=$(echo $1 | sed "s/$FileName//g")
+}
+
+# In Debian 11 OS template of DigitalOcean, there are 5 directions deposing network configurations after filtered by command of "find" and "grep":
+# /run/network/interfaces.d/eth0            31  bytes
+# /run/network/interfaces.d/eth1            31  bytes
+# /etc/network/interfaces                   755 bytes
+# /etc/network/interfaces.d/50-cloud-init   716 bytes
+# /etc/network/cloud-interfaces-template    39  bytes
+# We should get help by some algorithms to select the largest size of the file, the correct network configuration, "/etc/network/interfaces" is just there.
+#
+# "$1" is an array which storages temp files. "$2" is sort method, "sort -hr" is largest, "sort -h" is smallest.
+function getLargestOrSmallestFile() {
+	for Count in "$1"; do
+		sortFileSize "$Count" "$2"
+		getArrItemIdx "${FilesLineArr[*]}" "${tmpSizeArray[0]}"
+		fullFilePath="${FilesDirArr[$index]}"
+		[[ "$fullFilePath" != "" ]] && {
+			splitDirAndFile "$fullFilePath"
+			break
+		}
+	done
+}
+
+# A function about parsing "*.yaml" files by native bash.
+# Reference: https://stackoverflow.com/questions/5014632/how-can-i-parse-a-yaml-file-from-a-linux-shell-script
+function parseYaml() {
+	prefix=$2
+	s='[[:space:]]*' w='[a-zA-Z0-9_]*'
+	fs=$(echo @ | tr @ '\034')
+	sed -ne "s|,$s\]$s\$|]|" \
+		-e ":1;s|^\($s\)\($w\)$s:$s\[$s\(.*\)$s,$s\(.*\)$s\]|\1\2: [\3]\n\1  - \4|;t1" \
+		-e "s|^\($s\)\($w\)$s:$s\[$s\(.*\)$s\]|\1\2:\n\1  - \3|;p" $1 |
+		sed -ne "s|,$s}$s\$|}|" \
+			-e ":1;s|^\($s\)-$s{$s\(.*\)$s,$s\($w\)$s:$s\(.*\)$s}|\1- {\2}\n\1  \3: \4|;t1" \
+			-e "s|^\($s\)-$s{$s\(.*\)$s}|\1-\n\1  \2|;p" |
+		sed -ne "s|^\($s\):|\1|" \
+			-e "s|^\($s\)-$s[\"']\(.*\)[\"']$s\$|\1$fs$fs\2|p" \
+			-e "s|^\($s\)-$s\(.*\)$s\$|\1$fs$fs\2|p" \
+			-e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+			-e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p" |
+		awk -F$fs '{
+    indent=length($1)/2
+    vname[indent]=$2
+    for (i in vname) {if (i>indent) {delete vname[i]; idx[i]=0}}
+    if (length($2)==0) {vname[indent]= ++idx[indent]}
+    if (length($3)>0) {
+      vn=""
+      for (i=0;i<indent;i++) {vn=(vn)(vname[i])("_")}
+      printf("%s%s%s=\"%s\"\n","'$prefix'",vn,vname[indent],$3)
+    }
+  }'
+}
+
+# $1 is $CurrentOS
+function getInterface() {
+	# Network config file for Ubuntu 16.04 and former version,
+	# Debian all version included the latest Debian 11 is deposited in /etc/network/interfaces, they managed by "ifupdown".
+	# Ubuntu 18.04 and later version, using netplan to replace legacy ifupdown, the network config file is in /etc/netplan/
+	interface=""
+	Interfaces=()
+	allInterfaces=$(cat /proc/net/dev | grep ':' | cut -d':' -f1 | sed 's/\s//g' | grep -iv '^lo\|^sit\|^stf\|^gif\|^dummy\|^vmnet\|^vir\|^gre\|^ipip\|^ppp\|^bond\|^tun\|^tap\|^ip6gre\|^ip6tnl\|^teql\|^ocserv\|^vpn\|^warp\|^wgcf\|^wg\|^docker' | sort -n)
+	for interfaceItem in $allInterfaces; do
+		Interfaces[${#Interfaces[@]}]=$interfaceItem
+	done
+	interfacesNum="${#Interfaces[*]}"
+	# Some server has two different network adapters and for example: eth0 is for IPv4, eth1 is for IPv6, so we need to distinguish whether they are the same.
+	default4Route=$(ip -4 route show default | grep -A 3 "^default")
+	# In Vultr server of 2.5$/mo plan, it has only IPv6 address, so the default route is via IPv6.
+	# The name of interface is not always in the first line:
+	# root@layer7:~# ip -6 route show
+	# 2a12:5e40:15::/48 dev eth0 proto ra metric 1024 expires 2591978sec pref medium
+	# fe80::/64 dev eth0 proto kernel metric 256 pref medium
+	# default proto static metric 1024 pref medium
+	# nexthop via 2a12:5e40:1::1 dev eth0 weight 1
+	# nexthop via fe80::e6c7:22ff:fe4d:b63c dev eth0 weight 1
+	default6Route=$(ip -6 route show default | grep -A 3 "^default")
+	for item in ${Interfaces[*]}; do
+		[ -n "$item" ] || continue
+		echo "$default4Route" | grep -q "$item"
+		[ $? -eq 0 ] && interface4="$item" && break
+	done
+	for item in ${Interfaces[*]}; do
+		[ -n "$item" ] || continue
+		echo "$default6Route" | grep -q "$item"
+		[ $? -eq 0 ] && interface6="$item" && break
+	done
+	interface="$interface4 $interface6"
+	[[ "$interface4" == "$interface6" ]] && interface=$(echo "$interface" | cut -d' ' -f 1)
+	[[ -z "$interface4" || -z "$interface6" ]] && {
+		interface=$(echo "$interface" | sed 's/[[:space:]]//g')
+		[[ -z "$interface4" ]] && interface4="$interface"
+		[[ -z "$interface6" ]] && interface6="$interface"
+	}
+	echo "$interface" >/dev/null
+	getArrItemIdx "${Interfaces[*]}" "$interface4"
+	interface4DeviceOrder="$index"
+	getArrItemIdx "${Interfaces[*]}" "$interface6"
+	interface6DeviceOrder="$index"
+	# Some templates of cloud provider like Bandwagonhosts, Ubuntu 22.04, may modify parameters in " GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0" " in /etc/default/grub
+	# to make Linux kernel redirect names of network adapters from real name like ens18, ens3, enp0s4 to eth0, eth1, eth2...
+	# This setting may confuse program to get real adapter name from reading /proc/cat/dev
+	GrubCmdLine=$(grep "GRUB_CMDLINE_LINUX" /etc/default/grub | grep -v "#" | grep "net.ifnames=0\|biosdevname=0")
+	# So we need to comfirm whether adapter name is renamed and whether we should inherit it into new system.
+	[[ -n "$interfaceSelect" ]] && {
+		interface="$interfaceSelect"
+		interface4="$interface"
+		interface6="$interface"
+	}
+	if [[ -n "$GrubCmdLine" && -z "$interfaceSelect" ]] || [[ "$interface4" =~ "eth" ]] || [[ "$interface6" =~ "eth" ]] || [[ "$linux_relese" == 'kali' ]] || [[ "$linux_relese" == 'alpinelinux' ]]; then
+		setInterfaceName='1'
+	fi
+	[[ -z "$tmpDHCP" ]] && {
+		if [[ "$1" == 'CentOS' || "$1" == 'AlmaLinux' || "$1" == 'RockyLinux' || "$1" == 'Fedora' || "$1" == 'Vzlinux' || "$1" == 'OracleLinux' || "$1" == 'OpenCloudOS' || "$1" == 'AlibabaCloudLinux' || "$1" == 'ScientificLinux' || "$1" == 'AmazonLinux' || "$1" == 'RedHatEnterpriseLinux' || "$1" == 'OpenAnolis' || "$1" == 'CloudLinux' ]]; then
+			[[ ! $(find / -maxdepth 5 -path /*network-scripts -type d -print -or -path /*system-connections -type d -print) ]] && {
+				echo -ne "\n[${red}Error${plain}] Invalid network configuration!\n"
+				exit 1
+			}
+			NetCfgWhole=()
+			tmpNetCfgFiles=""
+			for Count in $(find / -maxdepth 5 -path /*network-scripts -type d -print -or -path /*system-connections -type d -print); do
+				NetCfgDir="$Count""/"
+				# If "NetworkManager" replaced "network-scripts", there is a file called "readme-ifcfg-rh.txt" in dir: /etc/sysconfig/network-scripts/
+				# NetCfgFile=`ls -Sl $NetCfgDir 2>/dev/null | awk -F' ' '{print $NF}' | grep -iv 'lo\|sit\|stf\|gif\|dummy\|vmnet\|vir\|gre\|ipip\|ppp\|bond\|tun\|tap\|ip6gre\|ip6tnl\|teql\|ocserv\|vpn\|readme' | grep -s "$interface" | head -n 1`
+				# Condition of "grep -iv 'lo\|sit\|stf..." has been deperated because the config file name of "NetworkManager" which initiated by "cloud init" is like "cloud-init-eth0.nmconnection".
+				# Different from command "grep", command "ls" can only show file name but not full file direction.
+				# There are 3 files named "ifcfg-ens18  ifcfg-eth0  ifcfg-eth1" in dir "/etc/sysconfig/network-scripts/" of Almalinux 8 of Bandwagonhosts template.
+				# We should select the correct one by adjust whether includes interface name and file size.
+				# Files in "/etc/sysconfig/network-scripts/", reference: https://zetawiki.com/wiki/%EB%B6%84%EB%A5%98:/etc/sysconfig/network-scripts
+				NetCfgFiles=$(ls -Sl $NetCfgDir 2>/dev/null | awk -F' ' '{print $NF}' | grep -iv 'readme-\|ifcfg-lo\|ifcfg-bond\|ifup\|ifdown\|vpn\|init.ipv6-global\|network-functions\|lo.' | grep -s "ifcfg\|nmconnection")
+				for Files in $NetCfgFiles; do
+					if [[ $(grep -w "$interface4\|$interface6" "$NetCfgDir$Files") != "" ]]; then
+						tmpNetCfgFiles+=$(echo -e "\n""$NetCfgDir$Files")
+					fi
+				done
+				getLargestOrSmallestFile "$tmpNetCfgFiles" "sort -hr"
+				NetCfgFile="$FileName"
+				# In Google Cloud Platform, network configuration files of Redhat Enterprise 8+, CentOS-stream 8+, RockyLinux 8+ are all named " 'Wired connection 1.nmconnection' " in "/run/NetworkManager/system-connections/" direction.
+				# Yes, that's right, the name of this file includes spaces and two single quotes which are in the first and last.
+				# Only command "ls" can show the whole file name:
+				#
+				# [root@instance-2 ~]# ls -l /run/NetworkManager/system-connections/
+				# total 4
+				# -rw-------. 1 root root 270 May  4 22:15 'Wired connection 1.nmconnection'
+				#
+				# Many commands in linux can't handle these son of bitches because single quote is a strong reference so that the strings between two single quotes can't be any parameters.
+				# The most typical case is when you search these fuckin files by "grub", the result deleted two single quotes automatically like:
+				#
+				# [root@instance-2 ~]# grep -r "ipv4" /run/NetworkManager/system-connections/
+				# /run/NetworkManager/system-connections/Wired connection 1.nmconnection:[ipv4]
+				#
+				# When we try to use command "head" and "tail" to be pipeline items after the first command "ls", the result is also the same:
+				#
+				# [root@instance-2 ~]# ls /run/NetworkManager/system-connections/ | head -n 1 | tail -n 1
+				# Wired connection 1.nmconnection
+				#
+				# A file name includes space is very dangerous in linux because the operating system will use a couple of single quotes to bundle it as a "not be referenced" file to prevent os identify them error.
+				# No matter what command you choice, unless attach its' absolute direction and execute it with other commands directly in the shell, it can work correctly, otherwise you wanna be cried when handle them by parameters transactions.
+				# We should use "grep" to extract which key words we need and print the result to another file.
+				# If this universe has hell, those jackass  who deployed these tortured settings of OS templates works on Google Cloud Platform will go to there when they died.
+				if [[ ! -z "$NetCfgFile" && ! -f "$NetCfgDir$NetCfgFile" ]]; then
+					tmpNetcfgDir="/root/tmp/installNetcfgCollections/"
+					[[ ! -d "$tmpNetcfgDir" ]] && mkdir -p "$tmpNetcfgDir"
+					if [[ "$NetCfgFile" =~ "nmconnection" ]]; then
+						NetCfgFile="$interface.nmconnection"
+						grep -wr "$interface\|\[ipv4\]\|\[ipv6\]\|\[connection\]\|\[ethernet\]\|id=*\|interface-name=*\|type=*\|method=*" "$NetCfgDir" | cut -d ':' -f 2 | tee -a "$tmpNetcfgDir$NetCfgFile"
+						NetCfgDir="$tmpNetcfgDir"
+					elif [[ "$NetCfgFile" =~ "ifcfg" ]]; then
+						NetCfgFile="$ifcfg-$interface"
+						grep -wr "$interface\|BOOTPROTO=*\|DEVICE=*\|ONBOOT=*\|TYPE=*\|HWADDR=*\|IPV6_AUTOCONF=*\|DHCPV6C=*" "$NetCfgDir" | cut -d ':' -f 2 | tee -a "$tmpNetcfgDir$NetCfgFile"
+						NetCfgDir="$tmpNetcfgDir"
+					fi
+				fi
+				# The following conditions must appeared at least 3 times in a vaild network config file.
+				[[ $(grep -wcs "$interface4\|$interface6\|BOOTPROTO=*\|DEVICE=*\|ONBOOT=*\|TYPE=*\|HWADDR=*\|id=*\|\[connection\]\|interface-name=*\|type=*\|method=*" $NetCfgDir$NetCfgFile) -ge "3" ]] && {
+					# In AlmaLinux 9 template of DigitalOcean, network adapter name is "eth0", there are two network config files in the OS, and they all belong to "eth0".
+					# /etc/sysconfig/network-scripts/ifcfg-eth0
+					# /etc/NetworkManager/system-connections/eth0.nmconnection
+					# Which is the vaild one? We can storage them to one array first.
+					NetCfgWhole+=("$NetCfgDir$NetCfgFile")
+				}
+			done
+			# If index "1"(starts in "0") is not empty, it means there at least two network config files in current OS.
+			if [[ "${NetCfgWhole[1]}" != "" ]]; then
+				for c in "${NetCfgWhole[@]}"; do
+					# Cloud providers usually use automatic tools like SolusVM or Cloud-init etc. to initial different Linux OS.
+					# The first row of the network config files is showed like the following example regularly:
+					# # Generated by SolusVM
+					# # Created by cloud-init on instance boot automatically, do not edit.
+					# So the "#" and preposition "(did something) by (who)" is a obvious hint to help us to distinguish:
+					[[ $(sed -e "4"p "$c" | grep " by " | grep -c "#") -ge "1" ]] && {
+						NetCfgWhole="$c"
+						break
+					}
+				done
+				# If the array of "${NetCfgWhole}" doesn't be turned into a parameter, it means there are not any annotates generated by automatic tools.
+				# We need to import command "declare" to make an inspection to comfirm whether it's an array or a parameter,
+				# If it's still an arrary, we can only assume the index "0" in this array as the valid network config file.
+				[[ $(declare -p NetCfgWhole 2>/dev/null | grep -iw '^declare -a') ]] && {
+					NetCfgWhole="${NetCfgWhole[0]}"
+				}
+			fi
+			splitDirAndFile "$NetCfgWhole"
+			NetCfgFile="$FileName"
+			NetCfgDir="$FileDirection"
+		else
+			readNetplan=$(find $(echo $(find / -maxdepth 4 -path /*netplan)) -maxdepth 1 -name "*.yaml" -print)
+			readIfupdown=$(find / -maxdepth 5 -path /*network -type d -print | grep -v "lib\|systemd")
+			if [[ ! -z "$readNetplan" ]]; then
+				# Ubuntu 18+ network configuration
+				networkManagerType="netplan"
+				tmpNetCfgFiles=""
+				for Count in $readNetplan; do
+					tmpNetCfgFiles+=$(echo -e "\n"$(grep -wrl "network" | grep -wrl "ethernets" | grep -wrl "$interface4\|$interface6" "$Count" 2>/dev/null))
+				done
+				getLargestOrSmallestFile "$tmpNetCfgFiles" "sort -hr"
+				NetCfgFile="$FileName"
+				NetCfgDir="$FileDirection"
+				NetCfgWhole="$NetCfgDir$NetCfgFile"
+			elif [[ ! -z "$readIfupdown" ]]; then
+				# Debian/Kali/AlpineLinux network configuration
+				# Some versions of Ubuntu 18 like virmach template use ifupdown not netplan.
+				networkManagerType="ifupdown"
+				# Collect all eligible config files by the several parent directions names "network".
+				# Reference: https://wiki.debian.org/NetworkConfiguration
+				#            https://wiki.debian.org/IPv6PrefixDelegation
+				tmpNetCfgFiles=""
+				for Count in $readIfupdown; do
+					if [[ "$IPStackType" == "IPv4Stack" ]]; then
+						NetCfgFiles=$(timeout 4s grep -wrl 'iface' | grep -wrl "auto\|dhcp\|static\|manual" | grep -wrl 'inet\|ip addr\|ip route' "$Count""/" 2>/dev/null | grep -v "if-*" | grep -v "state" | grep -v "helper" | grep -v "template")
+					elif [[ "$IPStackType" == "BiStack" ]] || [[ "$IPStackType" == "IPv6Stack" ]]; then
+						NetCfgFiles=$(timeout 4s grep -wrl 'iface' | grep -wrl "auto\|dhcp\|static\|manual" | grep -wrl 'inet\|ip addr\|ip route\|inet6\|ip -6' "$Count""/" 2>/dev/null | grep -v "if-*" | grep -v "state" | grep -v "helper" | grep -v "template")
+					fi
+					for Files in $NetCfgFiles; do
+						if [[ $(timeout 4s grep -w "$interface4\|$interface6" "$Files") != "" ]]; then
+							tmpNetCfgFiles+=$(echo -e "\n""$Files")
+						fi
+					done
+				done
+				getLargestOrSmallestFile "$tmpNetCfgFiles" "sort -hr"
+				NetCfgFile="$FileName"
+				NetCfgDir="$FileDirection"
+				NetCfgWhole="$NetCfgDir$NetCfgFile"
+			else
+				echo -ne "\n[${red}Error${plain}] Invalid network configuration!\n"
+				exit 1
+			fi
+		fi
+	}
+}
+
+# $1 is "$ipMask", $2 is "$ip6Mask". Can only accept prefix number transmit.
+function acceptIPv4AndIPv6SubnetValue() {
+	[[ -n "$1" ]] && {
+		if [[ $(echo "$1" | grep '^[[:digit:]]*$') && "$1" -ge "1" && "$1" -le "32" ]]; then
+			ipPrefix="$1"
+			actualIp4Prefix="$ipPrefix"
+			ipMask=$(netmask "$1")
+			actualIp4Subnet=$(netmask "$1")
+		else
+			echo -ne "\n[${red}Warning${plain}] Only accept prefix format of IPv4 address, length from 1 to 32."
+			echo -ne "\nIPv4 CIDR Calculator: https://www.vultr.com/resources/subnet-calculator/\n"
+			exit 1
+		fi
+	}
+	[[ -n "$2" ]] && {
+		if [[ $(echo "$2" | grep '^[[:digit:]]*$') && "$2" -ge "1" && "$2" -le "128" ]]; then
+			actualIp6Prefix="$2"
+			ipv6SubnetCalc "$2"
+		else
+			echo -ne "\n[${red}Warning${plain}] Only accept prefix format of IPv6 address, length from 1 to 128."
+			echo -ne "\nIPv6 CIDR Calculator: https://en.rakko.tools/tools/27/\n"
+			exit 1
+		fi
+	}
+}
+
+# To confuse whether ipv4 is dhcp or static and whether ipv6 is dhcp or static in Redhat like os in version 9 and later,
+# $1 is $NetCfgDir, $2 is $NetCfgFile, $3 is "ipv4" or "ipv6", $4 is "method="
+function checkIpv4OrIpv6ConfigForRedhat9Later() {
+	IpTypeLine="$(awk '/\['$3'\]/{print NR}' $1/$2 | head -n 2 | tail -n 1)"
+	ConnectTypeArray=()
+	CtaSpace=()
+	for tmpConnectType in $(awk '/'$4'/{print NR}' $1/$2); do
+		ConnectTypeArray+=("$tmpConnectType" "$ConnectTypeArray")
+		[[ $(expr $tmpConnectType - $IpTypeLine) -gt "0" ]] && CtaSpace+=($(expr "$tmpConnectType" - "$IpTypeLine") "$CtaSpace")
+	done
+	minArray=${CtaSpace[0]}
+	for ((i = 1; i <= $(grep -io "$4" $1/$2 | wc -l); i++)); do
+		for j in ${CtaSpace[@]}; do
+			[[ "$minArray" -gt "$j" ]] && minArray=$j
+		done
+	done
+	NetCfgLineNum=$(expr $minArray + $IpTypeLine)
+}
+
+# For those IPv6 only servers which Redhat series OS are need to be installed in environment of anaconda,
+# we need to assign a valid IPv6 config in grub so that "install.img" can be loaded.
+# Reference: https://www.golinuxcloud.com/ipv6-uefi-pxe-boot-kickstart-rhel-centos-8/#Step-8_Configure_grubcfg_Dracut_Kernel_Menu
+#            https://binaryfury.wann.net/2016/03/installing-centos-7-on-an-ipv6-only-system/
+function ipv6ForRedhatGrub() {
+	if [[ "$IPStackType" == "IPv6Stack" ]]; then
+		ipv6NameserverForKsGrub="nameserver=$ip6DNS1 nameserver=$ip6DNS2"
+		if [[ "$Network6Config" == "isStatic" ]]; then
+			ipv6StaticConfForKsGrub="noipv4 ip=[$ip6Addr]::[$ip6Gate]:$actualIp6Prefix::$interface:none $ipv6NameserverForKsGrub"
+		else
+			ipv6StaticConfForKsGrub="noipv4 $ipv6NameserverForKsGrub"
+		fi
+	fi
+}
+
+# If original system using DHCP, skip IP address, subnet mask, gateway, DNS server settings manually.
+# In many DHCP servers, manual settings may cause some additional problems.
+# For example, in Hetzner's machine, the network configuration of official template is DHCP for IPv4, STATIC for IPv6,
+# If we config both IPv4 and IPv6 as STATIC, IPv4 network will failure, even though according to the bullshit network config guide which provided by Hetzner:
+# https://docs.hetzner.com/cloud/servers/static-configuration/
+# So we need to distinguish whether IPv4 is DHCP or STATIC and whether IPv6 is DHCP or STATIC separately and clearly.
+
+# $1 is $CurrentOS, $2 is $CurrentOSVer, $3 is $IPStackType
+function checkDHCP() {
+	getInterface "$1"
+	[[ -z "$tmpDHCP" ]] && {
+		if [[ "$1" == 'CentOS' || "$1" == 'AlmaLinux' || "$1" == 'RockyLinux' || "$1" == 'Fedora' || "$1" == 'Vzlinux' || "$1" == 'OracleLinux' || "$1" == 'OpenCloudOS' || "$1" == 'AlibabaCloudLinux' || "$1" == 'ScientificLinux' || "$1" == 'AmazonLinux' || "$1" == 'RedHatEnterpriseLinux' || "$1" == 'OpenAnolis' || "$1" == 'CloudLinux' ]]; then
+			# RedHat like linux system 8 and before network config name is "ifcfg-interface", deposited in /etc/sysconfig/network-scripts/
+			# RedHat like linux system 9 and later network config name is "interface.nmconnection", deposited in /etc/NetworkManager/system-connections/
+			# In some templates like RockyLinux 9 x64 of DigitalOcean, both "/etc/sysconfig/network-scripts/ifcfg-eth0" and "/etc/NetworkManager/system-connections/ens3.nmconnection" are existed.
+			# in "ifcfg-eth0", BOOTPROTO=none; in "ens3.nmconnection", [ipv4] method=auto. the actually network adapter is "eth0", so the vaild network config file name is "ifcfg-eth0".
+			# So we need to check the type of the network configuration file to determine whether the method of config is dhcp or static.
+			if [[ "$NetCfgFile" =~ "ifcfg" ]]; then
+				# "BOOTPROTO=dhcp" is for IPv4 DHCP, "=none" or "=static" is Static.
+				# "IPv6_AUTOCONf=yes" or "DHCPV6C=yes" is IPv6 DHCP, "=no" is IPv6 Static.
+				# For IPv6 STATIC configuration, "IPv6_AUTOCONf=no" or "DHCPV6C=no" doesn't exist is allowed.
+				# For IPv6 DHCP configuration, "IPv6_AUTOCONf=yes" or "DHCPV6C=yes" is necessary.
+				# Reference: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/deployment_guide/s1-networkscripts-interfaces
+				if [[ "$3" == "IPv4Stack" ]]; then
+					Network6Config="isDHCP"
+					[[ -n $(timeout 4s grep -Ewirn "BOOTPROTO=none|BOOTPROTO=\"none\"|BOOTPROTO=\'none\'|BOOTPROTO=NONE|BOOTPROTO=\"NONE\"|BOOTPROTO=\'NONE\'|BOOTPROTO=static|BOOTPROTO=\"static\"|BOOTPROTO=\'static\'|BOOTPROTO=STATIC|BOOTPROTO=\"STATIC\"|BOOTPROTO=\'STATIC\'" $NetCfgWhole) ]] && Network4Config="isStatic" || Network4Config="isDHCP"
+				elif [[ "$3" == "BiStack" ]]; then
+					[[ -n $(timeout 4s grep -Ewirn "BOOTPROTO=none|BOOTPROTO=\"none\"|BOOTPROTO=\'none\'|BOOTPROTO=NONE|BOOTPROTO=\"NONE\"|BOOTPROTO=\'NONE\'|BOOTPROTO=static|BOOTPROTO=\"static\"|BOOTPROTO=\'static\'|BOOTPROTO=STATIC|BOOTPROTO=\"STATIC\"|BOOTPROTO=\'STATIC\'" $NetCfgWhole) ]] && Network4Config="isStatic" || Network4Config="isDHCP"
+					[[ -n $(timeout 4s grep -Ewirn "IPV6_AUTOCONF=yes|IPV6_AUTOCONF=\"yes\"|IPV6_AUTOCONF=YES|IPV6_AUTOCONF=\"YES\"|DHCPV6C=yes|DHCPV6C=\"yes\"" $NetCfgWhole) ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				elif [[ "$3" == "IPv6Stack" ]]; then
+					Network4Config="isDHCP"
+					[[ -n $(timeout 4s grep -Ewirn "IPV6_AUTOCONF=yes|IPV6_AUTOCONF=\"yes\"|IPV6_AUTOCONF=YES|IPV6_AUTOCONF=\"YES\"|DHCPV6C=yes|DHCPV6C=\"yes\"" $NetCfgWhole) ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				fi
+			elif [[ "$NetCfgFile" =~ "nmconnection" ]]; then
+				# In NetworkManager for Redhat 9 and later, IPv4 and IPv6 share the same config method and value like the following sample:
+				#
+				# [ethernet]
+				#
+				# [ipv4]
+				# method=auto
+				#
+				# [ipv6]
+				# addr-gen-mode=eui64
+				# method=auto
+				#
+				# So we need to import the function "checkIpv4OrIpv6ConfigForRedhat9Later" to confuse.
+				# which "method=auto or manual" is belonged to [ipv4], which "method=auto or manual" is belonged to [ipv6].
+				checkIpv4OrIpv6ConfigForRedhat9Later "$NetCfgDir" "$NetCfgFile" "ipv4" "method="
+				NetCfg4LineNum="$NetCfgLineNum"
+				checkIpv4OrIpv6ConfigForRedhat9Later "$NetCfgDir" "$NetCfgFile" "ipv6" "method="
+				NetCfg6LineNum="$NetCfgLineNum"
+				if [[ "$3" == "IPv4Stack" ]]; then
+					Network6Config="isDHCP"
+					[[ $(timeout 4s sed -n "$NetCfg4LineNum"p $NetCfgWhole) == "method=auto" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+				elif [[ "$3" == "BiStack" ]]; then
+					[[ $(timeout 4s sed -n "$NetCfg4LineNum"p $NetCfgWhole) == "method=auto" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+					[[ $(timeout 4s sed -n "$NetCfg6LineNum"p $NetCfgWhole) == "method=auto" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				elif [[ "$3" == "IPv6Stack" ]]; then
+					Network4Config="isDHCP"
+					[[ $(timeout 4s sed -n "$NetCfg6LineNum"p $NetCfgWhole) == "method=auto" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				fi
+			fi
+		elif [[ "$1" == 'Debian' ]] || [[ "$1" == 'Kali' ]] || [[ "$1" == 'Ubuntu' ]] || [[ "$1" == 'AlpineLinux' ]]; then
+			if [[ "$networkManagerType" == "ifupdown" ]]; then
+				# Debian network configs may be deposited in the following directions.
+				# /etc/network/interfaces or /etc/network/interfaces.d/interface or /run/network/interfaces.d/interface
+				if [[ "$3" == "IPv4Stack" ]]; then
+					Network6Config="isDHCP"
+					[[ $(timeout 4s grep -iw "iface" $NetCfgWhole | grep -iw "$interface4" | grep -iw "inet" | grep -ic "auto\|dhcp") -ge "1" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+				elif [[ "$3" == "BiStack" ]]; then
+					[[ $(timeout 4s grep -iw "iface" $NetCfgWhole | grep -iw "$interface4" | grep -iw "inet" | grep -ic "auto\|dhcp") -ge "1" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+					[[ $(timeout 4s grep -iw "iface" $NetCfgWhole | grep -iw "$interface6" | grep -iw "inet6" | grep -ic "auto\|dhcp") -ge "1" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				elif [[ "$3" == "IPv6Stack" ]]; then
+					Network4Config="isDHCP"
+					[[ $(timeout 4s grep -iw "iface" $NetCfgWhole | grep -iw "$interface6" | grep -iw "inet6" | grep -ic "auto\|dhcp") -ge "1" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				fi
+				# Configure method in OVH can't boot with dhcp.
+				[[ -n $(timeout 4s grep "accept_ra" $NetCfgWhole) ]] && {
+					Network4Config="isStatic"
+					Network6Config="isStatic"
+				}
+			elif [[ "$networkManagerType" == "netplan" ]]; then
+				# For netplan(Ubuntu 18 and later), if network configuration is Static whether IPv4 or IPv6.
+				# in "*.yaml" config file, dhcp(4 or 6): no or false doesn't exist is allowed.
+				# But if is DHCP, dhcp(4 or 6): yes or true is necessary.
+				# Typical format of dhcp status in "*.yaml" is "dhcp4/6: true/false" or "dhcp4/6: yes/no".
+				# The raw sample processed by function "parseYaml" is: " network_ethernets_enp1s0_dhcp4="true" network_ethernets_enp1s0_dhcp6="true" ".
+				[[ ! -z "$NetCfgWhole" ]] && {
+					dhcp4Status=$(parseYaml "$NetCfgWhole" | grep "$interface4" | grep "dhcp")
+					dhcp6Status=$(parseYaml "$NetCfgWhole" | grep "$interface6" | grep "dhcp")
+				}
+				if [[ "$3" == "IPv4Stack" ]]; then
+					Network6Config="isDHCP"
+					[[ "$dhcp4Status" =~ "dhcp4=\"true\"" || "$dhcp4Status" =~ "dhcp4=\"yes\"" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+				elif [[ "$3" == "BiStack" ]]; then
+					[[ "$dhcp4Status" =~ "dhcp4=\"true\"" || "$dhcp4Status" =~ "dhcp4=\"yes\"" ]] && Network4Config="isDHCP" || Network4Config="isStatic"
+					[[ "$dhcp6Status" =~ "dhcp6=\"true\"" || "$dhcp6Status" =~ "dhcp6=\"yes\"" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				elif [[ "$3" == "IPv6Stack" ]]; then
+					Network4Config="isDHCP"
+					[[ "$dhcp6Status" =~ "dhcp6=\"true\"" || "$dhcp6Status" =~ "dhcp6=\"yes\"" ]] && Network6Config="isDHCP" || Network6Config="isStatic"
+				fi
+			fi
+		fi
+		rm -rf "$tmpNetcfgDir"
+	}
+	[[ "$Network4Config" == "" ]] && Network4Config="isStatic"
+	[[ "$Network6Config" == "" ]] && Network6Config="isStatic"
+}
+
+# $1 is "$tmpDHCP", $2 is "$virtWhat", $3 is "$virtType".
+# For GCP, network config method for netboot kernel must be static.
+# In official template of Debian 10-11, Ubuntu 20.04-22.04 of GCP, the result of "virt-what" can only be shown as "kvm", so we need to figure out the actual manufacturer from both "$virtWhat" and "$virtType".
+function setDhcpOrStatic() {
+	[[ "$1" == "dhcp" || "$1" == "auto" || "$1" == "automatic" || "$1" == "true" || "$1" == "yes" || "$1" == "1" ]] && {
+		Network4Config="isDHCP"
+		Network6Config="isDHCP"
+	}
+	[[ "$1" == "static" || "$1" == "manual" || "$1" == "none" || "$1" == "false" || "$1" == "no" || "$1" == "0" || -n $(echo $2 $3 | grep -io 'google') ]] && {
+		Network4Config="isStatic"
+		Network6Config="isStatic"
+	}
+}
+
+# $1 is "in-target", $2 is "/etc/network/interfaces", $3 is "/etc/sysctl.d/99-sysctl.conf".
+function DebianModifiedPreseed() {
+	if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]]; then
+		debianConfFileDir="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Debian"
+		debianConfFileDirCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Debian"
+		# Must use ";" instead of using "&&", "echo -e" etc to combine multiple commands, or write text in files, recommend sed.
+		# Can't pass parameters correctly in preseed environment.
+		# DebianVimVer=`ls -a /usr/share/vim | grep vim[0-9]`
+		if [[ "$DebianDistNum" -ge "9" && "$DebianDistNum" -le "11" ]]; then
+			DebianVimVer="vim"$(expr ${DebianDistNum} + 71)
+		elif [[ "$DebianDistNum" -ge "12" ]]; then
+			DebianVimVer="vim"$(expr ${DebianDistNum} + 78)
+		elif [[ "$DIST" =~ "kali-" ]]; then
+			DebianVimVer="vim90"
+		else
+			DebianVimVer=""
+		fi
+		# Set parameter "mouse-=a" in /usr/share/vim/vim-version/defaults.vim to support copy text from terminal to client.
+		VimSupportCopy="$1 sed -i 's/set mouse=a/set mouse-=a/g' /usr/share/vim/${DebianVimVer}/defaults.vim;"
+		# Enable cursor edit backspace freely in insert mode.
+		# Reference: https://wonderwall.hatenablog.com/entry/2016/03/23/232634
+		VimIndentEolStart="$1 sed -i 's/set compatible/set nocompatible/g' /etc/vim/vimrc.tiny; $1 sed -i '/set nocompatible/a\set backspace=2' /etc/vim/vimrc.tiny;"
+		[[ "$DebianVimVer" == "" ]] && {
+			VimSupportCopy=""
+			VimIndentEolStart=""
+		}
+		# Fail2ban configurations.
+		# Reference: https://github.com/fail2ban/fail2ban/issues/2756
+		#            https://www.mail-archive.com/debian-bugs-dist@lists.debian.org/msg1879390.html
+		[[ "$setFail2banStatus" == "1" ]] && {
+			EnableFail2ban="$1 sed -i '/^\[Definition\]/a allowipv6 = auto' /etc/fail2ban/fail2ban.conf; $1 sed -ri 's/^backend = auto/backend = systemd/g' /etc/fail2ban/jail.conf; $1 update-rc.d fail2ban enable; $1 /etc/init.d/fail2ban restart;"
+			fail2banComponent="fail2ban"
+		}
+		AptUpdating="$1 apt update -y;"
+		# pre-install some commonly used software.
+		InstallComponents="$1 apt install apt-transport-https ca-certificates cron curl dnsutils dpkg ${fail2banComponent} file lrzsz lsb-release net-tools sudo vim wget -y;"
+		# In Debian 9 and former, some certificates are expired.
+		DisableCertExpiredCheck="$1 sed -i '/^mozilla\/DST_Root_CA_X3/s/^/!/' /etc/ca-certificates.conf; $1 update-ca-certificates -f;"
+		if [[ "$IsCN" == "cn" ]]; then
+			# Modify /root/.bashrc to support colorful filename.
+			ChangeBashrc="$1 rm -rf /root/.bashrc; $1 wget --no-check-certificate -qO /root/.bashrc '${debianConfFileDirCn}/.bashrc';"
+			# Need to install "resolvconf" manually after all installation ended, logged into new system.
+			# DNS server validation must setting up in installed system, can't in preseeding!
+			# Set China DNS server from Tencent Cloud and Alibaba Cloud permanently.
+			[[ "$setDns" == "1" ]] && SetDNS="CNResolvHead" DnsChangePermanently="$1 mkdir -p /etc/resolvconf/resolv.conf.d/; $1 wget --no-check-certificate -qO /etc/resolvconf/resolv.conf.d/head '${debianConfFileDirCn}/network/${SetDNS}';" || DnsChangePermanently=""
+			# Modify logging in welcome information(Message Of The Day) of Debian and make it more pretty.
+			[[ "$setMotd" == "1" ]] && ModifyMOTD="$1 rm -rf /etc/update-motd.d/ /etc/motd /run/motd.dynamic; $1 mkdir -p /etc/update-motd.d/; $1 wget --no-check-certificate -qO /etc/update-motd.d/00-header '${debianConfFileDirCn}/updatemotd/00-header'; $1 wget --no-check-certificate -qO /etc/update-motd.d/10-sysinfo '${debianConfFileDirCn}/updatemotd/10-sysinfo'; $1 wget --no-check-certificate -qO /etc/update-motd.d/90-footer '${debianConfFileDirCn}/updatemotd/90-footer'; $1 chmod +x /etc/update-motd.d/00-header; $1 chmod +x /etc/update-motd.d/10-sysinfo; $1 chmod +x /etc/update-motd.d/90-footer;" || ModifyMOTD=""
+		else
+			ChangeBashrc="$1 rm -rf /root/.bashrc; $1 wget --no-check-certificate -qO /root/.bashrc '${debianConfFileDir}/.bashrc';"
+			# Set DNS server from Cloudflare and Google permanently.
+			[[ "$setDns" == "1" ]] && SetDNS="NomalResolvHead" DnsChangePermanently="$1 mkdir -p /etc/resolvconf/resolv.conf.d/; $1 wget --no-check-certificate -qO /etc/resolvconf/resolv.conf.d/head '${debianConfFileDir}/network/${SetDNS}';" || DnsChangePermanently=""
+			[[ "$setMotd" == "1" ]] && ModifyMOTD="$1 rm -rf /etc/update-motd.d/ /etc/motd /run/motd.dynamic; $1 mkdir -p /etc/update-motd.d/; $1 wget --no-check-certificate -qO /etc/update-motd.d/00-header '${debianConfFileDir}/updatemotd/00-header'; $1 wget --no-check-certificate -qO /etc/update-motd.d/10-sysinfo '${debianConfFileDir}/updatemotd/10-sysinfo'; $1 wget --no-check-certificate -qO /etc/update-motd.d/90-footer '${debianConfFileDir}/updatemotd/90-footer'; $1 chmod +x /etc/update-motd.d/00-header; $1 chmod +x /etc/update-motd.d/10-sysinfo; $1 chmod +x /etc/update-motd.d/90-footer;" || ModifyMOTD=""
+		fi
+		# For multiple interfaces environment, if the interface which is configurated by "auto", regardless of it is plugged by internet cable,
+		# Debian/Kali will continuously try to wake and start up it contains with dhcp even timeout.
+		# Set up with "allow-hotplug(default setting by Debian/Kali installer)" will skip this problem, but if one interface has more than 1 IP or it will connect to
+		# another network bridge, when system restarted, the interfaces' initialization will be failed, in most of VPS environments, the interfaces of machine should be stable,
+		# so replace the default from "allow-hotplug" to "auto" for interfaces config method is a better idea?
+		[[ "$autoPlugAdapter" == "1" ]] && AutoPlugInterfaces="$1 sed -ri \"s/allow-hotplug $interface4/auto $interface4/g\" $2; $1 sed -ri \"s/allow-hotplug $interface6/auto $interface6/g\" $2;" || AutoPlugInterfaces=""
+		# If the network config type of server is DHCP and it have both public IPv4 and IPv6 address,
+		# Debian install program even get nerwork config with DHCP, but after log into new system,
+		# only the IPv4 of the server has been configurated.
+		# so need to write "iface interface inet6 dhcp" to /etc/network/interfaces in preseeding process for Bi-stack machine,
+		# to avoid config IPv6 manually after log into new system.
+		SupportIPv6orIPv4=""
+		ReplaceActualIpPrefix=""
+		if [[ "$IPStackType" == "IPv4Stack" ]]; then
+			[[ "$BurnIrregularIpv4Status" == "1" ]] && BurnIrregularIpv4Gate="$1 sed -i '\$a\\\tgateway $actualIp4Gate' $2;"
+			# This IPv4Stack machine should be setting as IPv4 network accessing priority.
+			SupportIPv6orIPv4="$1 sed -i '\$aprecedence ::ffff:0:0/96' /etc/gai.conf;"
+			ReplaceActualIpPrefix="$1 sed -ri \"s/address $ipAddr\/$ipPrefix/address $ipAddr\/$actualIp4Prefix/g\" $2;"
+			[[ "$iAddrNum" -ge "2" ]] && {
+				writeMultipleIpv4Addresses "$iAddrNum" "$1" ''$2''
+				SupportIPv6orIPv4="$SupportMultipleIPv4"
+			}
+		elif [[ "$IPStackType" == "BiStack" ]]; then
+			# Enable IPv4 dhcp or static configurations.
+			if [[ "$BiStackPreferIpv6Status" == "1" ]]; then
+				if [[ "$Network4Config" == "isDHCP" ]]; then
+					SupportIPv6orIPv4="$1 sed -i '\$aiface $interface inet dhcp' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					[[ -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && SupportIPv6orIPv4="$1 sed -i '\$a\ ' $2; $1 sed -i '\$aallow-hotplug $interface4' $2; $1 sed -i '\$aiface $interface4 inet dhcp' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					ReplaceActualIpPrefix="$1 sed -ri \"s/address $ip6Addr\/$ip6Mask/address $ip6Addr\/$actualIp6Prefix/g\" $2;"
+				elif [[ "$Network4Config" == "isStatic" ]]; then
+					SupportIPv6orIPv4="$1 sed -i '\$aiface $interface inet static' $2; $1 sed -i '\$a\\\taddress $ipAddr' $2; $1 sed -i '\$a\\\tnetmask $MASK' $2; $1 sed -i '\$a\\\tgateway $GATE' $2; $1 sed -i '\$a\\\tdns-nameservers $ipDNS' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					[[ -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && SupportIPv6orIPv4="$1 sed -i '\$a\ ' $2; $1 sed -i '\$aallow-hotplug $interface4' $2; $1 sed -i '\$aiface $interface4 inet static' $2; $1 sed -i '\$a\\\taddress $ipAddr' $2; $1 sed -i '\$a\\\tnetmask $MASK' $2; $1 sed -i '\$a\\\tgateway $GATE' $2; $1 sed -i '\$a\\\tdns-nameservers $ipDNS' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					ReplaceActualIpPrefix="$1 sed -ri \"s/address $ip6Addr\/$ip6Mask/address $ip6Addr\/$actualIp6Prefix/g\" $2; $1 sed -ri \"s/netmask $MASK/netmask $actualIp4Subnet/g\" $2;"
+				fi
+			else
+				[[ "$BurnIrregularIpv4Status" == "1" ]] && BurnIrregularIpv4Gate="$1 sed -i '\$a\\\tgateway $actualIp4Gate' $2;"
+				if [[ "$Network6Config" == "isDHCP" ]]; then
+					# Enable IPv6 dhcp and set prefer IPv6 access for BiStack or IPv6Stack machine: add "label 2002::/16", "label 2001:0::/32" in last line of the "/etc/gai.conf"
+					SupportIPv6orIPv4="$1 sed -i '\$aiface $interface inet6 dhcp' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					[[ -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && SupportIPv6orIPv4="$1 sed -i '\$a\ ' $2; $1 sed -i '\$aallow-hotplug $interface6' $2; $1 sed -i '\$aiface $interface6 inet6 dhcp' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					ReplaceActualIpPrefix="$1 sed -ri \"s/address $ipAddr\/$ipPrefix/address $ipAddr\/$actualIp4Prefix/g\" $2;"
+				elif [[ "$Network6Config" == "isStatic" ]]; then
+					SupportIPv6orIPv4="$1 sed -i '\$aiface $interface inet6 static' $2; $1 sed -i '\$a\\\taddress $ip6Addr' $2; $1 sed -i '\$a\\\tnetmask $ip6Mask' $2; $1 sed -i '\$a\\\tgateway $ip6Gate' $2; $1 sed -i '\$a\\\tdns-nameservers $ip6DNS' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					[[ -n "$interface4" && -n "$interface6" && "$interface4" != "$interface6" ]] && SupportIPv6orIPv4="$1 sed -i '\$a\ ' $2; $1 sed -i '\$aallow-hotplug $interface6' $2; $1 sed -i '\$aiface $interface6 inet6 static' $2; $1 sed -i '\$a\\\taddress $ip6Addr' $2; $1 sed -i '\$a\\\tnetmask $ip6Mask' $2; $1 sed -i '\$a\\\tgateway $ip6Gate' $2; $1 sed -i '\$a\\\tdns-nameservers $ip6DNS' $2; $1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+					ReplaceActualIpPrefix="$1 sed -ri \"s/address $ipAddr\/$ipPrefix/address $ipAddr\/$actualIp4Prefix/g\" $2; $1 sed -ri \"s/netmask $ip6Mask/netmask $actualIp6Prefix/g\" $2;"
+				fi
+			fi
+			[[ "$iAddrNum" -ge "2" || "$i6AddrNum" -ge "2" ]] && {
+				writeMultipleIpv4Addresses "$iAddrNum" "$1" ''$2''
+				writeMultipleIpv6Addresses "$i6AddrNum" "$1" ''$2''
+				if [[ "$iAddrNum" == "1" || "$i6AddrNum" == "1" ]]; then
+					SupportIPv6orIPv4="$SupportMultipleIPv4 $SupportMultipleIPv6 $SupportIPv6orIPv4"
+				else
+					SupportIPv6orIPv4="$SupportMultipleIPv4 $SupportMultipleIPv6"
+				fi
+			}
+		elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+			[[ "$BurnIrregularIpv6Status" == "1" ]] && BurnIrregularIpv6Gate="$1 sed -i '\$a\\\tgateway $ip6Gate' $2;"
+			# This IPv6Stack machine should be setting as IPv6 network accessing priority.
+			SupportIPv6orIPv4="$1 sed -i '\$alabel 2002::/16' /etc/gai.conf; $1 sed -i '\$alabel 2001:0::/32' /etc/gai.conf;"
+			ReplaceActualIpPrefix="$1 sed -ri \"s/address $ip6Addr\/$ip6Mask/address $ip6Addr\/$actualIp6Prefix/g\" $2;"
+			[[ "$i6AddrNum" -ge "2" ]] && {
+				writeMultipleIpv6Addresses "$i6AddrNum" "$1" ''$2''
+				SupportIPv6orIPv4="$SupportMultipleIPv6"
+			}
+		fi
+		# a typical network configuration sample of IPv6 static for Debian:
+		# iface eth0 inet static
+		#         address 10.0.0.72
+		#         netmask 255.255.255.0
+		#         gateway 10.0.0.1
+		#         dns-nameservers 1.0.0.1 8.4.4.8
+		#
+		# a typical network configuration sample of IPv6 static for Debian:
+		# iface eth0 inet6 static
+		#         address 2702:b43c:492a:9d1e:8270:fd59:6de4:20f1
+		#         netmask 128
+		#         gateway fe80::200:17ff:fe9e:f9d0
+		#         dns-nameservers 2606:4700:4700::1001 2001:4860:4860::8844
+		[[ "$linux_relese" == 'kali' ]] && {
+			ChangeBashrc=""
+			# Enable Kali ssh service.
+			EnableSSH="$1 update-rc.d ssh enable; $1 /etc/init.d/ssh restart;"
+			# Revise terms of license from "Debian" to "Kali" in motd file of "00-header".
+			ReviseMOTD="$1 sed -ri 's/Debian/Kali/g' /etc/update-motd.d/00-header;"
+			SupportZSH="$1 apt install zsh -y; $1 chsh -s /bin/zsh; $1 rm -rf /root/.bashrc.original;"
+		}
+		# Write the following configs to "/etc/sysctl.d/99-sysctl.conf", including network optimization:
+		#
+		# net.core.default_qdisc = fq
+		# net.ipv4.tcp_congestion_control = bbr
+		# net.ipv4.tcp_rmem = 8192 262144 536870912
+		# net.ipv4.tcp_wmem = 4096 16384 536870912
+		# net.ipv4.tcp_adv_win_scale = -2
+		# net.ipv4.tcp_collapse_max_bytes = 6291456
+		# net.ipv4.tcp_notsent_lowat = 131072
+		# net.ipv4.ip_local_port_range = 1024 65535
+		# net.core.rmem_max = 536870912
+		# net.core.wmem_max = 536870912
+		# net.core.somaxconn = 32768
+		# net.core.netdev_max_backlog = 32768
+		# net.ipv4.tcp_max_tw_buckets = 65536
+		# net.ipv4.tcp_abort_on_overflow = 1
+		# net.ipv4.tcp_slow_start_after_idle = 0
+		# net.ipv4.tcp_timestamps = 1
+		# net.ipv4.tcp_syncookies = 0
+		# net.ipv4.tcp_syn_retries = 3
+		# net.ipv4.tcp_synack_retries = 3
+		# net.ipv4.tcp_max_syn_backlog = 32768
+		# net.ipv4.tcp_fin_timeout = 15
+		# net.ipv4.tcp_keepalive_intvl = 3
+		# net.ipv4.tcp_keepalive_probes = 5
+		# net.ipv4.tcp_keepalive_time = 600
+		# net.ipv4.tcp_retries1 = 3
+		# net.ipv4.tcp_retries2 = 5
+		# net.ipv4.tcp_no_metrics_save = 1
+		# net.ipv4.ip_forward = 1
+		# fs.file-max = 104857600
+		# fs.inotify.max_user_instances = 8192
+		# fs.nr_open = 1048576
+		#
+		# Note: Module "tcp_collapse_max_bytes" is a self completion of Cloudflare, users need to download and apply patches by themselves otherwise this module will not be in effect.
+		#
+		# Reference:
+		# 1. Settings of enable BBR:
+		# https://qiita.com/yoshuuua/items/daa9d04089d416afbf94 BBR推奨のパケットスケジューラーのキューイングアルゴリズムによるソケットバッファ枯渇問題
+		#                                                       Problem of exhaustion of socket buffer due to default queuing algorithm of packet scheduler of BBR
+		# 2. TCP optimization for shuttling to Cloudflare:
+		# https://blog.cloudflare.com/optimizing-tcp-for-high-throughput-and-low-latency/ Optimizing TCP for high WAN throughput while preserving low latency
+		#
+		# 3. Third part patches for Linux kernel which were provided by CloudFlare:
+		# https://github.com/cloudflare/linux/tree/master/patches
+		#
+		# 4. https://github.com/MoeClub/Note/blob/master/LinuxInit.sh
+		#
+		# 5. https://www.nodeseek.com/post-37225-1
+		#
+		# 6. https://www.starduster.me/2020/03/02/linux-network-tuning-kernel-parameter/
+		#
+		# 7. https://zhuanlan.zhihu.com/p/149372947
+		#
+		# 8. https://my.oschina.net/alchemystar/blog/4712110
+		#
+		# 9. http://performance.oreda.net/linux/configuration/sysctl 高負荷·大規模システムのLinuxカーネル·チューニング Linux kernel tuning for high availability and large scale system.
+		#
+		# To enable BBR is only suitable for Debian 11+
+		[[ "$enableBBR" == "1" ]] && [[ "$DebianDistNum" -ge "11" || "$linux_relese" == "kali" ]] && {
+			EnableBBR="$1 sed -i '\$anet.core.default_qdisc = fq' $3; $1 sed -i '\$anet.ipv4.tcp_congestion_control = bbr' $3; $1 sed -i '\$anet.ipv4.tcp_rmem = 8192 262144 536870912' $3; $1 sed -i '\$anet.ipv4.tcp_wmem = 4096 16384 536870912' $3; $1 sed -i '\$anet.ipv4.tcp_adv_win_scale = -2' $3; $1 sed -i '\$anet.ipv4.tcp_collapse_max_bytes = 6291456' $3; $1 sed -i '\$anet.ipv4.tcp_notsent_lowat = 131072' $3; $1 sed -i '\$anet.ipv4.ip_local_port_range = 1024 65535' $3; $1 sed -i '\$anet.core.rmem_max = 536870912' $3; $1 sed -i '\$anet.core.wmem_max = 536870912' $3; $1 sed -i '\$anet.core.somaxconn = 32768' $3; $1 sed -i '\$anet.core.netdev_max_backlog = 32768' $3; $1 sed -i '\$anet.ipv4.tcp_max_tw_buckets = 65536' $3; $1 sed -i '\$anet.ipv4.tcp_abort_on_overflow = 1' $3; $1 sed -i '\$anet.ipv4.tcp_slow_start_after_idle = 0' $3; $1 sed -i '\$anet.ipv4.tcp_timestamps = 1' $3; $1 sed -i '\$anet.ipv4.tcp_syncookies = 0' $3; $1 sed -i '\$anet.ipv4.tcp_syn_retries = 3' $3; $1 sed -i '\$anet.ipv4.tcp_synack_retries = 3' $3; $1 sed -i '\$anet.ipv4.tcp_max_syn_backlog = 32768' $3; $1 sed -i '\$anet.ipv4.tcp_fin_timeout = 15' $3; $1 sed -i '\$anet.ipv4.tcp_keepalive_intvl = 3' $3; $1 sed -i '\$anet.ipv4.tcp_keepalive_probes = 5' $3; $1 sed -i '\$anet.ipv4.tcp_keepalive_time = 600' $3; $1 sed -i '\$anet.ipv4.tcp_retries1 = 3' $3; $1 sed -i '\$anet.ipv4.tcp_retries2 = 5' $3; $1 sed -i '\$anet.ipv4.tcp_no_metrics_save = 1' $3; $1 sed -i '\$anet.ipv4.ip_forward = 1' $3; $1 sed -i '\$afs.file-max = 104857600' $3; $1 sed -i '\$afs.inotify.max_user_instances = 8192' $3; $1 sed -i '\$afs.nr_open = 1048576' $3; $1 systemctl restart systemd-sysctl;"
+		} || {
+			EnableBBR=""
+		}
+		# For some cloud providers which servers boot from their own grub2 bootloader first by force, not boot from grub in harddisk of our own servers directly,
+		# we need to creat a soft link for grub2 from grub1 to make sure the first reboot after installation won't meet a fatal.
+		# In this situation, the partition table and filesystem of the newly installed OS must be "mbr" and "ext4".
+		# This case has been occurred in these cloud providers such as "app.cloudcone.com", "www.readyidc.com".
+		CreateSoftLinkToGrub2FromGrub1="$1 ln -s /boot/grub/ /boot/grub2;"
+		# Statement of "grub-pc/timeout" in "preseed.cfg" is only valid for BIOS.
+		[[ "$EfiSupport" == "enabled" ]] && SetGrubTimeout="$1 sed -ri 's/GRUB_TIMEOUT=5/GRUB_TIMEOUT=3/g' /etc/default/grub; $1 sed -ri 's/set timeout=5/set timeout=3/g' /boot/grub/grub.cfg;" || SetGrubTimeout=""
+		export DebianModifiedProcession="${AptUpdating} ${InstallComponents} ${DisableCertExpiredCheck} ${ChangeBashrc} ${VimSupportCopy} ${VimIndentEolStart} ${DnsChangePermanently} ${ModifyMOTD} ${BurnIrregularIpv4Gate} ${BurnIrregularIpv6Gate} ${SupportIPv6orIPv4} ${ReplaceActualIpPrefix} ${AutoPlugInterfaces} ${EnableSSH} ${ReviseMOTD} ${SupportZSH} ${EnableFail2ban} ${EnableBBR} ${CreateSoftLinkToGrub2FromGrub1} ${SetGrubTimeout}"
+	fi
+}
+
+function DebianPreseedProcess() {
+	if [[ "$setAutoConfig" == "1" ]]; then
+		# Debian security mirror of Tsinghua University: https://mirrors.tuna.tsinghua.edu.cn/help/debian/
+		if [[ "$linux_relese" == 'debian' ]]; then
+			[[ "$IsCN" == "cn" ]] && debianSecurityMirror="mirrors.tuna.tsinghua.edu.cn" || debianSecurityMirror="security.debian.org"
+		fi
+		# Debian linux cloud kernel only include drivers of network adapter can reduce resource usage for most virtual servers.
+		# If target system need to set a raid recipe, to make sure to support more disk controllers, cloud kernel should not be installed.
+		# Reference: https://docs.software-univention.de/installation-4.4.pdf
+		#            https://unix.stackexchange.com/questions/639608/difference-between-debians-linux-image-cloud-amd64-and-linux-image-amd64
+		addCloudKernelCmd="d-i base-installer/kernel/image string"
+		if [[ "$setCloudKernel" == "" ]]; then
+			[[ -n "$virtWhat" ]] && {
+				[[ "$linux_relese" == 'debian' && "$DebianDistNum" -ge "11" || "$linux_relese" == 'kali' ]] && AddCloudKernel="$addCloudKernelCmd linux-image-cloud-$VER" || AddCloudKernel=""
+			}
+		elif [[ "$setCloudKernel" == "1" ]]; then
+			[[ "$linux_relese" == 'debian' && "$DebianDistNum" -ge "11" || "$linux_relese" == 'kali' ]] && AddCloudKernel="$addCloudKernelCmd linux-image-cloud-$VER" || AddCloudKernel=""
+		fi
+		# Despite VMware and Virtualbox are some kinds of virtualizations but Cloud kernel isn't suitable for them otherwise Debian series will meet a fatal when booting into the newly installed system.
+		[[ -n "$setRaid" || "$ddMode" == '1' || -n $(echo $virtWhat | grep -io 'vmware\|virtualbox') ]] && AddCloudKernel=""
+		ddWindowsEarlyCommandsOfAnna='anna-install libfuse2-udeb fuse-udeb ntfs-3g-udeb libcrypto3-udeb libpcre2-8-0-udeb libssl3-udeb libuuid1-udeb zlib1g-udeb wget-udeb'
+		tmpDdWinsEarlyCommandsOfAnna="$ddWindowsEarlyCommandsOfAnna"
+		setNormalRecipe "$linux_relese" "$disksNum" "$setSwap" "$setDisk" "$partitionTable" "$setFileSystem" "$EfiSupport" "$diskCapacity" "$IncDisk" "$AllDisks"
+		setRaidRecipe "$setRaid" "$disksNum" "$AllDisks" "$linux_relese"
+		# Debian 11 and former versions couldn't accept irregular IPv6 format configs, they can only be recognized by Debian 12+ and Kali, dd mode(base system is Debian 12) prefer IPv4 to config network.
+		if [[ "$BiStackPreferIpv6Status" == "1" ]]; then
+			if [[ "$interfacesNum" -ge "2" ]] || [[ "$linux_relese" == 'debian' && "$DebianDistNum" -le "11" ]] || [[ "$ddMode" == '1' ]]; then
+				BiStackPreferIpv6Status=""
+				BurnIrregularIpv6Status=""
+				BurnIrregularIpv4Status='1'
+				interfaceSelect="$interface4"
+			fi
+		fi
+		# A valid method to add an irregular gateway by force:
+		# This method aims to hack IPv4 network service and add IPv4 route by force in busybox, so we need to assign "none" for "d-i netcfg/get_gateway string" to avoid Debian installer report "unreachable gateway",
+		# don't forget to write IPv4 gateway back in "d-i preseed/late_command" stage.
+		# Reference: https://lab.civicrm.org/infra/ops/blob/master/ansible/roles/kvm-server/templates/etc/preseeds/host/preseed.cfg
+		#
+		# Reserved empty variables for engineering debugging, if you are not known them well, don't uncomment with them!
+		# BurnIrregularIpv4Status='1'
+		# ipPrefix=""
+		# MASK=""
+		[[ Network4Config == "isDHCP" ]] && BurnIrregularIpv4Status='0'
+		[[ "$BurnIrregularIpv4Status" == "1" ]] && {
+			actualIp4Gate="$GATE"
+			GATE="none"
+			if [[ "$IPStackType" == "IPv4Stack" ]]; then
+				writeDnsByForce='echo '\''nameserver '$ipDNS1''\'' > /etc/resolv.conf && echo '\''nameserver '$ipDNS2''\'' >> /etc/resolv.conf'
+			elif [[ "$IPStackType" == "BiStack" ]]; then
+				writeDnsByForce='echo '\''nameserver '$ipDNS1''\'' > /etc/resolv.conf && echo '\''nameserver '$ip6DNS1''\'' >> /etc/resolv.conf && echo '\''nameserver '$ipDNS2''\'' >> /etc/resolv.conf && echo '\''nameserver '$ip6DNS2''\'' >> /etc/resolv.conf'
+			fi
+			# If subnet of some machines of IPv4 config is "32"(255.255.255.255) means the intranet range is smallest, just including the server itself,
+			# the "onlink" must be included in command of adding gateway(route) by force via soft hack, for example:
+			#
+			# ip route add default via 10.0.0.1 dev eth0 onlink
+			#
+			# to tell the networking service that the gateway of "10.0.0.1" will serve the device of network adapter "eth0" via "onlink" by IPv4 stack protocol
+			# because "onlink" stipulates networking to establish a connection from local to gateway by "arp" directly without creating any area of intranet.
+			[[ "$ddMode" == '0' ]] && tmpDdWinsEarlyCommandsOfAnna=''
+			BurnIrregularIpv4ByForce=$(echo -e 'd-i preseed/early_command string ip link set dev '$interface4' up; ip addr add '$IPv4'/'$ipPrefix' dev '$interface4'; echo "(ip route add '$actualIp4Gate' dev '$interface4' || true) && (ip route add default via '$actualIp4Gate' dev '$interface4' onlink || true) && '$writeDnsByForce'" > /bin/ethdetect; echo "(test -x /bin/ethdetect && /bin/ethdetect) || true" >> /usr/share/debconf/confmodule; '$tmpDdWinsEarlyCommandsOfAnna'')
+		}
+		# Prefer to use IPv4 stack to config networking.
+		if [[ "$IPStackType" == "IPv4Stack" ]] || [[ "$IPStackType" == "BiStack" && "$BiStackPreferIpv6Status" != "1" ]]; then
+			[[ "$Network4Config" == "isStatic" ]] && NetConfigManually=$(echo -e "d-i netcfg/disable_autoconfig boolean true\nd-i netcfg/dhcp_failed note\nd-i netcfg/dhcp_options select Configure network manually\nd-i netcfg/get_ipaddress string $IPv4\nd-i netcfg/get_netmask string $MASK\nd-i netcfg/get_gateway string $GATE\nd-i netcfg/get_nameservers string $ipDNS\nd-i netcfg/no_default_route boolean true\nd-i netcfg/confirm_static boolean true") || NetConfigManually=""
+			# Prefer to use IPv6 stack to configure network because Debian 12 supports public IPv6 address with private gateway like "fe80::1" and works well,
+			# if IPv4 configuration of one BiStack server has public IPv4 and private gateway like "172.31.1.1" because this case will cause Debian installer notices "unreachable gateway".
+		elif [[ "$IPStackType" == "IPv6Stack" ]] || [[ "$IPStackType" == "BiStack" && "$BiStackPreferIpv6Status" == "1" ]]; then
+			[[ "$Network6Config" == "isStatic" ]] && NetConfigManually=$(echo -e "d-i netcfg/disable_autoconfig boolean true\nd-i netcfg/dhcp_failed note\nd-i netcfg/dhcp_options select Configure network manually\nd-i netcfg/get_ipaddress string $ip6Addr\nd-i netcfg/get_netmask string $ip6Subnet\nd-i netcfg/get_gateway string $ip6Gate\nd-i netcfg/get_nameservers string $ip6DNS\nd-i netcfg/no_default_route boolean true\nd-i netcfg/confirm_static boolean true") || NetConfigManually=""
+		fi
+		# The similar principle as hacking IPv4.
+		[[ "$BurnIrregularIpv6Status" == "1" ]] && {
+			writeDnsByForce='echo '\''nameserver '$ip6DNS1''\'' > /etc/resolv.conf && echo '\''nameserver '$ip6DNS2''\'' >> /etc/resolv.conf'
+			BurnIrregularIpv6ByForce=$(echo -e 'd-i preseed/early_command string ip link set dev '$interface6' up; ip -6 addr add '$ip6Addr'/'$actualIp6Prefix' dev '$interface6'; echo "(ip -6 route add '$ip6Gate' dev '$interface6' || true) && (ip -6 route add default via '$ip6Gate' dev '$interface6' onlink || true) && '$writeDnsByForce'" > /bin/ethdetect; echo "(test -x /bin/ethdetect && /bin/ethdetect) || true" >> /usr/share/debconf/confmodule;')
+			NetConfigManually=$(echo -e "d-i netcfg/disable_autoconfig boolean true\nd-i netcfg/dhcp_failed note\nd-i netcfg/dhcp_options select Configure network manually\nd-i netcfg/get_ipaddress string $ip6Addr\nd-i netcfg/get_netmask string $ip6Subnet\nd-i netcfg/get_gateway string none\nd-i netcfg/get_nameservers string $ip6DNS\nd-i netcfg/no_default_route boolean true\nd-i netcfg/confirm_static boolean true")
+		}
+		# Debian installer can only identify the full IPv6 address of IPv6 mask,
+		# so we need to covert IPv6 prefix shortening from "0-128" to whole IPv6 address.
+		# The result of "$ip6Subnet" is calculated by function "ipv6SubnetCalc".
+		#
+		# Manually network setting configurations, including:
+		# d-i netcfg/disable_autoconfig boolean true
+		# d-i netcfg/dhcp_failed note
+		# d-i netcfg/dhcp_options select Configure network manually
+		# d-i netcfg/get_ipaddress string $IPv4/$ip6Addr
+		# d-i netcfg/get_netmask string $MASK/$ip6Subnet
+		# d-i netcfg/get_gateway string $GATE/$ip6Gate
+		# d-i netcfg/get_nameservers string $ipDNS/$ip6DNS
+		# d-i netcfg/no_default_route boolean true
+		# d-i netcfg/confirm_static boolean true
+		DebianModifiedPreseed "in-target" "/etc/network/interfaces" "/etc/sysctl.d/99-sysctl.conf"
+		cat >/tmp/boot/preseed.cfg <<EOF
+### Unattended Installation
+d-i auto-install/enable boolean true
+d-i debconf/priority select critical
+
+### Localization
+d-i debian-installer/locale string en_US.UTF-8
+d-i debian-installer/country string US
+d-i debian-installer/language string en
+d-i debian-installer/allow_unauthenticated boolean true
+d-i console-setup/layoutcode string us
+d-i keyboard-configuration/xkb-keymap string us
+
+### Low memory mode
+d-i lowmem/low note
+
+### Select security, updates and backports
+d-i apt-setup/services-select multiselect security, updates
+
+### Configure source repositories
+d-i apt-setup/enable-source-repositories boolean true
+
+### Security setup
+d-i apt-setup/security_host string ${debianSecurityMirror}
+
+### Config contrib, non-free and non-free firmware
+d-i apt-setup/contrib boolean true
+d-i apt-setup/non-free boolean true
+d-i apt-setup/non-free-firmware boolean true
+
+### Disable CD-rom automatic scan
+d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/cdrom/set-next boolean false
+d-i apt-setup/cdrom/set-failed boolean false
+
+### Configure cloud kernel
+${AddCloudKernel}
+
+### Network configuration
+d-i netcfg/choose_interface select $interfaceSelect
+${NetConfigManually}
+d-i hw-detect/load_firmware boolean true
+${BurnIrregularIpv4ByForce}
+${BurnIrregularIpv6ByForce}
+
+### Mirror settings
+d-i mirror/country string manual
+d-i mirror/http/hostname string $MirrorHost
+d-i mirror/http/directory string $MirrorFolder
+
+### Account setup
+d-i passwd/root-login boolean ture
+d-i passwd/make-user boolean false
+d-i passwd/root-password-crypted password ${myPASSWORD}
+d-i user-setup/allow-password-weak boolean true
+d-i user-setup/encrypt-home boolean false
+
+### Clock and time zone setup
+d-i clock-setup/utc boolean true
+d-i time/zone string ${TimeZone}
+d-i clock-setup/ntp boolean true
+d-i clock-setup/ntp-server string ntp.nict.jp
+
+### Get harddisk name and Windows DD installation set up
+d-i preseed/early_command string ${ddWindowsEarlyCommandsOfAnna}
+d-i partman/early_command string \
+lvremove --select all -ff -y; \
+vgremove --select all -ff -y; \
+pvremove /dev/* -ff -y; \
+[[ -n "\$(blkid -t TYPE='vfat' -o device)" ]] && umount "\$(blkid -t TYPE='vfat' -o device)"; \
+${PartmanEarlyCommand} \
+wget -qO- '$DDURL' | $DEC_CMD | /bin/dd of=\$(list-devices disk | grep ${IncDisk} | head -n 1); \
+/bin/ntfs-3g \$(list-devices partition | grep ${IncDisk} | head -n 1) /mnt; \
+cd '/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs'; \
+cd Start* || cd start*; \
+cp -f '/net.bat' './net.bat'; \
+/sbin/reboot; \
+umount /media || true; \
+
+### Partitioning
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-lvm/device_remove_lvm_span boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+${defaultFileSystem}
+d-i partman/mount_style select uuid
+d-i partman-md/device_remove_md boolean true
+${FormatDisk}
+
+### Package selection
+tasksel tasksel/first multiselect minimal
+d-i pkgsel/include string openssh-server
+
+# Automatic updates are not applied, everything is updated manually.
+d-i pkgsel/update-policy select none
+d-i pkgsel/upgrade select none
+
+### Disable to upload developer statistics anonymously
+popularity-contest popularity-contest/participate boolean false
+
+### Grub
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean true
+d-i grub-installer/bootdev string ${IncDisk}
+d-i grub-installer/force-efi-extra-removable boolean true
+d-i debian-installer/add-kernel-opts string net.ifnames=0 biosdevname=0 ipv6.disable=1 ${serialConsolePropertiesForGrub}
+grub-pc grub-pc/hidden_timeout boolean false
+grub-pc grub-pc/timeout string 3
+
+### Shutdown machine
+d-i finish-install/reboot_in_progress note
+d-i debian-installer/exit/reboot boolean true
+
+### Write preseed
+d-i preseed/late_command string	\
+sed -ri 's/^#?Port.*/Port ${sshPORT}/g' /target/etc/ssh/sshd_config; \
+sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /target/etc/ssh/sshd_config; \
+sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /target/etc/ssh/sshd_config; \
+echo '@reboot root cat /etc/run.sh 2>/dev/null |base64 -d >/tmp/run.sh; rm -rf /etc/run.sh; sed -i /^@reboot/d /etc/crontab; bash /tmp/run.sh' >>/target/etc/crontab; \
+echo '' >>/target/etc/crontab; \
+echo '${setCMD}' >/target/etc/run.sh; \
+${DebianModifiedProcession}
+EOF
+	fi
+}
+
+# The parameter which be passed into the function after 10th order must be included with "{}".
+function alpineInstallOrDdAdditionalFiles() {
+	AlpineInitFile="$1"
+	AlpineDnsFile="$2"
+	AlpineMotd="$3"
+	AlpineInitFileName="alpineConf.start"
+	if [[ "$targetRelese" == 'Ubuntu' ]]; then
+		if [[ "$ubuntuArchitecture" == "amd64" ]]; then
+			targetLinuxMirror="$4"
+			targetLinuxSecurityMirror="${10}"
+		elif [[ "$ubuntuArchitecture" == "arm64" ]]; then
+			targetLinuxMirror="$5"
+			targetLinuxSecurityMirror="$5"
+		fi
+		AlpineInitFile="$6"
+		AlpineInitFileName="ubuntuConf.start"
+		[[ "$setIPv6" == "0" ]] && setIPv6="0" || setIPv6="1"
+	elif [[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]]; then
+		AlpineInitFile="$9"
+		AlpineInitFileName="rhelConf.start"
+		[[ "$setIPv6" == "0" ]] && setIPv6="0" || setIPv6="1"
+	elif [[ "$targetRelese" == 'Windows' ]]; then
+		AlpineInitFile="$7"
+		AlpineInitFileName="windowsConf.start"
+		windowsStaticConfigCmd="$8"
+	fi
+}
+
+# $1 is "$tmpURL".
+function verifyUrlValidationOfDdImages() {
+	echo "$1" | grep -q '^http://\|^ftp://\|^https://'
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Please input a vaild URL, only support http://, ftp:// and https:// ! \n" && exit 1
+	tmpURLCheck=$(echo $(curl -s -I -X GET $1) | grep -wi "http/[0-9]*" | awk '{print $2}')
+	[[ -z "$tmpURLCheck" || ! "$tmpURLCheck" =~ ^[0-9]+$ ]] && {
+		echo -ne "\n[${red}Error${plain}] The mirror of DD images is temporarily unavailable!\n"
+		exit 1
+	}
+	DDURL="$1"
+	# Decompress command selection
+	if [[ "$setFileType" == "gz" ]]; then
+		DEC_CMD="gunzip -dc"
+		[[ $(echo "$DDURL" | grep -o ...$) == ".xz" ]] && DEC_CMD="xzcat"
+	elif [[ "$setFileType" == "xz" ]]; then
+		DEC_CMD="xzcat"
+		[[ $(echo "$DDURL" | grep -o ...$) == ".gz" ]] && DEC_CMD="gunzip -dc"
+	else
+		[[ $(echo "$DDURL" | grep -o ...$) == ".xz" ]] && DEC_CMD="xzcat"
+		[[ $(echo "$DDURL" | grep -o ...$) == ".gz" ]] && DEC_CMD="gunzip -dc"
+	fi
+}
+
+checkSys
+
+# Get the name of network adapter($interface).
+# [[ -z "$interface" ]] && interface=`getInterface "$CurrentOS"
+# Try to enable IPv4 by DHCP
+# timeout 5 dhclient -4 $interface
+# Try to enable IPv6 by DHCP
+# timeout 5 dhclient -6 $interface
+
+# IPv4 and IPv6 DNS check servers from OpenDNS, Quad9, Verisign and TWNIC.
+checkIpv4OrIpv6 "$ipAddr" "$ip6Addr" "208.67.220.220" "9.9.9.9" "64.6.65.6" "101.102.103.104" "2620:0:ccc::2" "2620:fe::9" "2620:74:1b::1:1" "2001:de4::101"
+
+# Youtube, Instagram, Wikipedia and BBC are all have public IPv4 and IPv6 address and are also banned in mainland of China.
+checkCN "$IPStackType" "www.youtube.com" "www.instagram.com" "www.wikipedia.org" "bbc.com"
+
+checkEfi "/sys/firmware/efi/efivars/" "/sys/firmware/efi/vars/" "/sys/firmware/efi/runtime-map/" "/sys/firmware/efi/mok-variables/"
+
+checkVirt
+
+if [[ "$sshPORT" ]]; then
+	if [[ ! ${sshPORT} -ge "1" ]] || [[ ! ${sshPORT} -le "65535" ]] || [[ $(grep '^[[:digit:]]*$' <<<'${sshPORT}') ]]; then
+		sshPORT='22'
+	fi
+else
+	sshPORT=$(grep -Ei "^port|^#port" /etc/ssh/sshd_config | head -n 1 | awk -F' ' '{print $2}')
+	[[ "$sshPORT" == "" ]] && sshPORT=$(netstat -anp | grep -i 'sshd: root' | grep -iw 'tcp' | awk '{print $4}' | head -n 1 | cut -d':' -f'2')
+	[[ "$sshPORT" == "" ]] && sshPORT=$(netstat -anp | grep -i 'sshd: root' | grep -iw 'tcp6' | awk '{print $4}' | head -n 1 | awk -F':' '{print $NF}')
+	if [[ "$sshPORT" == "" ]] || [[ ! ${sshPORT} -ge "1" ]] || [[ ! ${sshPORT} -le "65535" ]] || [[ $(grep '^[[:digit:]]*$' <<<'${sshPORT}') ]]; then
+		sshPORT='22'
+	fi
 fi
 
-eval set -- "$opts"
-# shellcheck disable=SC2034
-while true; do
-    case "$1" in
-    -h | --help)
-        usage_and_exit
-        ;;
-    --commit)
-        commit=$2
-        shift 2
-        ;;
-    --debug)
-        set -x
-        shift
-        ;;
-    --ci)
-        cloud_image=1
-        unset installer
-        shift
-        ;;
-    --installer)
-        installer=1
-        unset cloud_image
-        shift
-        ;;
-    --minimal)
-        minimal=1
-        shift
-        ;;
-    --allow-ping)
-        allow_ping=1
-        shift
-        ;;
-    --force-cn)
-        # 仅为了方便测试
-        force_cn=1
-        shift
-        ;;
-    --hold | --sleep)
-        if ! { [ "$2" = 1 ] || [ "$2" = 2 ]; }; then
-            error_and_exit "Invalid $1 value: $2"
-        fi
-        hold=$2
-        shift 2
-        ;;
-    --frpc-conf | --frpc-config | --frpc-toml)
-        [ -n "$2" ] || error_and_exit "Need value for $1"
+[[ -n "$Relese" ]] || Relese='Debian'
+linux_relese=$(echo "$Relese" | sed 's/\ //g' | sed -r 's/(.*)/\L\1/')
 
-        # windows 路径转换
-        frpc_config=$(get_unix_path "$2")
+[[ -z "$tmpDIST" ]] && {
+	[ "$Relese" == 'Debian' ] && tmpDIST='12'
+	[ "$Relese" == 'Kali' ] && tmpDIST='rolling'
+	[ "$Relese" == 'AlpineLinux' ] && tmpDIST='edge'
+	[ "$Relese" == 'CentOS' ] && tmpDIST='9'
+	[ "$Relese" == 'RockyLinux' ] && tmpDIST='9'
+	[ "$Relese" == 'AlmaLinux' ] && tmpDIST='9'
+	[ "$Relese" == 'Fedora' ] && tmpDIST='39'
+}
+[[ -z "$finalDIST" ]] && {
+	[ "$targetRelese" == 'Ubuntu' ] && finalDIST='22.04'
+	[ "$targetRelese" == 'Windows' ] && finalDIST='11'
+}
 
-        # alpine busybox 不支持 readlink -m
-        # readlink -m /asfsafasfsaf/fasf
-        # 因此需要先判断路径是否存在
+checkVER
+if [[ -n "$tmpDIST" ]]; then
+	checkDIST
+fi
 
-        if ! [ -f "$frpc_config" ]; then
-            error_and_exit "Not a toml file: $2"
-        fi
+if [[ "$loaderMode" == "0" ]]; then
+	checkGrub "/boot/grub/" "/boot/grub2/" "/etc/" "grub.cfg" "grub.conf" "/boot/efi/EFI/"
+	if [[ -z "$GRUBTYPE" ]]; then
+		echo -ne "\n[${red}Error${plain}] Not found grub!\n"
+		exit 1
+	fi
+	checkConsole "$VER"
+fi
 
-        # 转为绝对路径
-        frpc_config=$(readlink -f "$frpc_config")
+clear
 
-        shift 2
-        ;;
-    --force)
-        if ! { [ "$2" = bios ] || [ "$2" = efi ]; }; then
-            error_and_exit "Invalid $1 value: $2"
-        fi
-        force=$2
-        shift 2
-        ;;
-    --passwd | --password)
-        [ -n "$2" ] || error_and_exit "Need value for $1"
-        password=$2
-        shift 2
-        ;;
-    --ssh-key | --public-key)
-        ssh_key_error_and_exit() {
-            error "$1"
-            cat <<EOF
-Available options:
-  --ssh-key "ssh-rsa ..."
-  --ssh-key "ssh-ed25519 ..."
-  --ssh-key "ecdsa-sha2-nistp256/384/521 ..."
-  --ssh-key github:your_username
-  --ssh-key gitlab:your_username
-  --ssh-key http://path/to/public_key
-  --ssh-key https://path/to/public_key
-  --ssh-key /path/to/public_key
-  --ssh-key C:\path\to\public_key
-EOF
-            exit 1
-        }
+[[ ! -d "/tmp/" ]] && mkdir /tmp
 
-        # https://manpages.debian.org/testing/openssh-server/authorized_keys.5.en.html#AUTHORIZED_KEYS_FILE_FORMAT
-        is_valid_ssh_key() {
-            grep -qE '^(ecdsa-sha2-nistp(256|384|512)|ssh-(ed25519|rsa)) ' <<<"$1"
-        }
+[[ -n "$aliyundunProcess" ]] && {
+	echo -ne "\n[${red}Warning${plain}] ${blue}AliYunDun${plain} is detected on your server, the components will be removed compeletely because they may obstruct the following flow. \n"
+}
 
-        [ -n "$2" ] || ssh_key_error_and_exit "Need value for $1"
+# Disable SELinux
+[[ -f /etc/selinux/config ]] && {
+	SELinuxStatus=$(sestatus -v | grep -i "selinux status:" | grep "enabled")
+	[[ "$SELinuxStatus" != "" ]] && {
+		echo -ne "\n${aoiBlue}# Disabling SELinux${plain}\n"
+		setenforce 0 2>/dev/null
+		echo -e "\nSuccess"
+	}
+}
 
-        case "$(to_lower <<<"$2")" in
-        github:* | gitlab:* | http://* | https://*)
-            if [[ "$(to_lower <<<"$2")" = http* ]]; then
-                key_url=$2
-            else
-                IFS=: read -r site user <<<"$2"
-                [ -n "$user" ] || ssh_key_error_and_exit "Need a username for $site"
-                key_url="https://$site.com/$user.keys"
-            fi
-            if ! ssh_key=$(curl -L "$key_url"); then
-                error_and_exit "Can't get ssh key from $key_url"
-            fi
-            ;;
-        *)
-            # 检测值是否为 ssh key
-            if is_valid_ssh_key "$2"; then
-                ssh_key=$2
-            else
-                # 视为路径
-                # windows 路径转换
-                if ! { ssh_key_file=$(get_unix_path "$2") && [ -f "$ssh_key_file" ]; }; then
-                    ssh_key_error_and_exit "SSH Key/File/Url \"$2\" is invalid."
-                fi
-                ssh_key=$(<"$ssh_key_file")
-            fi
-            ;;
-        esac
+# RAM of RedHat series is 2.2GB required at least for native install, for dd is 512MB.
+[[ "$setNetbootXyz" == "0" ]] && {
+	checkMem "$linux_relese" "$RedHatSeries" "$targetRelese"
+	Add_OPTION="$Add_OPTION $lowmemLevel"
+	checkDIST
+}
 
-        # 检查 key 格式
-        if ! is_valid_ssh_key "$ssh_key"; then
-            ssh_key_error_and_exit "SSH Key/File/Url \"$2\" is invalid."
-        fi
+[[ -n "$TotalMem" ]] && {
+	echo -ne "\n${aoiBlue}# System Memory${plain}\n"
+	echo -e "\n${TotalMem} MB"
+}
 
-        # 保存 key
-        # 不用处理注释，可以支持写入 authorized_keys
-        # 安装 nixos 时再处理注释/空行，转成数组，再添加到 nix 配置文件中
-        if [ -n "$ssh_keys" ]; then
-            ssh_keys+=$'\n'
-        fi
-        ssh_keys+=$ssh_key
+[[ -n "$showAllVirts" ]] && {
+	echo -ne "\n${aoiBlue}# Virtualization and Manufacturer${plain}\n"
+	echo -e "\n${showAllVirts}"
+}
 
-        shift 2
-        ;;
-    --ssh-port)
-        is_port_valid $2 || error_and_exit "Invalid $1 value: $2"
-        ssh_port=$2
-        shift 2
-        ;;
-    --rdp-port)
-        is_port_valid $2 || error_and_exit "Invalid $1 value: $2"
-        rdp_port=$2
-        shift 2
-        ;;
-    --web-port | --http-port)
-        is_port_valid $2 || error_and_exit "Invalid $1 value: $2"
-        web_port=$2
-        shift 2
-        ;;
-    --add-driver)
-        [ -n "$2" ] || error_and_exit "Need value for $1"
+[[ "$lowMemMode" == '1' || "$useCloudImage" == "1" ]] && {
+	detectCloudinit
+	if [[ "$linux_relese" == 'rockylinux' || "$linux_relese" == 'almalinux' || "$linux_relese" == 'centos' ]]; then
+		if [[ "$RedHatSeries" == "7" ]]; then
+			echo -ne "\n[${red}Error${plain}] There were not suitable Cloud Images for ${yellow}$Relese $RedHatSeries${plain}!\n"
+			exit 1
+		fi
+		if [[ "$RedHatSeries" == "8" ]]; then
+			targetRelese='Rocky'
+			# Cloud images of Redhat 8 series could not accept any parameter of IPv6 from cloud init, this is an awful release because of higher memory requirement for installation and execution, worse compatibility. Anyone should abandon it in principle.
+			[[ "$IPStackType" != "IPv4Stack" || "$internalCloudinitStatus" == "1" ]] && {
+				if [[ "$IPStackType" != "IPv4Stack" ]]; then
+					echo -ne "\n[${red}Error${plain}] Cloud Image of ${yellow}$targetRelese $RedHatSeries${plain} doesn't support ${blue}$IPStackType${plain} network!\n"
+				elif [[ "$internalCloudinitStatus" == "1" ]]; then
+					echo -ne "\n[${red}Error${plain}] Due to internal Cloud Init configurations existed on ${underLine}$cloudinitCdDrive${plain}, installation of $targetRelese $RedHatSeries will meet a fatal!\n"
+				fi
+				RedHatSeries="$(($RedHatSeries + 1))"
+				echo -ne "\nTry to install ${yellow}AlmaLinux $RedHatSeries${plain} or ${yellow}Rocky $RedHatSeries${plain} instead.\n"
+				exit 1
+			}
+		fi
+		if [[ "$linux_relese" == 'centos' && "$RedHatSeries" -ge "9" ]]; then
+			targetRelese='AlmaLinux'
+		elif [[ "$RedHatSeries" -ge "9" ]]; then
+			if [[ "$linux_relese" == 'almalinux' ]]; then
+				targetRelese='AlmaLinux'
+			elif [[ "$linux_relese" == 'rockylinux' ]]; then
+				targetRelese='Rocky'
+			fi
+		fi
+		ddMode='1'
+	fi
+}
 
-        # windows 路径转换
-        inf_or_dir=$(get_unix_path "$2")
+[[ "$ddMode" == '1' ]] && {
+	if [[ "$targetRelese" == 'Ubuntu' ]] || [[ "$targetRelese" == 'Windows' ]] || [[ "$targetRelese" == 'AlmaLinux' ]] || [[ "$targetRelese" == 'Rocky' ]]; then
+		Relese='AlpineLinux'
+		tmpDIST='edge'
+		if [[ "$targetRelese" == 'Windows' ]]; then
+			[[ "$VER" == "aarch64" || "$VER" == "arm64" ]] && {
+				echo -ne "\n[${red}Error${plain}] ${targetRelese} doesn't support ${VER} architecture.\n"
+				exit 1
+			}
+		fi
+	else
+		Relese='Debian'
+		tmpDIST='12'
+	fi
+	linux_relese=$(echo "$Relese" | sed 's/\ //g' | sed -r 's/(.*)/\L\1/')
+	checkVER
+	checkDIST
+}
 
-        # alpine busybox 不支持 readlink -m
-        # readlink -m /asfsafasfsaf/fasf
-        # 因此需要先判断路径是否存在
+[[ -z "$LinuxMirror" ]] && {
+	echo -ne "\n[${red}Error${plain}] Invaild mirror! \n"
+	[ "$Relese" == 'Debian' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://www.debian.org/mirror/list\n\n"
+	[ "$Relese" == 'Ubuntu' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://launchpad.net/ubuntu/+archivemirrors\n\n"
+	[ "$Relese" == 'Kali' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://http.kali.org/README.mirrorlist\n\n"
+	[ "$Relese" == 'AlpineLinux' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://mirrors.alpinelinux.org/\n\n"
+	[ "$Relese" == 'CentOS' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://www.centos.org/download/mirrors/\n\n"
+	[ "$Relese" == 'RockyLinux' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://mirrors.rockylinux.org/mirrormanager/mirrors\n\n"
+	[ "$Relese" == 'AlmaLinux' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://mirrors.almalinux.org/\n\n"
+	[ "$Relese" == 'Fedora' ] && echo -ne "${yellow}Please check mirror lists:${plain} https://mirrors.fedoraproject.org/\n\n"
+	# bash $0 error
+	exit 1
+}
 
-        if ! [ -d "$inf_or_dir" ] &&
-            ! { [ -f "$inf_or_dir" ] && [[ "$inf_or_dir" =~ \.[iI][nN][fF]$ ]]; }; then
-            ssh_key_error_and_exit "Not a inf or dir: $2"
-        fi
+echo -ne "\n${aoiBlue}# Check Dependence${plain}\n\n"
 
-        # 转为绝对路径
-        inf_or_dir=$(readlink -f "$inf_or_dir")
+dependence awk,basename,cat,cpio,curl,cut,dirname,file,find,grep,gzip,iconv,ip,lsblk,openssl,sed,wget
 
-        info "finding inf in $inf_or_dir"
-        # find /tmp -type f -iname '*.inf' 只要 /tmp 存在就会返回 0
-        if infs=$(find "$inf_or_dir" -type f -iname '*.inf' | grep .); then
-            while IFS= read -r inf; do
-                # 防止重复添加
-                if ! grep -Fqx "$inf" <<<"$custom_infs"; then
-                    echo "inf found: $inf"
-                    # 一行一个 inf
-                    if [ -n "$custom_infs" ]; then
-                        custom_infs+=$'\n'
-                    fi
-                    custom_infs+=$inf
-                fi
-            done <<<"$infs"
-        else
-            error_and_exit "Can't find inf files in $2"
-        fi
+ipDNS1=$(echo $ipDNS | cut -d ' ' -f 1)
+ipDNS2=$(echo $ipDNS | cut -d ' ' -f 2)
+ip6DNS1=$(echo $ip6DNS | cut -d ' ' -f 1)
+ip6DNS2=$(echo $ip6DNS | cut -d ' ' -f 2)
+ipDNS=$(checkDNS "$ipDNS")
+ip6DNS=$(checkDNS "$ip6DNS")
 
-        shift 2
-        ;;
-    --force-old-windows-setup)
-        force_old_windows_setup=$2
-        shift 2
-        ;;
-    --img)
-        img=$2
-        shift 2
-        ;;
-    --iso)
-        iso=$2
-        shift 2
-        ;;
-    --boot-wim)
-        boot_wim=$2
-        shift 2
-        ;;
-    --image-name)
-        image_name=$(echo "$2" | to_lower)
-        shift 2
-        ;;
-    --lang)
-        lang=$(echo "$2" | to_lower)
-        shift 2
-        ;;
-    --)
-        shift
-        break
-        ;;
-    *)
-        echo "Unexpected option: $1."
-        usage_and_exit
-        ;;
-    esac
+if [[ -n "$ipAddr" && -n "$ipMask" && -n "$ipGate" ]] && [[ -z "$ip6Addr" && -z "$ip6Mask" && -z "$ip6Gate" ]]; then
+	setNet='1'
+	checkDHCP "$CurrentOS" "$CurrentOSVer" "$IPStackType"
+	setDhcpOrStatic "$tmpDHCP" "$virtWhat" "$virtType"
+	Network4Config="isStatic"
+	acceptIPv4AndIPv6SubnetValue "$ipMask" ""
+	[[ "$IPStackType" != "IPv4Stack" ]] && getIPv6Address
+elif [[ -n "$ipAddr" && -n "$ipMask" && -n "$ipGate" ]] && [[ -n "$ip6Addr" && -n "$ip6Mask" && -n "$ip6Gate" ]]; then
+	setNet='1'
+	[[ -z "$interfaceSelect" ]] && getInterface "$CurrentOS"
+	Network4Config="isStatic"
+	Network6Config="isStatic"
+	acceptIPv4AndIPv6SubnetValue "$ipMask" "$ip6Mask"
+elif [[ -z "$ipAddr" && -z "$ipMask" && -z "$ipGate" ]] && [[ -n "$ip6Addr" && -n "$ip6Mask" && -n "$ip6Gate" ]]; then
+	setNet='1'
+	checkDHCP "$CurrentOS" "$CurrentOSVer" "$IPStackType"
+	setDhcpOrStatic "$tmpDHCP" "$virtWhat" "$virtType"
+	Network6Config="isStatic"
+	acceptIPv4AndIPv6SubnetValue "" "$ip6Mask"
+	getIPv4Address
+fi
+
+if [[ "$setNet" == "0" ]]; then
+	checkDHCP "$CurrentOS" "$CurrentOSVer" "$IPStackType"
+	setDhcpOrStatic "$tmpDHCP" "$virtWhat" "$virtType"
+	getIPv4Address
+	[[ "$IPStackType" != "IPv4Stack" ]] && getIPv6Address
+	if [[ "$IPStackType" == "BiStack" && "$iAddrNum" -ge "2" || "$i6AddrNum" -ge "2" ]]; then
+		if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]] || [[ "$linux_relese" == 'alpinelinux' ]]; then
+			Network4Config="isStatic"
+		fi
+		[[ "$BiStackPreferIpv6Status" == "1" ]] && {
+			BiStackPreferIpv6Status=""
+			BurnIrregularIpv6Status=""
+			BurnIrregularIpv4Status='1'
+		}
+	fi
+fi
+
+checkWarp "warp*.conf" "wgcf*.conf" "wg[0-9].conf" "warp*" "wgcf*" "wg[0-9]" "privatekey" "publickey"
+
+IPv4="$ipAddr"
+MASK="$ipMask"
+GATE="$ipGate"
+if [[ -z "$IPv4" && -z "$MASK" && -z "$GATE" ]] && [[ -z "$ip6Addr" && -z "$ip6Mask" && -z "$ip6Gate" ]]; then
+	echo -ne "\n[${red}Error${plain}] The network of your machine may not be available!\n"
+	bash $0 error
+	exit 1
+fi
+
+echo -ne "\n${aoiBlue}# Network Details${plain}\n"
+[[ -n "$interfaceSelect" ]] && echo -ne "\n[${yellow}Adapter Name${plain}]  $interfaceSelect" || echo -ne "\n[${yellow}Adapter Name${plain}]  $interface"
+[[ -n "$NetCfgWhole" ]] && echo -ne "\n[${yellow}Network File${plain}]  $NetCfgWhole" || echo -ne "\n[${yellow}Network File${plain}]  N/A"
+echo -ne "\n[${yellow}Server Stack${plain}]  $IPStackType\n"
+[[ "$IPStackType" != "IPv6Stack" ]] && echo -ne "\n[${yellow}IPv4  Method${plain}]  $Network4Config\n" || echo -ne "\n[${yellow}IPv4  Method${plain}]  N/A\n"
+[[ "$IPv4" && "$IPStackType" != "IPv6Stack" ]] && echo -e "[${yellow}IPv4 Address${plain}]  ""$IPv4" || echo -e "[${yellow}IPv4 Address${plain}]  ""N/A"
+[[ "$IPv4" && "$IPStackType" != "IPv6Stack" ]] && echo -e "[${yellow}IPv4  Subnet${plain}]  ""$actualIp4Subnet" || echo -e "[${yellow}IPv4  Subnet${plain}]  ""N/A"
+[[ "$IPv4" && "$IPStackType" != "IPv6Stack" ]] && echo -e "[${yellow}IPv4 Gateway${plain}]  ""$GATE" || echo -e "[${yellow}IPv4 Gateway${plain}]  ""N/A"
+[[ "$IPv4" && "$IPStackType" != "IPv6Stack" ]] && echo -e "[${yellow}IPv4     DNS${plain}]  ""$ipDNS" || echo -e "[${yellow}IPv4     DNS${plain}]  ""N/A"
+[[ "$IPv4" && "$IPStackType" != "IPv6Stack" ]] && echo -e "[${yellow}IPv4  Amount${plain}]  ""$iAddrNum" || echo -e "[${yellow}IPv4  Amount${plain}]  ""N/A"
+[[ "$IPStackType" != "IPv4Stack" ]] && echo -ne "\n[${yellow}IPv6  Method${plain}]  $Network6Config\n" || echo -ne "\n[${yellow}IPv6  Method${plain}]  N/A\n"
+[[ "$ip6Addr" && "$IPStackType" != "IPv4Stack" ]] && echo -e "[${yellow}IPv6 Address${plain}]  ""$ip6Addr" || echo -e "[${yellow}IPv6 Address${plain}]  ""N/A"
+[[ "$ip6Addr" && "$IPStackType" != "IPv4Stack" ]] && echo -e "[${yellow}IPv6  Subnet${plain}]  ""$actualIp6Prefix" || echo -e "[${yellow}IPv6  Subnet${plain}]  ""N/A"
+[[ "$ip6Addr" && "$IPStackType" != "IPv4Stack" ]] && echo -e "[${yellow}IPv6 Gateway${plain}]  ""$ip6Gate" || echo -e "[${yellow}IPv6 Gateway${plain}]  ""N/A"
+[[ "$ip6Addr" && "$IPStackType" != "IPv4Stack" ]] && echo -e "[${yellow}IPv6     DNS${plain}]  ""$ip6DNS" || echo -e "[${yellow}IPv6     DNS${plain}]  ""N/A"
+[[ "$ip6Addr" && "$IPStackType" != "IPv4Stack" ]] && echo -e "[${yellow}IPv6  Amount${plain}]  ""$i6AddrNum" || echo -e "[${yellow}IPv6  Amount${plain}]  ""N/A"
+
+getUserTimeZone "/root/timezonelists" "https://api.ip.sb/geoip/" "http://ifconfig.co/json?ip=" "http://ip-api.com/json/" "https://ipapi.co/" "YjNhNjAxNjY5YTFiNDI2MmFmOGYxYjJjZDk3ZjNiN2YK" "MmUxMjBhYmM0Y2Q4NDM1ZDhhMmQ5YzQzYzk4ZTZiZTEK" "NjBiMThjZWJlMWU1NGQ5NDg2YWY0MTgyMWM0ZTZiZDgK"
+[[ -z "$TimeZone" ]] && TimeZone="Asia/Tokyo"
+echo -ne "\n${aoiBlue}# User Timezone${plain}\n\n"
+echo "$TimeZone"
+
+# Hostname should not be "localhost".
+[[ -n "$tmpHostName" ]] && HostName="$tmpHostName" || HostName=$(hostname)
+[[ -z "$HostName" || "$HostName" =~ "localhost" || "$HostName" =~ "localdomain" || "$HostName" == "random" ]] && HostName="instance-$(date "+%Y%m%d")-$(date "+%H%M")"
+echo -ne "\n${aoiBlue}# Hostname${plain}\n\n"
+echo "$HostName"
+
+if [[ -z "$tmpWORD" || "$linux_relese" == 'alpinelinux' ]]; then
+	tmpWORD='LeitboGi0ro'
+	myPASSWORD='$6$qE9Lqgrd0QTOq46i$YMECmKvIw2SeBP4X411I0ZWmtyMsRcBi4Rxu7HYRsqdwqSApi6zjds5UJyM4HrAoBcuLBmjPyLatGydulmCDb0'
+else
+	# "-1" is MD5, "-5" is SHA256, "-6" is SHA512. MD5 is no longer secure.
+	myPASSWORD=$(openssl passwd -6 ''$tmpWORD'' 2>/dev/null)
+	# Version 1.0.2k of openssl in CentOS 7 is too old that it's only support MD5, the same as Debian 9.
+	[[ -z "$myPASSWORD" || "$myPASSWORD" =~ "NULL" ]] && myPASSWORD=$(openssl passwd -1 ''$tmpWORD'')
+fi
+
+echo -ne "\n${aoiBlue}# SSH or RDP Port, Username and Password${plain}\n\n"
+if [[ "$targetRelese" == 'Windows' && "$tmpURL" == "" || "$tmpURL" =~ "dl.lamp.sh" ]]; then
+	echo "3389"
+	echo "Administrator"
+	echo "Teddysun.com"
+elif [[ -z "$targetRelese" && "$ddMode" == '1' ]]; then
+	echo -e "N/A\nN/A\nN/A"
+else
+	echo "$sshPORT"
+	echo "root"
+	echo "$tmpWORD"
+fi
+
+setDisk=$(echo "$setDisk" | sed 's/[A-Z]/\l&/g')
+getDisk "$setDisk" "$linux_relese"
+if [[ "$targetRelese" == 'AlmaLinux' ]] || [[ "$targetRelese" == 'Rocky' ]]; then
+	[[ "$diskCapacity" -lt "10737418240" ]] && {
+		echo -ne "\n[${red}Error${plain}] Minimum system hard drive requirement is 10 GB! \n\n"
+		exit 1
+	}
+elif [[ "$targetRelese" == 'Windows' ]]; then
+	[[ "$diskCapacity" -lt "16106127360" ]] && {
+		echo -ne "\n[${red}Error${plain}] Minimum system hard drive requirement is 15 GB! \n\n"
+		exit 1
+	}
+fi
+echo -ne "\n${aoiBlue}# Formatting and Installing Drives${plain}\n\n"
+[[ "$setDisk" == "all" || -n "$setRaid" ]] && echo "$AllDisks" || echo "$IncDisk"
+
+echo -ne "\n${aoiBlue}# Motherboard Firmware${plain}\n\n"
+[[ "$EfiSupport" == "enabled" ]] && echo "UEFI" || echo "BIOS"
+
+[[ "$setNetbootXyz" == "1" ]] && SpikCheckDIST="1"
+if [[ "$SpikCheckDIST" == '0' ]]; then
+	echo -ne "\n${aoiBlue}# Check DIST${plain}\n"
+	[[ "$linux_relese" == 'debian' ]] && DistsList="$(wget --no-check-certificate -qO- "$LinuxMirror/dists/" | grep -o 'href=.*/"' | cut -d'"' -f2 | sed '/-\|old\|README\|Debian\|experimental\|stable\|test\|sid\|devel/d' | grep '^[^/]' | sed -n '1h;1!H;$g;s/\n//g;s/\//\;/g;$p')"
+	[[ "$linux_relese" == 'kali' ]] && DistsList="$(wget --no-check-certificate -qO- "$LinuxMirror/dists/" | grep -o 'href=.*/"' | cut -d'"' -f2 | sed '/debian\|only\|last\|edge/d' | grep '^[^/]' | sed -n '1h;1!H;$g;s/\n//g;s/\//\;/g;$p')"
+	[[ "$linux_relese" == 'alpinelinux' ]] && DistsList="$(wget --no-check-certificate -qO- "$LinuxMirror/" | grep -o 'href=.*/"' | cut -d'"' -f2 | sed '/-/d' | grep '^[^/]' | sed -n '1h;1!H;$g;s/\n//g;s/\//\;/g;$p')"
+	for CheckDEB in $(echo "$DistsList" | sed 's/;/\n/g'); do
+		# In some mirror, the value of parameter "DistsList" is "?C=N;O=Dbookworm;bullseye;buster;http:;;wisepoint.jp;product;wpshibb;"
+		# The second item in "DistsList" which is splited by ";" is O=Dbookworm.
+		# So we need to check whether "DIST" is approximately equal(contains) to "CheckDEB".
+		[[ "$CheckDEB" =~ "$DIST" ]] && FindDists='1' && break
+	done
+	[[ "$FindDists" == '0' ]] && {
+		echo -ne "\n[${red}Error${plain}] The dists version not found, Please check it! \n\n"
+		exit 1
+	}
+	echo -e "\nSuccess"
+fi
+
+if [[ "$ddMode" == '1' ]]; then
+	if [[ "$targetRelese" == 'Ubuntu' ]]; then
+		ubuntuDIST="$(echo "$finalDIST" | sed -r 's/(.*)/\L\1/')"
+		UbuntuDistNum=$(echo "$ubuntuDIST" | cut -d'.' -f1)
+		echo "$ubuntuDIST" | grep -q '[0-9]'
+		[[ $? -eq '0' ]] && {
+			ubuntuDigital="$(echo "$ubuntuDIST" | grep -o '[\.0-9]\{1,\}' | sed -n '1h;1!H;$g;s/\n//g;$p')"
+			ubuntuDigital1=$(echo "$ubuntuDigital" | cut -d'.' -f1)
+			ubuntuDigital2=$(echo "$ubuntuDigital" | cut -d'.' -f2)
+			if [[ "$ubuntuDigital1" -le "19" || "$ubuntuDigital1" -ge "25" || $((${ubuntuDigital1} % 2)) = 1 ]] || [[ "$ubuntuDigital2" != "04" ]]; then
+				echo -ne "\n[${red}Error${plain}] The dists version not found, Please check it! \n'"
+				exit 1
+			fi
+			[[ -n $ubuntuDigital ]] && {
+				# [[ "$ubuntuDigital" == '12.04' ]] && finalDIST='precise'
+				# [[ "$ubuntuDigital" == '14.04' ]] && finalDIST='trusty'
+				# [[ "$ubuntuDigital" == '16.04' ]] && finalDIST='xenial'
+				# [[ "$ubuntuDigital" == '18.04' ]] && finalDIST='bionic'
+				[[ "$ubuntuDigital" == '20.04' ]] && finalDIST='focal'
+				# Ubuntu 22.04 and future versions started to using "Cloud-init" to replace legacy "d-i(Debian installer)" which is designed to support network installation of Debian like system.
+				# "Cloud-init" make a high hardware requirements of the server, one requirement must be demanded is CPU virtualization support.
+				# Many vps which are virtualizated by a physical machine, despite parent machine support virtualization, but sub-servers don't support.
+				# Because Ubuntu 22.04 and future version removed critical file of "initrd.gz" and "linux" which are critical files to implement "d-i".
+				# For example, the official of Ubuntu 22.04(jammy) mirror site doesn't provide any related files to download, the following is here:
+				# http://archive.ubuntu.com/ubuntu/dists/jammy/main/installer-amd64/current/legacy-images/
+				# So we have no possibility to accomplish Ubuntu network installation in future.
+				# Canonical.inc is son of a bitch, they change back and forth, pood and pee everywhere.
+				# More discussions: https://discourse.ubuntu.com/t/netbooting-the-live-server-installer/14510/18
+				[[ "$ubuntuDigital" == '22.04' ]] && finalDIST='jammy'
+				[[ "$ubuntuDigital" == '24.04' ]] && finalDIST='noble'
+				# Ubuntu releases reference: https://wiki.ubuntu.com/Releases/
+			}
+		}
+		if [[ "$VER" == "x86_64" ]] || [[ "$VER" == "x86-64" ]]; then
+			ubuntuArchitecture="amd64"
+		elif [[ "$VER" == "aarch64" ]]; then
+			ubuntuArchitecture="arm64"
+		fi
+		if [[ "$tmpURL" == "" ]]; then
+			tmpURL="https://cloud-images.a.disk.re/$targetRelese/"
+			setFileType="xz"
+			packageName="$finalDIST-server-cloudimg-$ubuntuArchitecture"
+			verifyUrlValidationOfDdImages "$tmpURL$packageName.$setFileType"
+		else
+			verifyUrlValidationOfDdImages "$tmpURL"
+		fi
+		ReleaseName="$targetRelese $finalDIST $ubuntuArchitecture"
+	elif [[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]]; then
+		rhelArchitecture="$VER"
+		if [[ "$tmpURL" == "" ]]; then
+			tmpURL="https://cloud-images.a.disk.re/$targetRelese/"
+			setFileType="xz"
+			if [[ "$targetRelese" == 'AlmaLinux' ]]; then
+				packageName="$targetRelese-$RedHatSeries-GenericCloud-latest.$rhelArchitecture"
+			elif [[ "$targetRelese" == 'Rocky' ]]; then
+				packageName="$targetRelese-$RedHatSeries-GenericCloud.latest.$rhelArchitecture"
+			fi
+			verifyUrlValidationOfDdImages "$tmpURL$packageName.$setFileType"
+		else
+			verifyUrlValidationOfDdImages "$tmpURL"
+		fi
+		ReleaseName="$targetRelese $RedHatSeries $rhelArchitecture"
+	elif [[ "$targetRelese" == 'Windows' ]]; then
+		# If the range of IPv4 address is too narrow, it will cause IPv4 address and subnet are added with a fatal by using "CMD(*.bat script)" of
+		# "wmic nicconfig where ipenabled=true call enablestatic(%staticip%),(%subnetmask%)" on newly installed Windows OS.
+		[[ "$actualIp4Prefix" -gt "24" ]] && {
+			actualIp4Prefix="24"
+			actualIp4Subnet=$(netmask "$actualIp4Prefix")
+		}
+		if [[ -z "$tmpURL" ]]; then
+			tmpURL="https://dl.lamp.sh/vhd"
+			[[ $(echo "$finalDIST" | grep -i "server") ]] && tmpFinalDIST=$(echo $finalDIST | awk -F ' |-|_' '{print $2}')
+			[[ $(echo "$finalDIST" | grep -i "pro") || $(echo "$finalDIST" | grep -i "ltsc") ]] && tmpFinalDIST=$(echo $finalDIST | awk -F ' |-|_' '{print $1}')
+			[[ "$finalDIST" =~ ^[0-9]+$ ]] && tmpFinalDIST="$finalDIST"
+			[[ "$targetLang" == 'jp' ]] && targetLang='ja'
+			[[ "$targetLang" == 'zh' ]] && targetLang='cn'
+			if [[ "$tmpFinalDIST" -ge "2012" && "$tmpFinalDIST" -le "2019" ]]; then
+				tmpTargetLang="$targetLang"
+			else
+				[[ "$targetLang" == 'cn' ]] && tmpTargetLang="zh-""$targetLang"
+				[[ "$targetLang" == 'en' ]] && tmpTargetLang="$targetLang""-us"
+				[[ "$targetLang" == 'ja' ]] && tmpTargetLang="$targetLang""-jp"
+			fi
+			if [[ "$tmpFinalDIST" == "2012" ]]; then
+				tmpURL="$tmpURL/"${tmpTargetLang}"_win"${tmpFinalDIST}"r2.xz"
+				showFinalDIST="Server $tmpFinalDIST R2"
+			elif [[ "$tmpFinalDIST" -ge "2016" && "$tmpFinalDIST" -le "2022" ]]; then
+				tmpURL="$tmpURL/"${tmpTargetLang}"_win"${tmpFinalDIST}".xz"
+				showFinalDIST="Server $tmpFinalDIST"
+			elif [[ "$tmpFinalDIST" -ge "10" && "$tmpFinalDIST" -le "11" ]]; then
+				[[ "$tmpFinalDIST" == "10" ]] && {
+					[[ "$targetLang" == 'en' ]] && tmpURL="$tmpURL/tiny"${tmpFinalDIST}"_23h2.xz" || tmpURL="$tmpURL/"${tmpTargetLang}"_windows"${tmpFinalDIST}"_ltsc.xz"
+					showFinalDIST="$tmpFinalDIST Enterprise LTSC"
+				}
+				[[ "$tmpFinalDIST" == "11" ]] && {
+					[[ "$targetLang" == 'en' ]] && tmpURL="$tmpURL/tiny"${tmpFinalDIST}"_23h2.xz" || tmpURL="$tmpURL/"${tmpTargetLang}"_windows"${tmpFinalDIST}"_22h2.xz"
+					showFinalDIST="$tmpFinalDIST Pro for Workstations"
+				}
+			fi
+			if [[ "$EfiSupport" == "enabled" ]]; then
+				[[ "$tmpFinalDIST" == "10" ]] && tmpURL=$(echo $tmpURL | sed 's/windows/win/g')
+				tmpURL=$(echo $tmpURL | sed 's/...$/_uefi.xz/g')
+			fi
+			ReleaseName="$targetRelese $showFinalDIST"
+		else
+			showFinalDIST=""
+			ReleaseName="$targetRelese"
+		fi
+		verifyUrlValidationOfDdImages "$tmpURL"
+	elif [[ -z "$targetRelese" && "$tmpURL" != "" ]]; then
+		verifyUrlValidationOfDdImages "$tmpURL"
+		ReleaseName="Self-Modified OS"
+	else
+		echo -ne "\n[${red}Warning${plain}] Please input a vaild image URL!\n"
+		exit 1
+	fi
+fi
+
+# The first network adapter name is must be "eth0" if kernel is loaded with parameter "net.ifnames=0 biosdevname=0".
+# If the names of network adapters on original system were not be redirected, we can speculate them according to the sequence
+# which they had plugged into the system by a physical queue if newly installed system need to redirect network adapters.
+if [[ "$setInterfaceName" == "1" ]] && [[ ! "$interface4" =~ "eth" || ! "$interface6" =~ "eth" ]]; then
+	interface4="eth""$interface4DeviceOrder"
+	interface6="eth""$interface6DeviceOrder"
+	interface="$interface4"
+	[[ "$IPStackType" == "IPv6Stack" ]] && interface="$interface6"
+fi
+
+if [ -z "$interfaceSelect" ]; then
+	if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]] || [[ "$linux_relese" == 'kali' ]]; then
+		interfaceSelect="auto"
+	elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+		interfaceSelect="link"
+	fi
+	# Some cloud providers using the second or further order back of interface adapter like "eth1" to config public networking usually and we don't know what's role of "eth0".
+	[[ "$interfacesNum" -ge "2" ]] && {
+		if [[ "$IPStackType" == "IPv6Stack" ]]; then
+			# Approximately equal "=~" to "eth..." is for the redirected situation, "device order" is on the contrary for an un-redirected example.
+			[[ "$interface6" =~ "eth" && $(echo "$interface6" | grep -o '[0-9]') != "0" ]] || [[ "$interface6DeviceOrder" != "0" ]] && {
+				interfaceSelect="$interface6"
+			}
+		elif [[ "$IPStackType" == "BiStack" || "$IPStackType" == "IPv4Stack" ]]; then
+			[[ "$interface4" =~ "eth" && $(echo "$interface4" | grep -o '[0-9]') != "0" ]] || [[ "$interface4DeviceOrder" != "0" ]] && {
+				interfaceSelect="$interface4"
+			}
+		fi
+	}
+else
+	# If the kernel of original system is loaded with parameter "net.ifnames=0 biosdevname=0" and users don't want to set this
+	# one in new system, they have to assign a valid, real name of their network adapter and the parameter "$interface"
+	# will be written to new network configuration in preseed file for new system.
+	interface4=$(echo "$interfaceSelect" | cut -d' ' -f 1)
+	interface6=$(echo "$interfaceSelect" | cut -d' ' -f 2)
+	interface="$interface4"
+	[[ -z "$interface6" ]] && {
+		interface=$(echo "$interfaceSelect" | sed 's/[[:space:]]//g')
+		interface6="$interface"
+	}
+fi
+
+echo -ne "\n${aoiBlue}# Installation Starting${plain}\n"
+
+[[ "$ddMode" == '1' ]] && echo -ne "\n${blue}Overwriting Packaged Image Mode${plain} Target System [${yellow}$ReleaseName${plain}]\n$DDURL\n"
+
+if [[ "$linux_relese" == 'centos' ]]; then
+	if [[ "$DIST" != "$UNVER" ]]; then
+		awk 'BEGIN{print '${UNVER}'-'${DIST}'}' | grep -q '^-'
+		if [ $? != '0' ]; then
+			UNKNOWHW='1'
+			echo -ne "\nThe version lower than ${red}$UNVER${plain} may not support in auto mode!\n"
+		fi
+	fi
+fi
+[[ "$setNetbootXyz" == "0" ]] && echo -ne "\n[${yellow}$Relese${plain}] [${yellow}$DIST${plain}] [${yellow}$VER${plain}] Downloading...\n" || echo -ne "\n[${yellow}netboot.xyz${plain}] Downloading...\n"
+
+if [[ "$setNetbootXyz" == "1" ]]; then
+	[[ "$VER" == "x86_64" || "$VER" == "amd64" ]] && apt install grub-imageboot -y
+	if [[ "$EfiSupport" == "enabled" ]] || [[ "$VER" == "aarch64" || "$VER" == "arm64" ]]; then
+		echo -ne "\n[${red}Error${plain}] Netbootxyz doesn't support $VER architecture!\n"
+		bash $0 error
+		exit 1
+	fi
+	# NetbootXYZ set to boot from an existing Linux installation using GRUB
+	# Reference: https://netboot.xyz/docs/booting/grub
+	if [[ "$IsCN" == "cn" ]]; then
+		NetbootXyzUrl="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/NetbootXyz/netboot.xyz.iso"
+		NetbootXyzGrub="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/NetbootXyz/60_grub-imageboot"
+	else
+		NetbootXyzUrl="https://boot.netboot.xyz/ipxe/netboot.xyz.iso"
+		NetbootXyzGrub="https://raw.githubusercontent.com/formorer/grub-imageboot/master/bin/60_grub-imageboot"
+	fi
+	[[ ! -d "/boot/images/" ]] && mkdir /boot/images/
+	rm -rf /boot/images/netboot.xyz.iso
+	echo -ne "[${yellow}Mirror${plain}] $NetbootXyzUrl\n"
+	wget --no-check-certificate -qO '/boot/images/netboot.xyz.iso' "$NetbootXyzUrl"
+	[[ ! -f "/etc/grub.d/60_grub-imageboot" ]] && wget --no-check-certificate -qO '/etc/grub.d/60_grub-imageboot' "$NetbootXyzGrub"
+	chmod 755 /etc/grub.d/60_grub-imageboot
+	[[ ! -z "$GRUBTYPE" && "$GRUBTYPE" == "isGrub2" ]] && {
+		rm -rf /boot/memdisk
+		cp /usr/share/syslinux/memdisk /boot/memdisk
+		ln -s /usr/share/grub/grub-mkconfig_lib /usr/lib/grub/grub-mkconfig_lib
+	}
+elif [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]] || [[ "$linux_relese" == 'kali' ]]; then
+	[ "$DIST" == "focal" ] && legacy="legacy-" || legacy=""
+	InitrdUrl="${LinuxMirror}/dists/${DIST}/main/installer-${VER}/current/${legacy}images/netboot/${linux_relese}-installer/${VER}/initrd.gz"
+	VmLinuzUrl="${LinuxMirror}/dists/${DIST}${inUpdate}/main/installer-${VER}/current/${legacy}images/netboot/${linux_relese}-installer/${VER}/linux"
+	[[ "$linux_relese" == 'kali' ]] && {
+		InitrdUrl="${LinuxMirror}/dists/${DIST}/main/installer-${VER}/current/images/netboot/debian-installer/${VER}/initrd.gz"
+		VmLinuzUrl="${LinuxMirror}/dists/${DIST}/main/installer-${VER}/current/images/netboot/debian-installer/${VER}/linux"
+	}
+	echo -ne "[${yellow}Mirror${plain}] $InitrdUrl\n\t $VmLinuzUrl\n"
+	wget --no-check-certificate -qO '/tmp/initrd.img' "$InitrdUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'initrd.img' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	wget --no-check-certificate -qO '/tmp/vmlinuz' "$VmLinuzUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'vmlinuz' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	MirrorHost="$(echo "$LinuxMirror" | awk -F'://|/' '{print $2}')"
+	MirrorFolder="$(echo "$LinuxMirror" | awk -F''${MirrorHost}'' '{print $2}')/"
+	[ -n "$MirrorFolder" ] || MirrorFolder="/"
+elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+	InitrdUrl="${LinuxMirror}/${DIST}/releases/${VER}/netboot/${InitrdName}"
+	VmLinuzUrl="${LinuxMirror}/${DIST}/releases/${VER}/netboot/${VmLinuzName}"
+	ModLoopUrl="${LinuxMirror}/${DIST}/releases/${VER}/netboot/${ModLoopName}"
+	echo -ne "[${yellow}Mirror${plain}] $InitrdUrl\n\t $VmLinuzUrl\n"
+	wget --no-check-certificate -qO '/tmp/initrd.img' "$InitrdUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download '$InitrdName' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	wget --no-check-certificate -qO '/tmp/vmlinuz' "$VmLinuzUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download '$VmLinuzName' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+elif [[ "$linux_relese" == 'centos' ]] && [[ "$RedHatSeries" -le "7" ]]; then
+	InitrdUrl="${LinuxMirror}/${DIST}/os/${VER}/images/pxeboot/initrd.img"
+	VmLinuzUrl="${LinuxMirror}/${DIST}/os/${VER}/images/pxeboot/vmlinuz"
+	echo -ne "[${yellow}Mirror${plain}] $InitrdUrl\n\t $VmLinuzUrl\n"
+	wget --no-check-certificate -qO '/tmp/initrd.img' "$InitrdUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'initrd.img' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	wget --no-check-certificate -qO '/tmp/vmlinuz' "$VmLinuzUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'vmlinuz' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+elif [[ "$linux_relese" == 'centos' && "$RedHatSeries" -ge "8" ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]]; then
+	InitrdUrl="${LinuxMirror}/${DIST}/BaseOS/${VER}/os/images/pxeboot/initrd.img"
+	VmLinuzUrl="${LinuxMirror}/${DIST}/BaseOS/${VER}/os/images/pxeboot/vmlinuz"
+	echo -ne "[${yellow}Mirror${plain}] $InitrdUrl\n\t $VmLinuzUrl\n"
+	wget --no-check-certificate -qO '/tmp/initrd.img' "$InitrdUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'initrd.img' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	wget --no-check-certificate -qO '/tmp/vmlinuz' "$VmLinuzUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'vmlinuz' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+elif [[ "$linux_relese" == 'fedora' ]]; then
+	InitrdUrl="${LinuxMirror}/releases/${DIST}/Server/${VER}/os/images/pxeboot/initrd.img"
+	VmLinuzUrl="${LinuxMirror}/releases/${DIST}/Server/${VER}/os/images/pxeboot/vmlinuz"
+	echo -ne "[${yellow}Mirror${plain}] $InitrdUrl\n\t $VmLinuzUrl\n"
+	wget --no-check-certificate -qO '/tmp/initrd.img' "$InitrdUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'initrd.img' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+	wget --no-check-certificate -qO '/tmp/vmlinuz' "$VmLinuzUrl"
+	[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download 'vmlinuz' for ${yellow}$linux_relese${plain} failed! \n" && exit 1
+else
+	bash $0 error
+	exit 1
+fi
+
+if [[ "$IncFirmware" == '1' ]]; then
+	if [[ "$linux_relese" == 'debian' ]]; then
+		if [[ "$IsCN" == "cn" ]]; then
+			wget --no-check-certificate -qO '/tmp/firmware.cpio.gz' "https://mirrors.ustc.edu.cn/debian-cdimage/unofficial/non-free/firmware/${DIST}/current/firmware.cpio.gz"
+			[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download firmware for ${red}$linux_relese${plain} failed! \n" && exit 1
+		else
+			wget --no-check-certificate -qO '/tmp/firmware.cpio.gz' "http://cdimage.debian.org/cdimage/unofficial/non-free/firmware/${DIST}/current/firmware.cpio.gz"
+			[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download firmware for ${red}$linux_relese${plain} failed! \n" && exit 1
+		fi
+		if [[ "$ddMode" == '1' ]]; then
+			vKernel_udeb=$(wget --no-check-certificate -qO- "http://$LinuxMirror/dists/$DIST/main/installer-$VER/current/images/udeb.list" | grep '^acpi-modules' | head -n1 | grep -o '[0-9]\{1,2\}.[0-9]\{1,2\}.[0-9]\{1,2\}-[0-9]\{1,2\}' | head -n1)
+			[[ -z "vKernel_udeb" ]] && vKernel_udeb="6.1.0-11"
+		fi
+	elif [[ "$linux_relese" == 'kali' ]]; then
+		if [[ "$IsCN" == "cn" ]]; then
+			wget --no-check-certificate -qO /root/kaliFirmwareCheck 'https://mirrors.tuna.tsinghua.edu.cn/kali/pool/non-free/f/firmware-nonfree/?C=S&O=D'
+			kaliFirmwareName=$(grep "href=\"firmware-nonfree" /root/kaliFirmwareCheck | head -n 1 | awk -F'\">' '/tar.xz/{print $3}' | cut -d'<' -f1 | cut -d'/' -f2)
+			wget --no-check-certificate -qO '/tmp/kali_firmware.tar.xz' "https://mirrors.tuna.tsinghua.edu.cn/kali/pool/non-free/f/firmware-nonfree/$kaliFirmwareName"
+			[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download firmware for ${red}$linux_relese${plain} failed! \n" && exit 1
+			rm -rf /root/kaliFirmwareCheck
+		else
+			wget --no-check-certificate -qO /root/kaliFirmwareCheck 'https://mirrors.ocf.berkeley.edu/kali/pool/non-free/f/firmware-nonfree/?C=S&O=D'
+			kaliFirmwareName=$(grep "href=\"firmware-nonfree" /root/kaliFirmwareCheck | head -n 1 | awk -F'\">' '/tar.xz/{print $3}' | cut -d'<' -f1 | cut -d'/' -f2)
+			wget --no-check-certificate -qO '/tmp/kali_firmware.tar.xz' "https://mirrors.ocf.berkeley.edu/kali/pool/non-free/f/firmware-nonfree/$kaliFirmwareName"
+			[[ $? -ne '0' ]] && echo -ne "\n[${red}Error${plain}] Download firmware for ${red}$linux_relese${plain} failed! \n" && exit 1
+			rm -rf /root/kaliFirmwareCheck
+		fi
+		decompressedKaliFirmwareDir=$(echo $kaliFirmwareName | cut -d'.' -f 1 | sed 's/_/-/g')
+	fi
+fi
+
+# Resize "/tmp" to avoid too low space to contain netboot kernel, base measure is "MB".
+tmpDirAvail=$(df -TBM | grep "/tmp\|/dev/shm" | head -n 1 | awk '{print $5}' | tr -cd "[0-9]")
+[[ "$tmpDirAvail" -lt "1024" ]] && mount -o remount,size=1G,noexec,nosuid,nodev,noatime tmpfs /tmp 2>/dev/null
+
+[[ -d /tmp/boot ]] && rm -rf /tmp/boot
+mkdir -p /tmp/boot
+cd /tmp/boot
+
+if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]] || [[ "$linux_relese" == 'kali' ]] || [[ "$linux_relese" == 'alpinelinux' ]]; then
+	COMPTYPE="gzip"
+elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+	COMPTYPE="$(file ../initrd.img | grep -o ':.*compressed data' | cut -d' ' -f2 | sed -r 's/(.*)/\L\1/' | head -n1)"
+	[[ -z "$COMPTYPE" ]] && echo "Detect compressed type fail." && exit 1
+fi
+CompDected='0'
+for COMP in $(echo -en 'gzip\nlzma\nxz'); do
+	if [[ "$COMPTYPE" == "$COMP" ]]; then
+		CompDected='1'
+		if [[ "$COMPTYPE" == 'gzip' ]]; then
+			NewIMG="initrd.img.gz"
+		else
+			NewIMG="initrd.img.$COMPTYPE"
+		fi
+		mv -f "/tmp/initrd.img" "/tmp/$NewIMG"
+		break
+	fi
 done
+[[ "$CompDected" != '1' ]] && echo "Detect compressed type not support." && exit 1
+[[ "$COMPTYPE" == 'lzma' ]] && UNCOMP='xz --format=lzma --decompress'
+[[ "$COMPTYPE" == 'xz' ]] && UNCOMP='xz --decompress'
+[[ "$COMPTYPE" == 'gzip' ]] && UNCOMP='gzip -d'
+$UNCOMP </tmp/$NewIMG | cpio --extract --make-directories --preserve-modification-time >>/dev/null 2>&1
 
-# 检查目标系统名
-verify_os_name "$@"
+if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]] || [[ "$linux_relese" == 'ubuntu' ]]; then
+	DebianPreseedProcess
+	if [[ "$loaderMode" != "0" ]] && [[ "$setNet" == '0' ]]; then
+		sed -i '/netcfg\/disable_autoconfig/d' /tmp/boot/preseed.cfg
+		sed -i '/netcfg\/dhcp_options/d' /tmp/boot/preseed.cfg
+		sed -i '/netcfg\/get_.*/d' /tmp/boot/preseed.cfg
+		sed -i '/netcfg\/confirm_static/d' /tmp/boot/preseed.cfg
+	fi
+	# If server has only one disk, lv/vg/pv volumes removement by force should be disallowed, it may causes partitioner continuous execution but not finished.
+	if [[ "$disksNum" -le "1" || "$setDisk" != "all" || -n "$setRaid" ]]; then
+		sed -i 's/lvremove --select all -ff -y;//g' /tmp/boot/preseed.cfg
+		sed -i 's/vgremove --select all -ff -y;//g' /tmp/boot/preseed.cfg
+		sed -i 's/pvremove \/dev\/\* -ff -y;//g' /tmp/boot/preseed.cfg
+	elif [[ "$disksNum" -ge "2" && "$setDisk" == "all" ]]; then
+		# Some virtual machines will hanging on partition step if execute pvremove.
+		[[ -z "$virtWhat" ]] || sed -i 's/pvremove \/dev\/\* -ff -y;//g' /tmp/boot/preseed.cfg
+	fi
+	if [[ "$disksNum" -ge "2" ]] && [[ -n "$setRaid" ]]; then
+		sed -i 's/d-i partman\/early_command.*//g' /tmp/boot/preseed.cfg
+		sed -ri "/d-i grub-installer\/bootdev.*/c\d-i grub-installer\/bootdev string $AllDisks" /tmp/boot/preseed.cfg
+	fi
+	# Debian 8 and former or Raid mode don't support xfs.
+	[[ "$DebianDistNum" -le "8" || -n "$setRaid" ]] && sed -i '/d-i\ partman\/default_filesystem string xfs/d' /tmp/boot/preseed.cfg
+	if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]]; then
+		sed -i '/user-setup\/allow-password-weak/d' /tmp/boot/preseed.cfg
+		sed -i '/user-setup\/encrypt-home/d' /tmp/boot/preseed.cfg
+		sed -i '/pkgsel\/update-policy/d' /tmp/boot/preseed.cfg
+		sed -i 's/umount\ \/media.*true\;\ //g' /tmp/boot/preseed.cfg
+		[[ -f '/tmp/firmware.cpio.gz' ]] && gzip -d </tmp/firmware.cpio.gz | cpio --extract --verbose --make-directories --no-absolute-filenames >>/dev/null 2>&1
+		# Uncompressed hardware drivers size of Kali firmware non-free such as "firmware-nonfree_20230210.orig.tar.xz" is almost 800MB,
+		# if the physical memory of server is below 3GB, I suggested that not load parameter "-firmware".
+		[[ -f '/tmp/kali_firmware.tar.xz' ]] && {
+			tar -Jxvf '/tmp/kali_firmware.tar.xz' -C /tmp/
+			mv /tmp/$decompressedKaliFirmwareDir/* '/tmp/boot/lib/firmware/'
+		}
+	fi
+	# Ubuntu 20.04 and below does't support xfs, force grub-efi installation to the removable media path may cause grub install failed, low memory mode.
+	if [[ "$linux_relese" == 'ubuntu' ]]; then
+		sed -i '/d-i\ partman\/default_filesystem string xfs/d' /tmp/boot/preseed.cfg
+		sed -i '/d-i\ grub-installer\/force-efi-extra-removable/d' /tmp/boot/preseed.cfg
+		sed -i '/d-i\ lowmem\/low note/d' /tmp/boot/preseed.cfg
+	fi
+	# Kali preseed.cfg reference:
+	# https://github.com/iesplin/kali-preseed/blob/master/preseed/core-minimal.cfg
+	#
+	# Kali metapackages reference:
+	# https://www.kali.org/docs/general-use/metapackages/
+	if [[ "$linux_relese" == 'kali' ]]; then
+		sed -i 's/first multiselect minimal/first multiselect standard/g' /tmp/boot/preseed.cfg
+		sed -i 's/upgrade select none/upgrade select full-upgrade/g' /tmp/boot/preseed.cfg
+		sed -i 's/include string openssh-server/include string kali-linux-core openssh-server/g' /tmp/boot/preseed.cfg
+		sed -i 's/d-i grub-installer\/with_other_os boolean true//g' /tmp/boot/preseed.cfg
+	fi
+	# Disable get security updates for those versions of Debian which were 'EOL'(9 and former in 2023.07) and Kali.
+	if [[ "$linux_relese" == 'kali' ]]; then
+		sed -ri 's/services-select multiselect security, updates/services-select multiselect updates/g' /tmp/boot/preseed.cfg
+		sed -i '/d-i\ apt-setup\/security_host string/d' /tmp/boot/preseed.cfg
+	elif [[ "$linux_relese" == 'debian' && "$DebianDistNum" -le "9" ]]; then
+		sed -ri 's/services-select multiselect security, updates/services-select multiselect/g' /tmp/boot/preseed.cfg
+		sed -ri 's/enable-source-repositories boolean true/enable-source-repositories boolean false/g' /tmp/boot/preseed.cfg
+		sed -i '/d-i\ apt-setup\/security_host string/d' /tmp/boot/preseed.cfg
+	fi
+	# Static network environment doesn't support ntp clock setup.
+	if [[ "$Network4Config" == "isStatic" ]] || [[ "$Network6Config" == "isStatic" ]]; then
+		sed -i 's/ntp boolean true/ntp boolean false/g' /tmp/boot/preseed.cfg
+		sed -i '/d-i\ clock-setup\/ntp-server string ntp.nict.jp/d' /tmp/boot/preseed.cfg
+	fi
+	# If network adapter is not redirected, delete this setting to new system.
+	[[ "$setInterfaceName" == "0" ]] && sed -i 's/net.ifnames=0 biosdevname=0//g' /tmp/boot/preseed.cfg
+	# If user not setting disable IPv6 or network is IPv6 or bio-stack, "ipv6.disable=1" should be deleted.
+	[[ "$setIPv6" == "1" ]] && sed -i 's/ipv6.disable=1//g' /tmp/boot/preseed.cfg
 
-# 检查必须的参数
-verify_os_args
+	[[ "$ddMode" == '1' ]] && {
+		WinNoDHCP() {
+			echo -ne "for\0040\0057f\0040\0042tokens\00753\0052\0042\0040\0045\0045i\0040in\0040\0050\0047netsh\0040interface\0040show\0040interface\0040\0136\0174more\0040\00533\0040\0136\0174findstr\0040\0057I\0040\0057R\0040\0042本地\0056\0052\0040以太\0056\0052\0040Local\0056\0052\0040Ethernet\0042\0047\0051\0040do\0040\0050set\0040EthName\0075\0045\0045j\0051\r\nnetsh\0040\0055c\0040interface\0040ip\0040set\0040address\0040name\0075\0042\0045EthName\0045\0042\0040source\0075static\0040address\0075$IPv4\0040mask\0075$MASK\0040gateway\0075$GATE\r\nnetsh\0040\0055c\0040interface\0040ip\0040add\0040dnsservers\0040name\0075\0042\0045EthName\0045\0042\0040address\00758\00568\00568\00568\0040index\00751\0040validate\0075no\r\n\r\n" >>'/tmp/boot/net.tmp'
+		}
+		WinRDP() {
+			echo -ne "netsh\0040firewall\0040set\0040portopening\0040protocol\0075ALL\0040port\0075$WinRemote\0040name\0075RDP\0040mode\0075ENABLE\0040scope\0075ALL\0040profile\0075ALL\r\nnetsh\0040firewall\0040set\0040portopening\0040protocol\0075ALL\0040port\0075$WinRemote\0040name\0075RDP\0040mode\0075ENABLE\0040scope\0075ALL\0040profile\0075CURRENT\r\nreg\0040add\0040\0042HKLM\0134SYSTEM\0134CurrentControlSet\0134Control\0134Network\0134NewNetworkWindowOff\0042\0040\0057f\r\nreg\0040add\0040\0042HKLM\0134SYSTEM\0134CurrentControlSet\0134Control\0134Terminal\0040Server\0042\0040\0057v\0040fDenyTSConnections\0040\0057t\0040reg\0137dword\0040\0057d\00400\0040\0057f\r\nreg\0040add\0040\0042HKLM\0134SYSTEM\0134CurrentControlSet\0134Control\0134Terminal\0040Server\0134Wds\0134rdpwd\0134Tds\0134tcp\0042\0040\0057v\0040PortNumber\0040\0057t\0040reg\0137dword\0040\0057d\0040$WinRemote\0040\0057f\r\nreg\0040add\0040\0042HKLM\0134SYSTEM\0134CurrentControlSet\0134Control\0134Terminal\0040Server\0134WinStations\0134RDP\0055Tcp\0042\0040\0057v\0040PortNumber\0040\0057t\0040reg\0137dword\0040\0057d\0040$WinRemote\0040\0057f\r\nreg\0040add\0040\0042HKLM\0134SYSTEM\0134CurrentControlSet\0134Control\0134Terminal\0040Server\0134WinStations\0134RDP\0055Tcp\0042\0040\0057v\0040UserAuthentication\0040\0057t\0040reg\0137dword\0040\0057d\00400\0040\0057f\r\nFOR\0040\0057F\0040\0042tokens\00752\0040delims\0075\0072\0042\0040\0045\0045i\0040in\0040\0050\0047SC\0040QUERYEX\0040TermService\0040\0136\0174FINDSTR\0040\0057I\0040\0042PID\0042\0047\0051\0040do\0040TASKKILL\0040\0057F\0040\0057PID\0040\0045\0045i\r\nFOR\0040\0057F\0040\0042tokens\00752\0040delims\0075\0072\0042\0040\0045\0045i\0040in\0040\0050\0047SC\0040QUERYEX\0040UmRdpService\0040\0136\0174FINDSTR\0040\0057I\0040\0042PID\0042\0047\0051\0040do\0040TASKKILL\0040\0057F\0040\0057PID\0040\0045\0045i\r\nSC\0040START\0040TermService\r\n\r\n" >>'/tmp/boot/net.tmp'
+		}
+		echo -ne "\0100ECHO\0040OFF\r\n\r\ncd\0056\0076\0045WINDIR\0045\0134GetAdmin\r\nif\0040exist\0040\0045WINDIR\0045\0134GetAdmin\0040\0050del\0040\0057f\0040\0057q\0040\0042\0045WINDIR\0045\0134GetAdmin\0042\0051\0040else\0040\0050\r\necho\0040CreateObject\0136\0050\0042Shell\0056Application\0042\0136\0051\0056ShellExecute\0040\0042\0045\0176s0\0042\0054\0040\0042\0045\0052\0042\0054\0040\0042\0042\0054\0040\0042runas\0042\0054\00401\0040\0076\0076\0040\0042\0045temp\0045\0134Admin\0056vbs\0042\r\n\0042\0045temp\0045\0134Admin\0056vbs\0042\r\ndel\0040\0057f\0040\0057q\0040\0042\0045temp\0045\0134Admin\0056vbs\0042\r\nexit\0040\0057b\00402\0051\r\n\r\n" >'/tmp/boot/net.tmp'
+		[[ "$setNet" == '1' ]] && WinNoDHCP
+		[[ "$setNet" == '0' ]] && [[ "$AutoNet" == '0' ]] && WinNoDHCP
+		[[ "$setRDP" == '1' ]] && [[ -n "$WinRemote" ]] && WinRDP
+		echo -ne "ECHO\0040SELECT\0040VOLUME\0075\0045\0045SystemDrive\0045\0045\0040\0076\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nECHO\0040EXTEND\0040\0076\0076\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nSTART\0040/WAIT\0040DISKPART\0040\0057S\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\nDEL\0040\0057f\0040\0057q\0040\0042\0045SystemDrive\0045\0134diskpart\0056extend\0042\r\n\r\n" >>'/tmp/boot/net.tmp'
+		echo -ne "cd\0040\0057d\0040\0042\0045ProgramData\0045\0057Microsoft\0057Windows\0057Start\0040Menu\0057Programs\0057Startup\0042\r\ndel\0040\0057f\0040\0057q\0040net\0056bat\r\n\r\n\r\n" >>'/tmp/boot/net.tmp'
+		iconv -f 'UTF-8' -t 'GBK' '/tmp/boot/net.tmp' -o '/tmp/boot/net.bat'
+		rm -rf '/tmp/boot/net.tmp'
+	}
+	[[ "$ddMode" == '0' ]] && {
+		sed -i '/anna-install/d' /tmp/boot/preseed.cfg
+		sed -i 's/wget.*\/sbin\/reboot\;\ //g' /tmp/boot/preseed.cfg
+	}
+	# Commands of "d-i preseed/early_command" in "preseed.cfg" can only appear at one time, otherwise if there are two or more "preseed/early_command" in one preseed,
+	# Debian installer can only execute one of them instead of running all of them because soft hack for irregular IPv4 configs and dd Windows will all using "preseed/early_command".
+	[[ "$BurnIrregularIpv4Status" == "1" ]] && {
+		sed -i '/early_command string anna-install/d' /tmp/boot/preseed.cfg
+	}
+elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+	alpineArchitecture="$VER"
+	# Enable IPv6
+	echo "ipv6" >>/tmp/boot/etc/modules
+	if [[ "$setAutoConfig" == "1" ]]; then
+		AlpineInitLineNum=$(grep -E -n '^exec (/bin/busybox )?switch_root' /tmp/boot/init | cut -d: -f1)
+		AlpineInitLineNum=$((AlpineInitLineNum - 1))
+		if [[ "$IsCN" == "cn" ]]; then
+			alpineInstallOrDdAdditionalFiles "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/alpineInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/network/resolv_cn.conf" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/motd.sh" "mirrors.ustc.edu.cn" "mirrors.tuna.tsinghua.edu.cn" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/windowsInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/SetupComplete.bat" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/RHELinit.sh" "mirrors.ustc.edu.cn"
+		else
+			alpineInstallOrDdAdditionalFiles "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/alpineInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/network/resolv.conf" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/motd.sh" "archive.ubuntu.com" "ports.ubuntu.com" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/windowsInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/SetupComplete.bat" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/RedHat/RHELinit.sh" "security.ubuntu.com"
+			# Reserved alternative mirror comes from gitlab.com of initial files for engineering, if you are not fascinated with debugging, don't uncomment with them!
+			# alpineInstallOrDdAdditionalFiles "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/alpineInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/network/resolv.conf" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/motd.sh" "archive.ubuntu.com" "ports.ubuntu.com" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Windows/windowsInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Windows/SetupComplete.bat" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/RedHat/RHELinit.sh" "security.ubuntu.com"
+		fi
+		# Cloud init configurate documents and resources:
+		# Ubuntu cloud images:
+		# https://cloud-images.ubuntu.com/daily/server/
+		# customize Ubuntu cloud images by our own:
+		# https://bleatingsheep.org/2022/03/14/%E7%94%A8-Ubuntu-Cloud-Images-%E5%88%B6%E4%BD%9C%E8%87%AA%E5%B7%B1%E7%9A%84%E4%BA%91%E9%95%9C%E5%83%8F%EF%BC%88%E9%85%8D%E7%BD%AE-cloud-init-%E7%9A%84-NoCloud-%E6%95%B0%E6%8D%AE%E6%BA%90%EF%BC%89/
+		# documents from Redhat:
+		# https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/configuring_and_managing_cloud-init_for_rhel_8/configuring-cloud-init_cloud-content
+		# network configuration:
+		# https://cloudinit.readthedocs.io/en/latest/reference/network-config-format-v2.html
+		# valid "*.yaml" format regulations for netplan samples:
+		# https://qiita.com/zen3/items/757f96cbe522a9ad397d
+		# netplan will deperate the "gateway4" and "gateway6", use "routes" to replace it.
+		# https://rohhie.net/ubuntu22-04-netplan-gateway4-has-been-deprecated/
+		# enable netplan configuration permanently to prevent to be changed by cloud init during rebooting from the new OS
+		# https://askubuntu.com/questions/1051655/convert-etc-network-interfaces-to-netplan
+		# disable cloud init service when next restart
+		# https://cloudinit.readthedocs.io/en/latest/howto/disable_cloud_init.html
+		alpineNetcfgMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/network/"
+		alpineNetcfgMirror="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/network/"
+		[[ "$targetRelese" == 'Ubuntu' ]] && {
+			ubuntuCloudinitMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Ubuntu/CloudInit/"
+			ubuntuCloudinitMirror="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Ubuntu/CloudInit/"
+		}
+		[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && {
+			rhelCloudinitMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/CloudInit/"
+			rhelCloudinitMirror="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/RedHat/CloudInit/"
+		}
+		if [[ "$IPStackType" == "IPv4Stack" ]]; then
+			if [[ "$Network4Config" == "isDHCP" ]]; then
+				if [[ "$IsCN" == "cn" ]]; then
+					AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_dhcp_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""dhcp_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirrorCn""dhcp_interfaces.cfg"
+				else
+					AlpineNetworkConf="$alpineNetcfgMirror""ipv4_dhcp_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirror""dhcp_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirror""dhcp_interfaces.cfg"
+				fi
+			elif [[ "$Network4Config" == "isStatic" ]]; then
+				if [[ "$IsCN" == "cn" ]]; then
+					AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_static_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""ipv4_static_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirrorCn""ipv4_static_interfaces.cfg"
+				else
+					AlpineNetworkConf="$alpineNetcfgMirror""ipv4_static_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirror""ipv4_static_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirror""ipv4_static_interfaces.cfg"
+				fi
+			fi
+			networkAdapter="$interface4"
+		elif [[ "$IPStackType" == "BiStack" ]]; then
+			# To let Alpine Linux support IPv6 automatic config, we must install dhcpcd.
+			if [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+				[[ "$IsCN" == "cn" ]] && AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_ipv6_dhcp_interfaces" || AlpineNetworkConf="$alpineNetcfgMirror""ipv4_ipv6_dhcp_interfaces"
+			elif [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+				[[ "$IsCN" == "cn" ]] && AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_dhcp_ipv6_static_interfaces" || AlpineNetworkConf="$alpineNetcfgMirror""ipv4_dhcp_ipv6_static_interfaces"
+			elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+				[[ "$IsCN" == "cn" ]] && AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_static_ipv6_dhcp_interfaces" || AlpineNetworkConf="$alpineNetcfgMirror""ipv4_static_ipv6_dhcp_interfaces"
+			elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+				[[ "$IsCN" == "cn" ]] && AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_ipv6_static_interfaces" || AlpineNetworkConf="$alpineNetcfgMirror""ipv4_ipv6_static_interfaces"
+			fi
+			[[ "$iAddrNum" -ge "2" || "$i6AddrNum" -ge "2" ]] && {
+				[[ "$IsCN" == "cn" ]] && AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv4_static_interfaces" || AlpineNetworkConf="$alpineNetcfgMirror""ipv4_static_interfaces"
+			}
+			[[ "$targetRelese" == 'Ubuntu' ]] && {
+				if [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""dhcp_interfaces.cfg" || cloudInitUrl="$ubuntuCloudinitMirror""dhcp_interfaces.cfg"
+				elif [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""ipv4_dhcp_ipv6_static_interfaces.cfg" || cloudInitUrl="$ubuntuCloudinitMirror""ipv4_dhcp_ipv6_static_interfaces.cfg"
+				elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""ipv4_static_ipv6_dhcp_interfaces.cfg" || cloudInitUrl="$ubuntuCloudinitMirror""ipv4_static_ipv6_dhcp_interfaces.cfg"
+				elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""ipv4_static_ipv6_static_interfaces.cfg" || cloudInitUrl="$ubuntuCloudinitMirror""ipv4_static_ipv6_static_interfaces.cfg"
+				fi
+			}
+			[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && {
+				if [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$rhelCloudinitMirrorCn""dhcp_interfaces.cfg" || cloudInitUrl="$rhelCloudinitMirror""dhcp_interfaces.cfg"
+				elif [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$rhelCloudinitMirrorCn""ipv4_dhcp_ipv6_static_interfaces.cfg" || cloudInitUrl="$rhelCloudinitMirror""ipv4_dhcp_ipv6_static_interfaces.cfg"
+				elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$rhelCloudinitMirrorCn""ipv4_static_ipv6_dhcp_interfaces.cfg" || cloudInitUrl="$rhelCloudinitMirror""ipv4_static_ipv6_dhcp_interfaces.cfg"
+				elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+					[[ "$IsCN" == "cn" ]] && cloudInitUrl="$rhelCloudinitMirrorCn""ipv4_static_ipv6_static_interfaces.cfg" || cloudInitUrl="$rhelCloudinitMirror""ipv4_static_ipv6_static_interfaces.cfg"
+				fi
+			}
+			networkAdapter="$interface4"
+		elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+			if [[ "$Network6Config" == "isDHCP" ]]; then
+				if [[ "$IsCN" == "cn" ]]; then
+					AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv6_dhcp_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""dhcp_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirrorCn""dhcp_interfaces.cfg"
+				else
+					AlpineNetworkConf="$alpineNetcfgMirror""ipv6_dhcp_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirror""dhcp_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirror""dhcp_interfaces.cfg"
+				fi
+			elif [[ "$Network6Config" == "isStatic" ]]; then
+				if [[ "$IsCN" == "cn" ]]; then
+					AlpineNetworkConf="$alpineNetcfgMirrorCn""ipv6_static_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirrorCn""ipv6_static_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirrorCn""ipv6_static_interfaces.cfg"
+				else
+					AlpineNetworkConf="$alpineNetcfgMirror""ipv6_static_interfaces"
+					[[ "$targetRelese" == 'Ubuntu' ]] && cloudInitUrl="$ubuntuCloudinitMirror""ipv6_static_interfaces.cfg"
+					[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && cloudInitUrl="$rhelCloudinitMirror""ipv6_static_interfaces.cfg"
+				fi
+			fi
+			networkAdapter="$interface6"
+		fi
+		if [[ "$IPStackType" == "BiStack" || "$IPStackType" == "IPv4Stack" ]]; then
+			# Soft hack of irregular IPv4 configs.
+			# Reserved empty variables for engineering debugging, if you are not known them well, don't uncomment with them!
+			# BurnIrregularIpv4Status='1'
+			# ipPrefix=""
+			# ipMask=""
+			[[ "$BurnIrregularIpv4Status" == "1" ]] && {
+				actualIp4Gate="$GATE"
+				# To add the following soft hacking commands in function "configure_ip()" of the initial file which is dedicated for AlpineLinux can let network service execute immediately at netboot kernel starting,
+				# it has a similar effect with "d-i preseed/early_command" in the file "preseed.cfg" of Debian series.
+				# A valid anchor is a comment of "# manual configuration" in this function.
+				sed -i '/manual configuration/a\\t\tip link set dev '$interface4' up\n\t\tip addr add '$IPv4'/'$ipPrefix' dev '$interface4'\n\t\tip route add '$actualIp4Gate' dev '$interface4'\n\t\tip route add default via '$actualIp4Gate' dev '$interface4' onlink\n\t\techo '\''nameserver '$ipDNS1''\'' > /etc/resolv.conf\n\t\techo '\''nameserver '$ipDNS2''\'' >> /etc/resolv.conf' /tmp/boot/init
+			}
+		elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+			# Attention:
+			# Configure networking in pure IPv6 or irregular IPv4 environment so that to let AlpineLinux netboot kernel to support to connect to the public network was not recognized by official at current(date 2023.08).
+			# This is only belonged to an appertain of my ingenuity in this earth. I'm glad to introduce to you without any reservation that how I was accomplished to dealing with it.
+			# By using "ip link set IPv6 network adaper", "ip -6 add IPv6 address and subnet", "ip -6 route add..." are similar with handling irregular IPv4s.
+			# For pure IPv6 stack, static network configure method, we need to generate a nonexistent IPv4 configurations to make a cheat to let AlpineLinux to initiate network service.
+			# For pure IPv6 stack, dhcp network configure method, in most of these environments, upstream networking topology may also has a IPv4 dhcp configuration but server won't get any public IPv4 address acrossing IPv4 route,
+			# so we need to add IPv6 hijack commands after IPv4 dhcp configure method context after comment of "# automatic configuration" in function of "configure_ip()".
+			# About deciding to write which different contents of "ip=..." in grub section, "ip=dhcp" is for IPv6 automatic method, for IPv6 manual method is like "ip=172.25.255.72:::255.255.255.0::eth0:::", no matter for menuentry of grub1 or grub2 format are all applicable.
+			# All of these deceptions of above are only for let AlpineLinux netboot kernel to creating IPv6 network successfully during a temporary AlpineLinux environment in RAM
+			# when installed as a formal AlpineLinux or Ubuntu or Windows, the networking configure files will be all rewritten so that the "fakeIpv4 ", etc. have no negative impacts to these finally installed target systems.
+			if [[ "$Network6Config" == "isStatic" ]]; then
+				fakeIpv4="172.25.255.72"
+				fakeIpMask="255.255.255.0"
+				hackIpv6Context="manual configuration"
+			elif [[ "$Network6Config" == "isDHCP" ]]; then
+				hackIpv6Context="automatic configuration"
+			fi
+			sed -i '/'"$hackIpv6Context"'/a\\t\tdepmod\n\t\tmodprobe ipv6\n\t\tip link set dev '$interface6' up\n\t\tip -6 addr add '$ip6Addr'/'$actualIp6Prefix' dev '$interface6'\n\t\tip -6 route add '$ip6Gate' dev '$interface6'\n\t\tip -6 route add default via '$ip6Gate' dev '$interface6' onlink\n\t\techo '\''nameserver '$ip6DNS1''\'' > /etc/resolv.conf\n\t\techo '\''nameserver '$ip6DNS2''\'' >> /etc/resolv.conf' /tmp/boot/init
+		fi
+		writeMultipleIpv4Addresses "$iAddrNum"
+		writeMultipleIpv6Addresses "$i6AddrNum"
+		if [[ "$setMotd" == "1" ]]; then
+			ModifyMOTD=$(echo -e "rm -rf \$sysroot/etc/motd
+wget --no-check-certificate -O \$sysroot/etc/profile.d/motd.sh ${AlpineMotd}
+chmod a+x \$sysroot/etc/profile.d/motd.sh")
+		else
+			ModifyMOTD=""
+		fi
+		if [[ -z "$targetRelese" ]]; then
+			NetcfgTemplate=$(echo -e "wget --no-check-certificate -O \$sysroot/etc/network/tmp_interfaces ${AlpineNetworkConf}")
+		else
+			NetcfgTemplate=""
+		fi
+		# All the following steps are processed in the temporary Alpine Linux.
+		cat <<EOF | sed -i "${AlpineInitLineNum}r /dev/stdin" /tmp/boot/init
+# Download an apposite network configure template and is used for replacing IP details in late stages, only for Alpine Linux.
+${NetcfgTemplate}
 
-# 不支持容器虚拟化
-assert_not_in_container
+# Configure temporary nameservers.
+rm -rf \$sysroot/etc/resolv.conf
+wget --no-check-certificate -O \$sysroot/etc/resolv.conf ${AlpineDnsFile}
+chmod a+x \$sysroot/etc/resolv.conf
 
-# 不支持安全启动
-if is_secure_boot_enabled; then
-    error_and_exit "Please disable secure boot first."
-fi
+# Creat a file to storage various prerequisite initial configs.
+echo '' > \$sysroot/root/alpine.config
 
-# 密码
-if ! is_netboot_xyz && [ -z "$ssh_keys" ] && [ -z "$password" ]; then
-    if is_use_dd; then
-        echo "
-This password is only used for SSH access to view logs during the installation.
-Password of the image will NOT modify.
+# To determine CPU architecture.
+echo "alpineArchitecture  "${alpineArchitecture} >> \$sysroot/root/alpine.config
+echo "ubuntuArchitecture  "${ubuntuArchitecture} >> \$sysroot/root/alpine.config
+echo "rhelArchitecture  "${rhelArchitecture} >> \$sysroot/root/alpine.config
 
-密码仅用于安装过程中通过 SSH 查看日志。
-镜像的密码不会被修改。
-"
-    fi
-    prompt_password
-fi
+# To determine main hard drive.
+echo "IncDisk  "${IncDisk} >> \$sysroot/root/alpine.config
 
-# 必备组件
-install_pkg curl grep
+# To determine mirror, only for Alpine Linux.
+echo "LinuxMirror  "${LinuxMirror} >> \$sysroot/root/alpine.config
 
-# /tmp 挂载在内存的话，可能不够空间
-tmp=/reinstall-tmp
-mkdir_clear "$tmp"
+# To determine the release of Alpine Linux.
+echo "alpineVer  "${DIST} >> \$sysroot/root/alpine.config
 
-# 强制忽略/强制添加 --ci 参数
-# debian 不强制忽略 ci 留作测试
-case "$distro" in
-dd | windows | netboot.xyz | kali | alpine | arch | gentoo | aosc | nixos | fnos)
-    if is_use_cloud_image; then
-        echo "ignored --ci"
-        unset cloud_image
-    fi
-    ;;
-oracle | opensuse | anolis | opencloudos | openeuler)
-    cloud_image=1
-    ;;
-redhat | centos | almalinux | rocky | fedora | ubuntu)
-    if is_force_use_installer; then
-        unset cloud_image
-    else
-        cloud_image=1
-    fi
-    ;;
-esac
+# To determine the distribution and release of Redhat series or Ubuntu for target system.
+echo "ubuntuDigital  "${ubuntuDigital} >> \$sysroot/root/alpine.config
+echo "targetRelese  "${targetRelese} >> \$sysroot/root/alpine.config
+echo "RedHatSeries  "${RedHatSeries} >> \$sysroot/root/alpine.config
 
-# 检查硬件架构
-if is_in_windows; then
-    # x86-based PC
-    # x64-based PC
-    # ARM-based PC
-    # ARM64-based PC
+# To determine the mirror of software for target system.
+echo "targetLinuxMirror  "${targetLinuxMirror} >> \$sysroot/root/alpine.config
 
-    if false; then
-        # 如果机器没有 wmic 则需要下载 wmic.ps1，但此时未判断国内外，还是用国外源
-        basearch=$(wmic ComputerSystem get SystemType | grep '=' | cut -d= -f2 | cut -d- -f1)
-    elif true; then
-        # 可以用
-        basearch=$(reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v PROCESSOR_ARCHITECTURE |
-            grep . | tail -1 | awk '{print $NF}')
-    else
-        # 也可以用
-        basearch=$(cmd /c "if defined PROCESSOR_ARCHITEW6432 (echo %PROCESSOR_ARCHITEW6432%) else (echo %PROCESSOR_ARCHITECTURE%)")
-    fi
-else
-    # archlinux 云镜像没有 arch 命令
-    # https://en.wikipedia.org/wiki/Uname
-    basearch=$(uname -m)
-fi
+# To determine the mirror of security for target system.
+echo "targetLinuxSecurityMirror  "${targetLinuxSecurityMirror} >> \$sysroot/root/alpine.config
 
-# 统一架构名称，并强制 64 位
-case "$(echo $basearch | to_lower)" in
-i?86 | x64 | x86* | amd64)
-    basearch=x86_64
-    basearch_alt=amd64
-    ;;
-arm* | aarch64)
-    basearch=aarch64
-    basearch_alt=arm64
-    ;;
-*) error_and_exit "Unsupported arch: $basearch" ;;
-esac
+# To determine timezone.
+echo "TimeZone  "${TimeZone} >> \$sysroot/root/alpine.config
 
-# 未测试
-if false && [[ "$confhome" = http*://raw.githubusercontent.com/* ]]; then
-    repo=$(echo $confhome | cut -d/ -f4,5)
-    branch=$(echo $confhome | cut -d/ -f6)
-    # 避免脚本更新时，文件不同步造成错误
-    if [ -z "$commit" ]; then
-        commit=$(curl -L https://api.github.com/repos/$repo/git/refs/heads/$branch |
-            grep '"sha"' | grep -Eo '[0-9a-f]{40}')
-    fi
-    # shellcheck disable=SC2001
-    confhome=$(echo "$confhome" | sed "s/main$/$commit/")
-fi
+# To determine root password.
+echo 'tmpWORD  '$tmpWORD'' >> \$sysroot/root/alpine.config
 
-# 设置国内代理
-# 要在使用 wmic 前设置，否则国内机器会从国外源下载 wmic.ps1
-# gitee 不支持ipv6
-# jsdelivr 有12小时缓存
-# https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
-if is_in_china; then
-    if [ -n "$confhome_cn" ]; then
-        confhome=$confhome_cn
-    elif [ -n "$github_proxy" ] && [[ "$confhome" = http*://raw.githubusercontent.com/* ]]; then
-        confhome=${confhome/http:\/\//https:\/\/}
-        confhome=${confhome/https:\/\/raw.githubusercontent.com/$github_proxy}
-    fi
-fi
+# To determine ssh port.
+echo "sshPORT  "${sshPORT} >> \$sysroot/root/alpine.config
 
-# 检查内存
-# 会用到 wmic，因此要在设置国内 confhome 后使用
-check_ram
+# To determine the name of network adapter.
+echo "networkAdapter  "${networkAdapter} >> \$sysroot/root/alpine.config
 
-# 以下目标系统不需要两步安装
-# alpine
-# debian
-# el7 x86_64 >=1g
-# el7 aarch64 >=1.5g
-# el8/9/fedora 任何架构 >=2g
-if is_netboot_xyz ||
-    { ! is_use_cloud_image && {
-        [ "$distro" = "alpine" ] || is_distro_like_debian ||
-            { is_distro_like_redhat && [ $releasever -eq 7 ] && [ $ram_size -ge 1024 ] && [ $basearch = "x86_64" ]; } ||
-            { is_distro_like_redhat && [ $releasever -eq 7 ] && [ $ram_size -ge 1536 ] && [ $basearch = "aarch64" ]; } ||
-            { is_distro_like_redhat && [ $releasever -ge 8 ] && [ $ram_size -ge 2048 ]; }
-    }; }; then
-    setos nextos $distro $releasever
-else
-    # alpine 作为中间系统时，使用最新版
-    alpine_ver_for_trans=$(get_latest_distro_releasever alpine)
-    setos finalos $distro $releasever
-    setos nextos alpine $alpine_ver_for_trans
-fi
+# To determine the configuration method of IPv4 network is static or dhcp.
+echo "Network4Config  "${Network4Config} >> \$sysroot/root/alpine.config
 
-# 删除之前的条目
-# 防止第一次运行 netboot.xyz，第二次运行其他，但还是进入 netboot.xyz
-# 防止第一次运行其他，第二次运行 netboot.xyz，但还有第一次的菜单
-# bios 无论什么情况都用到 grub，所以不用处理
-if is_efi; then
-    if is_in_windows; then
-        rm -f /cygdrive/$c/grub.cfg
+# To determine the details of IPv4 static.
+echo "IPv4  "${IPv4} >> \$sysroot/root/alpine.config
+echo "MASK  "${MASK} >> \$sysroot/root/alpine.config
+echo "ipPrefix  "${ipPrefix} >> \$sysroot/root/alpine.config
+echo "actualIp4Prefix  "${actualIp4Prefix} >> \$sysroot/root/alpine.config
+echo "actualIp4Subnet  "${actualIp4Subnet} >> \$sysroot/root/alpine.config
+echo "GATE  "${GATE} >> \$sysroot/root/alpine.config
+echo "actualIp4Gate  "${actualIp4Gate} >> \$sysroot/root/alpine.config
+echo "BurnIrregularIpv4Status  "${BurnIrregularIpv4Status} >> \$sysroot/root/alpine.config
+echo "ipDNS1  "${ipDNS1} >> \$sysroot/root/alpine.config
+echo "ipDNS2  "${ipDNS2} >> \$sysroot/root/alpine.config
+echo "iAddrNum  "${iAddrNum} >> \$sysroot/root/alpine.config
+echo "writeIpsCmd  "'''${writeIpsCmd}''' >> \$sysroot/root/alpine.config
 
-        bcdedit /set '{fwbootmgr}' bootsequence '{bootmgr}'
-        bcdedit /enum bootmgr | grep --text -B3 'reinstall' | awk '{print $2}' | grep '{.*}' |
-            xargs -I {} cmd /c bcdedit /delete {}
-    else
-        # shellcheck disable=SC2046
-        # 如果 nixos 的 efi 挂载到 /efi，则不会生成 /boot 文件夹
-        # find 不存在的路径会报错退出
-        find $(get_maybe_efi_dirs_in_linux) $([ -d /boot ] && echo /boot) \
-            -type f -name 'custom.cfg' -exec rm -f {} \;
+# To determine the configuration method of IPv6 network is static or dhcp.
+echo "Network6Config  "${Network6Config} >> \$sysroot/root/alpine.config
 
-        install_pkg efibootmgr
-        efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
-        efibootmgr | grep_efi_entry | grep 'reinstall' | grep_efi_index |
-            xargs -I {} efibootmgr --quiet --bootnum {} --delete-bootnum
-    fi
-fi
+# To determine the details of IPv6 static.
+echo "ip6Addr  "${ip6Addr} >> \$sysroot/root/alpine.config
+echo "ip6Mask  "${ip6Mask} >> \$sysroot/root/alpine.config
+echo "actualIp6Prefix  "${actualIp6Prefix} >> \$sysroot/root/alpine.config
+echo "ip6Gate  "${ip6Gate} >> \$sysroot/root/alpine.config
+echo "ip6DNS1  "${ip6DNS1} >> \$sysroot/root/alpine.config
+echo "ip6DNS2  "${ip6DNS2} >> \$sysroot/root/alpine.config
+echo "i6AddrNum  "${i6AddrNum} >> \$sysroot/root/alpine.config
+echo "writeIp6sCmd  "'''${writeIp6sCmd}''' >> \$sysroot/root/alpine.config
 
-# 有的机器开启了 kexec，例如腾讯云轻量 debian，要禁用
-if [ -f /etc/default/kexec ]; then
-    sed -i 's/LOAD_KEXEC=true/LOAD_KEXEC=false/' /etc/default/kexec
-fi
+# To determine whether to disable IPv6 modules.
+echo "setIPv6  "${setIPv6} >> \$sysroot/root/alpine.config
 
-# 下载 netboot.xyz / 内核
-# shellcheck disable=SC2154
-if is_netboot_xyz; then
-    if is_efi; then
-        curl -Lo /netboot.xyz.efi $nextos_efi
-        if is_in_windows; then
-            add_efi_entry_in_windows /netboot.xyz.efi
-        else
-            add_efi_entry_in_linux /netboot.xyz.efi
-        fi
-    else
-        curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
-    fi
-else
-    # 下载 nextos 内核
-    info download vmlnuz and initrd
-    curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
-    curl -Lo /reinstall-initrd $nextos_initrd
-    if is_use_firmware; then
-        curl -Lo /reinstall-firmware $nextos_firmware
-    fi
-fi
+# To determine hostname.
+echo "HostName  "${HostName} >> \$sysroot/root/alpine.config
 
-# 修改 alpine debian kali initrd
-if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
-    mod_initrd
-fi
+# To determine whether in a virtual or physical hardware.
+echo "virtualizationStatus  "${virtualizationStatus} >> \$sysroot/root/alpine.config
 
-# 将内核/netboot.xyz.lkrn 放到正确的位置
-if false && is_need_grub_extlinux; then
-    if is_in_windows; then
-        cp -f /reinstall-vmlinuz /cygdrive/$c/
-        is_have_initrd && cp -f /reinstall-initrd /cygdrive/$c/
-    else
-        if is_os_in_btrfs && is_os_in_subvol; then
-            cp_to_btrfs_root /reinstall-vmlinuz
-            is_have_initrd && cp_to_btrfs_root /reinstall-initrd
-        fi
-    fi
-fi
+# To determine console display for Linux kernel.
+echo "serialConsolePropertiesForGrub  "${serialConsolePropertiesForGrub} >> \$sysroot/root/alpine.config
 
-# grub / extlinux
-if is_need_grub_extlinux; then
-    # win 使用外部 grub
-    if is_in_windows; then
-        install_grub_win
-    else
-        # linux efi 使用外部 grub，因为
-        # 1. 原系统 grub 可能没有去除 aarch64 内核 magic number 校验
-        # 2. 原系统可能不是用 grub
-        if is_efi; then
-            install_grub_linux_efi
-        fi
-    fi
+# To determine whether to configure fail2ban.
+echo "setFail2banStatus  "${setFail2banStatus} >> \$sysroot/root/alpine.config
 
-    # 寻找 grub.cfg / extlinux.conf
-    if is_in_windows; then
-        if is_efi; then
-            grub_cfg=/cygdrive/$c/grub.cfg
-        else
-            grub_cfg=/cygdrive/$c/grub/grub.cfg
-        fi
-    else
-        # linux
-        if is_efi; then
-            # 现在 linux-efi 是使用 reinstall 目录下的 grub
-            # shellcheck disable=SC2046
-            efi_reinstall_dir=$(find $(get_maybe_efi_dirs_in_linux) -type d -name "reinstall" | head -1)
-            grub_cfg=$efi_reinstall_dir/grub.cfg
-        else
-            if is_mbr_using_grub; then
-                if is_have_cmd update-grub; then
-                    # alpine debian ubuntu
-                    grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
-                else
-                    # 找出主配置文件（含有menuentry|blscfg）
-                    # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
-                    grub_cfg=$(find_grub_extlinux_cfg '/boot/grub*' grub.cfg 'menuentry|blscfg')
-                fi
-            else
-                # extlinux
-                extlinux_cfg=$(find_grub_extlinux_cfg /boot extlinux.conf LINUX)
-            fi
-        fi
-    fi
+# Add customized motd.
+${ModifyMOTD}
 
-    # 判断用 linux 还是 linuxefi（主要是红帽系）
-    # 现在 efi 用下载的 grub，因此不需要判断 linux 或 linuxefi
-    if false && is_use_local_grub_extlinux; then
-        # 在x86 efi机器上，不同版本的 grub 可能用 linux 或 linuxefi 加载内核
-        # 通过检测原有的条目有没有 linuxefi 字样就知道当前 grub 用哪一种
-        # 也可以检测 /etc/grub.d/10_linux
-        if [ -d /boot/loader/entries/ ]; then
-            entries="/boot/loader/entries/"
-        fi
-        if grep -q -r -E '^[[:space:]]*linuxefi[[:space:]]' $grub_cfg $entries; then
-            efi=efi
-        fi
-    fi
+# To determine whether to delete motd for target system.
+echo "setMotd  "${setMotd} >> \$sysroot/root/alpine.config
 
-    # 找到 grub 程序的前缀
-    # 并重新生成 grub.cfg
-    # 因为有些机子例如hython debian的grub.cfg少了40_custom 41_custom
-    if is_use_local_grub; then
-        if is_have_cmd grub2-mkconfig; then
-            grub=grub2
-        elif is_have_cmd grub-mkconfig; then
-            grub=grub
-        else
-            error_and_exit "grub not found"
-        fi
+# To determine whether to enable low memory mode so that reduce preconditioning components to make sure installation succeed on 768MB and lower.
+echo "lowMemMode  "${lowMemMode} >> \$sysroot/root/alpine.config
 
-        # nixos 手动执行 grub-mkconfig -o /boot/grub/grub.cfg 会丢失系统启动条目
-        # 正确的方法是修改 configuration.nix 的 boot.loader.grub.extraEntries
-        # 但是修改 configuration.nix 不是很好，因此改成修改 grub.cfg
-        if [ -x /nix/var/nix/profiles/system/bin/switch-to-configuration ]; then
-            # 生成 grub.cfg
-            /nix/var/nix/profiles/system/bin/switch-to-configuration boot
-            # 手动启用 41_custom
-            nixos_grub_home="$(dirname "$(readlink -f "$(get_cmd_path grub-mkconfig)")")/.."
-            $nixos_grub_home/etc/grub.d/41_custom >>$grub_cfg
-        elif is_have_cmd update-grub; then
-            update-grub
-        else
-            $grub-mkconfig -o $grub_cfg
-        fi
-    fi
+# To determine the url of dd image.
+echo "DDURL  "${DDURL} >> \$sysroot/root/alpine.config
 
-    # 重新生成 extlinux.conf
-    if is_use_local_extlinux; then
-        if is_have_cmd update-extlinux; then
-            update-extlinux
-        fi
-    fi
+# To determine decompress method for dd package.
+echo "DEC_CMD  "${DEC_CMD} >> \$sysroot/root/alpine.config
 
-    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (linux-efi / win)
-    if is_use_local_grub; then
-        target_cfg=$(dirname $grub_cfg)/custom.cfg
-    else
-        target_cfg=$grub_cfg
-    fi
+# To determine the url of Linux Cloud-init file.
+echo "cloudInitUrl  "${cloudInitUrl} >> \$sysroot/root/alpine.config
 
-    # 找到 /reinstall-vmlinuz /reinstall-initrd 的绝对路径
-    if is_in_windows; then
-        # dir=/cygwin/
-        dir=$(cygpath -m / | cut -d: -f2-)/
-    else
-        # extlinux + 单独的 boot 分区
-        # 把内核文件放在 extlinux.conf 所在的目录
-        if is_use_local_extlinux && is_boot_in_separate_partition; then
-            dir=
-        else
-            # 获取当前系统根目录在 btrfs 中的绝对路径
-            if is_os_in_btrfs; then
-                # btrfs subvolume show /
-                # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
-                dir=$(btrfs subvolume show / | head -1)
-                if ! [ "$dir" = / ]; then
-                    dir="/$dir/"
-                fi
-            else
-                dir=/
-            fi
-        fi
-    fi
+# To determine the url of Windows cmd init file.
+echo "windowsStaticConfigCmd  "${windowsStaticConfigCmd} >> \$sysroot/root/alpine.config
 
-    vmlinuz=${dir}reinstall-vmlinuz
-    initrd=${dir}reinstall-initrd
-    firmware=${dir}reinstall-firmware
+# Download initial program.
+wget --no-check-certificate -O \$sysroot/etc/local.d/${AlpineInitFileName} ${AlpineInitFile}
 
-    # 设置 linux initrd 命令
-    if is_use_local_extlinux; then
-        linux_cmd=LINUX
-        initrd_cmd=INITRD
-    else
-        if is_netboot_xyz; then
-            linux_cmd=linux16
-            initrd_cmd=initrd16
-        else
-            linux_cmd="linux$efi"
-            initrd_cmd="initrd$efi"
-        fi
-    fi
-
-    # 设置 cmdlind initrds
-    if ! is_netboot_xyz; then
-        find_main_disk
-        build_cmdline
-
-        initrds="$initrd"
-        if is_use_firmware; then
-            initrds+=" $firmware"
-        fi
-    fi
-
-    if is_use_local_extlinux; then
-        info extlinux
-        echo $extlinux_cfg
-        extlinux_dir="$(dirname $extlinux_cfg)"
-
-        # 不起作用
-        # 好像跟 extlinux --once 有冲突
-        sed -i "/^MENU HIDDEN/d" $extlinux_cfg
-        sed -i "/^TIMEOUT /d" $extlinux_cfg
-
-        del_empty_lines <<EOF | tee -a $extlinux_cfg
-TIMEOUT 5
-LABEL reinstall
-  MENU LABEL $(get_entry_name)
-  $linux_cmd $vmlinuz
-  $([ -n "$initrds" ] && echo "$initrd_cmd $initrds")
-  $([ -n "$cmdline" ] && echo "APPEND $cmdline")
+# Set initial program to execute automatically.
+chmod a+x \$sysroot/etc/local.d/${AlpineInitFileName}
+ln -s /etc/init.d/local \$sysroot/etc/runlevels/default/
 EOF
-        # 设置重启引导项
-        extlinux --once=reinstall $extlinux_dir
+	fi
+elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+	AuthMethod="authselect --useshadow --passalgo sha512"
+	SetTimeZone="timezone --utc ${TimeZone}"
+	if [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]]; then
+		if [[ "$RedHatSeries" -ge "8" ]]; then
+			RedHatUrl="url --url=${LinuxMirror}/${DIST}/BaseOS/${VER}/os/"
+			RepoAppStream="repo --name=\"AppStream\" --baseurl=${LinuxMirror}/${DIST}/AppStream/${VER}/os/"
+			[[ "$linux_relese" != 'centos' ]] && RepoExtras="repo --name=\"extras\" --baseurl=${LinuxMirror}/${DIST}/extras/${VER}/os/"
+		elif [[ "$linux_relese" == 'centos' ]] && [[ "$RedHatSeries" -le "7" ]]; then
+			RedHatUrl="url --url=${LinuxMirror}/${DIST}/os/${VER}/"
+			RepoUpdates="repo --name=\"updates\" --baseurl=${LinuxMirror}/${DIST}/updates/${VER}/"
+			AuthMethod="auth --useshadow --passalgo=sha512"
+			SetTimeZone="timezone --isUtc ${TimeZone}"
+		fi
+		InstallEpel="dnf install epel-release -y"
+	elif [[ "$linux_relese" == 'fedora' ]]; then
+		RedHatUrl="url --url=${LinuxMirror}/releases/${DIST}/Server/${VER}/os/"
+		# Must configure additional repos for Fedora.
+		# Reference: https://bugzilla.redhat.com/show_bug.cgi?id=1773111
+		if [[ "$IsCN" == "cn" ]]; then
+			RepoUpdates="repo --name=\"updates\" --baseurl=https://mirrors.bfsu.edu.cn/fedora/updates/${DIST}/Everything/${VER}/"
+			RepoEverything="repo --name=\"Everything\" --baseurl=https://mirrors.ustc.edu.cn/fedora/releases/${DIST}/Everything/${VER}/os/"
+		else
+			RepoUpdates="repo --name=\"updates\" --mirrorlist=https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f${DIST}&arch=${VER}"
+			RepoEverything="repo --name=\"Everything\" --mirrorlist=https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-${DIST}&arch=${VER}"
+		fi
+	fi
+	# Reference: https://mirrors.ustc.edu.cn/help/rocky.html
+	#            https://mirrors.ustc.edu.cn/help/fedora.html
+	#            https://mirrors.ustc.edu.cn/help/epel.html
+	[[ "$IsCN" == "cn" ]] && {
+		if [[ "$linux_relese" == 'rockylinux' ]]; then
+			BaseUrl="dl.rockylinux.org/\$contentdir"
+			TargetCnUrl="mirrors.ustc.edu.cn/rocky"
+			[[ "$RedHatSeries" -le "8" ]] && ReposProperties="Rocky" || ReposProperties="rocky"
+		elif [[ "$linux_relese" == 'fedora' ]]; then
+			BaseUrl="download.example/pub/fedora/linux"
+			TargetCnUrl="mirrors.tuna.tsinghua.edu.cn/fedora"
+			ReposProperties="fedora"
+		fi
+		ReplaceReposToCn="sed -e 's|^metalink=|#metalink=|g' \
+-e 's|^mirrorlist=|#mirrorlist=|g' \
+-e 's|^#baseurl=http://$BaseUrl|baseurl=https://$TargetCnUrl|g' \
+-i.bak \
+/etc/yum.repos.d/$ReposProperties*.repo"
+		ReplaceEpelToCn="sed -e 's|^metalink=|#metalink=|g' \
+-e 's|^#baseurl=https\?://download.fedoraproject.org/pub/epel/|baseurl=http://mirror.nju.edu.cn/epel/|g' \
+-e 's|^#baseurl=https\?://download.example/pub/epel/|baseurl=http://mirror.nju.edu.cn/epel/|g' \
+-i.bak \
+/etc/yum.repos.d/epel*.repo"
+		[[ "$linux_relese" == 'centos' || "$linux_relese" == 'almalinux' ]] && ReplaceReposToCn=""
+		RestoreRepoCiscoOpenH26x="sed -ri 's|^#metalink=|metalink=|g' /etc/yum.repos.d/epel-cisco*.repo"
+		[[ "$linux_relese" == 'fedora' ]] && {
+			ReplaceEpelToCn=""
+			RestoreRepoCiscoOpenH26x="sed -ri 's|^#metalink=|metalink=|g' /etc/yum.repos.d/$ReposProperties-cisco*.repo"
+		}
+	}
+	# If network adapter is redirected, the "eth0" is default.
+	# --bootproto="a value" is exclusive to IPv4, --bootproto=dhcp is IPv4 DHCP, --bootproto=static is IPv4 Static.
+	# --ipv6="a vaild IPv6 address/netmask bits" is for IPv6 static, and then --ipv6gateway="a valid IPv6 gateway" is necessary, --ipv6=auto is for IPv6 DHCP.
+	# For IPv6 only network environment, no matter dhcp or static, IPv4 configuration must be disabled(--noipv4),
+	# in this situation, CentOS 7 doesn't accept any IPv4 DNS value.
+	# Reference: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/system_design_guide/kickstart-commands-and-options-reference_system-design-guide#network_kickstart-commands-for-network-configuration
+	writeMultipleIpv4Addresses "$iAddrNum" "" '/etc/NetworkManager/system-connections/'$interface'.nmconnection'
+	writeMultipleIpv6Addresses "$i6AddrNum" "" '/etc/NetworkManager/system-connections/'$interface'.nmconnection'
+	if [[ "$IPStackType" == "IPv4Stack" ]]; then
+		if [[ "$Network4Config" == "isDHCP" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=dhcp --ipv6=auto --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+		elif [[ "$Network4Config" == "isStatic" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=static --ip=$IPv4 --netmask=$actualIp4Subnet --gateway=$GATE --ipv6=auto --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+		fi
+	elif [[ "$IPStackType" == "BiStack" ]]; then
+		if [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=dhcp --ipv6=auto --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+		elif [[ "$Network4Config" == "isDHCP" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=dhcp --ipv6=$ip6Addr/$actualIp6Prefix --ipv6gateway=$ip6Gate --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+			# By adding multiple IPv6 addresses is only support these servers which are configurated in IPv4 networking in temporary environment of anaconda during the installation at current.
+			[[ "$i6AddrNum" -ge "2" ]] && NetConfigManually="network --device=$interface --bootproto=dhcp --nameserver=$ipDNS --hostname=$HostName --onboot=on"
+		elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isDHCP" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=static --ip=$IPv4 --netmask=$actualIp4Subnet --gateway=$GATE --ipv6=auto --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+		elif [[ "$Network4Config" == "isStatic" ]] && [[ "$Network6Config" == "isStatic" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=static --ip=$IPv4 --netmask=$actualIp4Subnet --gateway=$GATE --ipv6=$ip6Addr/$actualIp6Prefix --ipv6gateway=$ip6Gate --nameserver=$ipDNS,$ip6DNS --hostname=$HostName --onboot=on"
+			[[ "$i6AddrNum" -ge "2" ]] && NetConfigManually="network --device=$interface --bootproto=static --ip=$IPv4 --netmask=$actualIp4Subnet --gateway=$GATE --nameserver=$ipDNS --hostname=$HostName --onboot=on"
+		fi
+	elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+		if [[ "$Network6Config" == "isDHCP" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=dhcp --ipv6=auto --nameserver=$ip6DNS --hostname=$HostName --onboot=on --activate --noipv4"
+		elif [[ "$Network6Config" == "isStatic" ]]; then
+			NetConfigManually="network --device=$interface --bootproto=dhcp --ipv6=$ip6Addr/$actualIp6Prefix --ipv6gateway=$ip6Gate --nameserver=$ip6DNS --hostname=$HostName --onboot=on --activate --noipv4"
+		fi
+	fi
+	setNormalRecipe "$linux_relese" "$disksNum" "$setSwap" "$setDisk" "$partitionTable" "$setFileSystem" "$EfiSupport" "$diskCapacity" "$IncDisk" "$AllDisks"
+	setRaidRecipe "$setRaid" "$disksNum" "$AllDisks" "$linux_relese"
+	cat >/tmp/boot/ks.cfg <<EOF
+# platform x86, AMD64, or Intel EM64T, or ARM aarch64
 
-        # 复制文件到 extlinux 工作目录
-        if is_boot_in_separate_partition; then
-            info "copying files to $extlinux_dir"
-            is_have_initrd && cp -f /reinstall-initrd $extlinux_dir
-            is_use_firmware && cp -f /reinstall-firmware $extlinux_dir
-            # 放最后，防止前两条返回非 0 而报错
-            cp -f /reinstall-vmlinuz $extlinux_dir
-        fi
-    else
-        # cloudcone 从光驱的 grub 启动，再加载硬盘的 grub.cfg
-        # menuentry "Grub 2" --id grub2 {
-        #         set root=(hd0,msdos1)
-        #         configfile /boot/grub2/grub.cfg
-        # }
+# Firewall configuration
+firewall --enabled --ssh
 
-        # 加载后 $prefix 依然是光驱的 (hd96)/boot/grub
-        # 导致找不到 $prefix 目录的 grubenv，因此读取不到 next_entry
-        # 以下方法为 cloudcone 重新加载 grubenv
+# Use network installation and configure temporary mirrors
+${RedHatUrl}
+${RepoAppStream}
+${RepoExtras}
+${RepoUpdates}
+${RepoEverything}
 
-        # 需查找 2*2 个文件夹
-        # 分区：系统 / boot
-        # 文件夹：grub / grub2
-        # shellcheck disable=SC2121,SC2154
-        # cloudcone debian 能用但 ubuntu 模板用不了
-        # ubuntu 模板甚至没显示 reinstall menuentry
-        load_grubenv_if_not_loaded() {
-            if ! [ -s $prefix/grubenv ]; then
-                for dir in /boot/grub /boot/grub2 /grub /grub2; do
-                    set grubenv="($root)$dir/grubenv"
-                    if [ -s $grubenv ]; then
-                        load_env --file $grubenv
-                        if [ "${next_entry}" ]; then
-                            set default="${next_entry}"
-                            set next_entry=
-                            save_env --file $grubenv next_entry
-                        else
-                            set default="0"
-                        fi
-                        return
-                    fi
-                done
-            fi
-        }
+# Root password
+rootpw --iscrypted ${myPASSWORD}
 
-        # 生成 grub 配置
-        # 实测 centos 7 lvm 要手动加载 lvm 模块
-        info grub
-        echo $target_cfg
+# System authorization information
+${AuthMethod}
 
-        get_function_content load_grubenv_if_not_loaded >$target_cfg
+# Disable system configuration
+firstboot --disable
 
-        # 原系统为 openeuler 云镜像，需要添加 --unrestricted，否则要输入密码
-        del_empty_lines <<EOF | tee -a $target_cfg
-set timeout_style=menu
-set timeout=5
-menuentry "$(get_entry_name)" --unrestricted {
-    $(! is_in_windows && echo 'insmod lvm')
-    $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
-    insmod all_video
-    search --no-floppy --file --set=root $vmlinuz
-    $linux_cmd $vmlinuz $cmdline
-    $([ -n "$initrds" ] && echo "$initrd_cmd $initrds")
+# System language
+lang en_US
+
+# Keyboard layouts
+keyboard us
+
+# SELinux configuration
+selinux --disabled
+
+# Kdump configuration
+%addon com_redhat_kdump --disable
+%end
+
+# Use text install
+text
+
+# unsupported_hardware
+# vnc
+# dont't config display manager
+skipx
+
+# System Timezone
+${SetTimeZone}
+
+# Network Configuration
+${NetConfigManually}
+
+# System bootloader configuration
+bootloader --location=mbr --boot-drive=${ksIncDisk} --append="rhgb quiet crashkernel=0 net.ifnames=0 biosdevname=0 ipv6.disable=1 ${serialConsolePropertiesForGrub}"
+
+# Clear the Master Boot Record
+zerombr
+${clearPart}
+
+# Disk partitioning information
+${FormatDisk}
+
+# Reboot after installation
+reboot
+
+%packages --ignoremissing
+@^minimal-environment
+%end
+
+# Enable services
+# services --enabled=
+
+# All modified command should only be executed between %post and %end location!
+%post --interpreter=/bin/bash
+
+# Config mirrors for servers in mainland of China to avoid of executing yum/dnf too slow
+${ReplaceReposToCn}
+
+# Install and config dnf and epel
+yum install dnf -y
+${InstallEpel}
+${ReplaceEpelToCn}
+${RestoreRepoCiscoOpenH26x}
+dnf install fail2ban -y
+dnf install bind-utils curl file lrzsz net-tools vim wget xz -y
+
+# Disable selinux
+sed -ri "/^#?SELINUX=.*/c\SELINUX=disabled" /etc/selinux/config
+
+# Allow password login
+sed -ri "/^#?PermitRootLogin.*/c\PermitRootLogin yes" /etc/ssh/sshd_config
+sed -ri "/^#?PasswordAuthentication.*/c\PasswordAuthentication yes" /etc/ssh/sshd_config
+# Change ssh port
+sed -ri "/^#?Port.*/c\Port ${sshPORT}" /etc/ssh/sshd_config
+# Enable ssh service
+systemctl enable sshd
+systemctl restart sshd
+
+# Add new ssh port for firewalld
+sed -i '6i \ \ <port port="${sshPORT}" protocol="tcp"/>' /etc/firewalld/zones/public.xml
+sed -i '7i \ \ <port port="${sshPORT}" protocol="udp"/>' /etc/firewalld/zones/public.xml
+# Allowance of IPv4 and IPv6 access
+echo -e "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<direct>\n  <rule ipv=\"ipv4\" table=\"filter\" chain=\"INPUT\" priority=\"0\">-p icmp --icmp-type 32 -j DROP</rule>\n  <rule ipv=\"ipv4\" table=\"filter\" chain=\"INPUT\" priority=\"1\">-p icmp -j ACCEPT</rule>\n  <rule ipv=\"ipv6\" table=\"filter\" chain=\"INPUT\" priority=\"0\">-p icmpv6 --icmpv6-type 128 -j DROP</rule>\n  <rule ipv=\"ipv6\" table=\"filter\" chain=\"INPUT\" priority=\"1\">-p icmpv6 -j ACCEPT</rule>\n</direct>" > /etc/firewalld/direct.xml
+# Reload firewalld service
+firewall-cmd --reload
+
+# Generate Fail2Ban config
+touch /etc/fail2ban/jail.d/local.conf
+echo -ne "[DEFAULT]\nbanaction = firewallcmd-ipset\nbackend = systemd\n\n[sshd]\nenabled = true" > /etc/fail2ban/jail.d/local.conf
+# Allow Fail2Ban to access logs
+touch /var/log/fail2ban.log
+sed -i -E 's/^(logtarget =).*/\1 \/var\/log\/fail2ban.log/' /etc/fail2ban/fail2ban.conf
+# Enable Fail2Ban service
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+# Add multiple IPv4 addresses
+${deleteOriginalIpv4Coning}
+${addIpv4AddrsForRedhat}
+
+# Add multiple IPv6 addresses
+${deleteOriginalIpv6Coning}
+${setIpv6ConfigMethodForRedhat}
+${addIpv6AddrsForRedhat}
+
+# Clean logs and kickstart files
+rm -rf /root/anaconda-ks.cfg
+rm -rf /root/install.*log
+rm -rf /root/original-ks.cfg
+
+%end
+
+EOF
+	# If network adapter is not redirected, delete this setting to new system.
+	[[ "$setInterfaceName" == "0" ]] && sed -i 's/ net.ifnames=0 biosdevname=0//g' /tmp/boot/ks.cfg
+	# Support to add --setipv6 "0" to disable IPv6 modules permanently.
+	[[ "$setIPv6" == "1" ]] && sed -i 's/ipv6.disable=1//g' /tmp/boot/ks.cfg
+	# Support to disable fail2ban manually.
+	[[ "$setFail2banStatus" == "0" ]] && sed -i "/fail2ban/d" /tmp/boot/ks.cfg
+
+	[[ "$UNKNOWHW" == '1' ]] && sed -i 's/^unsupported_hardware/#unsupported_hardware/g' /tmp/boot/ks.cfg
+	[[ "$(echo "$DIST" | grep -o '^[0-9]\{1\}')" == '5' ]] && sed -i '0,/^%end/s//#%end/' /tmp/boot/ks.cfg
+fi
+
+# find . | cpio -H newc --create --verbose | gzip -1 > /tmp/initrd.img
+rm -rf /boot/initrd.img
+rm -rf /boot/vmlinuz
+find . | cpio -o -H newc | gzip -1 >/tmp/initrd.img
+
+# Grub config start
+# Debian/Ubuntu/Kali/AlpineLinux Grub1 setting start
+if [[ ! -z "$GRUBTYPE" && "$GRUBTYPE" == "isGrub1" ]]; then
+	if [[ "$setNetbootXyz" == "0" ]]; then
+		# In templates of Debian of equinix.com, the default "grub.cfg" is not match with the standard format, so it should be re-generated.
+		[[ ! $(grep -iE '/etc/grub.d|begin|end|savedefault|load_video|gfxmode' $GRUBDIR/$GRUBFILE) ]] && {
+			grub-mkconfig -o $GRUBDIR/$GRUBFILE >>/dev/null 2>&1
+		}
+		READGRUB='/tmp/grub.read'
+		[[ -f $READGRUB ]] && rm -rf $READGRUB
+		touch $READGRUB
+		# Backup original grub config file
+		cp $GRUBDIR/$GRUBFILE "$GRUBDIR/$GRUBFILE_$(date "+%Y%m%d%H%M").bak"
+		# Read grub file, search boot item.
+		#
+		# Here is the sample of "menuentry" in most regular Debian like Linux releases:
+		#
+		# menuentry 'Debian GNU/Linux' {
+		#   load_video
+		#   insmod ...
+		#   if [ x$grub_platform = xxen ]; then insmod ...; fi
+		#   set root='hd...'
+		#   if [ x$feature_platform_search_hint = xy ]; then
+		#	    search --no-floppy --fs-uuid --set=root --hint- ...
+		#   else
+		#     search --no-floppy --fs-uuid --set=root some uuid
+		#   fi
+		#   echo	'Loading Linux ...'
+		#	  linux	/boot/vmlinuz
+		#   echo	'Loading initial ramdisk ...'
+		#   initrd	/boot/initrd.img
+		# }
+		#
+		# But in Ubuntu series(version 20.04+) of official templates of Amazon Lightsail, there are two "}" in one set of the "menuentry" like:
+		#
+		# menuentry 'Ubuntu' {
+		#   gfxpayload ...
+		#   insmod ...
+		#   if [ x$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
+		#   if [ x$feature_platform_search_hint = xy ]; then ...; fi
+		#   if [ "${initrdfail}" = 1 ]; then
+		#     linux	/boot/vmlinuz
+		#     initrd	/boot/initrd.img
+		#   else
+		#     ...
+		#   fi
+		#   initrdfail
+		# }
+		#
+		# Original regex " grep -om 1 'menuentry\ [^}]*}' " written by "MoeClub" can only matches end to " menuentry 'Ubuntu' {..... if [ "${initrdfail} " so that " grep -om 1 'menuentry\ [^}]*}%%%%%%% " caused "$READGRUB" has nothing.
+		# That's why we need to add "." to split every regex conditions and delete space lines of "# code comments".
+		#
+		# Some grub file is written as a binary file, add parameter "-a, --text" process this file as if it were text; this is equivalent to the --binary-files=text option
+		cat $GRUBDIR/$GRUBFILE | sed -n '1h;1!H;$g;s/\n/%%%%%%%/g;$p' | grep -aom 1 'menuentry\ [^{].*{.[^}].*}%%%%%%%' | sed 's/%%%%%%%/\n/g' | grep -v '^#' | sed '/^[[:space:]]*$/d' >$READGRUB
+		LoadNum="$(cat $READGRUB | grep -c 'menuentry ')"
+		if [[ "$LoadNum" -eq '1' ]]; then
+			cat $READGRUB | sed '/^$/d' >/tmp/grub.new
+		elif [[ "$LoadNum" -gt '1' ]]; then
+			CFG0="$(awk '/menuentry /{print NR}' $READGRUB | head -n 1)"
+			CFG2="$(awk '/menuentry /{print NR}' $READGRUB | head -n 2 | tail -n 1)"
+			CFG1=""
+			for tmpCFG in $(awk '/}/{print NR}' $READGRUB); do
+				[ "$tmpCFG" -gt "$CFG0" -a "$tmpCFG" -lt "$CFG2" ] && CFG1="$tmpCFG"
+			done
+			[[ -z "$CFG1" ]] && {
+				echo -ne "\n[${red}Error${plain}] Read $GRUBFILE !\n"
+				exit 1
+			}
+			sed -n "$CFG0,$CFG1"p $READGRUB >/tmp/grub.new
+			[[ -f /tmp/grub.new ]] && [[ "$(grep -c '{' /tmp/grub.new)" -eq "$(grep -c '}' /tmp/grub.new)" ]] || {
+				echo -ne "\n[${red}Error${plain}] Not configure $GRUBFILE !\n"
+				exit 1
+			}
+		fi
+		[ ! -f /tmp/grub.new ] && echo -ne "\n[${red}Error${plain}] $GRUBFILE ! " && exit 1
+		sed -i "/menuentry.*/c\menuentry\ \'Install OS \[$Relese\ $DIST\ $VER\]\'\ --class $linux_relese\ --class\ gnu-linux\ --class\ gnu\ --class\ os\ \{" /tmp/grub.new
+		sed -i "/echo.*Loading/d" /tmp/grub.new
+		INSERTGRUB="$(awk '/menuentry /{print NR}' $GRUBDIR/$GRUBFILE | head -n 1)"
+
+		[[ -n "$(grep 'linux.*/\|kernel.*/' /tmp/grub.new | awk '{print $2}' | tail -n 1 | grep '^/boot/')" ]] && Type='InBoot' || Type='NoBoot'
+
+		LinuxKernel="$(grep 'linux.*/\|kernel.*/' /tmp/grub.new | awk '{print $1}' | head -n 1)"
+		[[ -z "$LinuxKernel" ]] && echo -ne "\n${red}Error${plain} read grub config!\n" && exit 1
+		LinuxIMG="$(grep 'initrd.*/' /tmp/grub.new | awk '{print $1}' | tail -n 1)"
+		[ -z "$LinuxIMG" ] && sed -i "/$LinuxKernel.*\//a\\\tinitrd\ \/" /tmp/grub.new && LinuxIMG='initrd'
+		# If network adapter need to redirect eth0, eth1... in new system, add this setting in grub file of the current system for netboot install file which need to be loaded after restart.
+		# The same behavior for grub2.
+		[[ "$setInterfaceName" == "1" ]] && Add_OPTION="$Add_OPTION net.ifnames=0 biosdevname=0" || Add_OPTION="$Add_OPTION"
+		[[ "$setIPv6" == "0" ]] && Add_OPTION="$Add_OPTION ipv6.disable=1" || Add_OPTION="$Add_OPTION"
+
+		if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]] || [[ "$linux_relese" == 'kali' ]]; then
+			# The method for Debian series installer to search network adapter automatically is to set "d-i netcfg/choose_interface select auto" in preseed file.
+			# The same behavior for grub2.
+			BOOT_OPTION="auto=true $Add_OPTION hostname=$HostName domain=$linux_relese quiet"
+		elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+			# Reference: https://wiki.alpinelinux.org/wiki/PXE_boot
+			# IPv4 dhcp config:
+			# ip=dhcp or not assign it.
+			# Allow a valid IPv4 static config:
+			# ip=client-ip::geteway:mask::adapter::dns:
+			# Sample:
+			# ip=179.86.100.76::179.86.100.1:255.255.255.0::eth0::1.0.0.1 8.8.8.8:
+			# Any of IPv6 address format can't be recognized.
+			if [[ "$IPStackType" == "BiStack" || "$IPStackType" == "IPv4Stack" ]]; then
+				[[ "$Network4Config" == "isStatic" ]] && Add_OPTION="ip=$IPv4::$GATE:$MASK::$interface4::$ipDNS:" || Add_OPTION="ip=dhcp"
+				[[ "$BurnIrregularIpv4Status" == "1" ]] && Add_OPTION="ip=$IPv4:::$ipMask::$interface4::$ipDNS:"
+			elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+				[[ "$Network6Config" == "isStatic" ]] && Add_OPTION="ip=$fakeIpv4:::$fakeIpMask::$interface6:::" || Add_OPTION="ip=dhcp"
+			fi
+			BOOT_OPTION="alpine_repo=$LinuxMirror/$DIST/main/ modloop=$ModLoopUrl $Add_OPTION"
+		elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+			ipv6ForRedhatGrub
+			# The method for Redhat series installer to search network adapter automatically is to set "ksdevice=link" in grub file of the current system for netboot install file which need to be loaded after restart.
+			# The same behavior for grub2.
+			# "ksdevice=interface" will be deprecated in future versions of anaconda.
+			# Reference: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/performing_an_advanced_rhel_8_installation/kickstart-and-advanced-boot-options_installing-rhel-as-an-experienced-user
+			BOOT_OPTION="inst.ks=file://ks.cfg $Add_OPTION inst.nomemcheck quiet $ipv6StaticConfForKsGrub"
+		fi
+		[[ "$setAutoConfig" == "0" ]] && sed -i 's/inst.ks=file:\/\/ks.cfg//' $GRUBDIR/$GRUBFILE
+
+		[[ -n "$ttyConsole" ]] && BOOT_OPTION="$BOOT_OPTION $ttyConsole"
+		[ -n "$setConsole" ] && BOOT_OPTION="$BOOT_OPTION --- console=$setConsole"
+
+		[[ "$Type" == 'InBoot' ]] && {
+			sed -i "/$LinuxKernel.*\//c\\\t$LinuxKernel\\t\/boot\/vmlinuz $BOOT_OPTION" /tmp/grub.new
+			sed -i "/$LinuxIMG.*\//c\\\t$LinuxIMG\\t\/boot\/initrd.img" /tmp/grub.new
+		}
+		[[ "$Type" == 'NoBoot' ]] && {
+			sed -i "/$LinuxKernel.*\//c\\\t$LinuxKernel\\t\/vmlinuz $BOOT_OPTION" /tmp/grub.new
+			sed -i "/$LinuxIMG.*\//c\\\t$LinuxIMG\\t\/initrd.img" /tmp/grub.new
+		}
+
+		sed -i '$a\\n' /tmp/grub.new
+
+		# To eliminate the undesirable effect of the condition of "initrdfail" in grub for Ubuntu series of AWS EC2 arm64 t4g instances.
+		#
+		# menuentry 'Ubuntu' --class ubuntu --class gnu-linux --class gnu --class os $menuentry_id_option 'gnulinux-simple-0694475a-b8e4-4c51-a03f-0c6f41144a12' {
+		#   recordfail
+		#   load_video
+		#   gfxmode $linux_gfx_mode
+		#   insmod gzio
+		#   if [ x$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
+		#   insmod part_gpt
+		#   insmod ext2
+		#   search --no-floppy --fs-uuid --set=root 0694475a-b8e4-4c51-a03f-0c6f41144a12
+		#   if [ "${initrdfail}" = 1 ]; then
+		#     echo  'GRUB_FORCE_PARTUUID set, initrdless boot failed. Attempting with initrd.'
+		#     linux  /boot/vmlinuz-5.19.0-1025-aws root=PARTUUID=7819481c-7167-49eb-8354-9a1efe601215 ro  console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295
+		#     initrd  /boot/initrd.img-5.19.0-1025-aws
+		#   else
+		#     echo  'GRUB_FORCE_PARTUUID set, attempting initrdless boot.'
+		#     linux  /boot/vmlinuz-5.19.0-1025-aws root=PARTUUID=7819481c-7167-49eb-8354-9a1efe601215 ro  console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295 panic=-1
+		#   fi
+		#   initrdfail
+		# }
+		#
+		# The same as AWS Lightsail, GCP, Azure.
+		#
+		# "initrdfail" is a recovery feature of Ubuntu. This option is used as when booting without initrd/initramfs for the cloud,
+		# and is not suitable in a normal Ubuntu installation environment. This option is similar to "recordfail",
+		# the variables of "initrdfail" are set on the GRUB side when each booting and then they will be deleted after startup,
+		# the behavior changes at the next startup depending on the contents of the variables.
+		#
+		# Reference: https://gihyo.jp/admin/serial/01/ubuntu-recipe/0746
+		#     Title: 第746回: update-grubの仕組みを使ってUbuntuのGRUBをさらにカスタマイズする
+		#   Chapter: 起動が失敗した時のリカバリー機能
+		#
+		[[ -n $(grep "initrdfail" /tmp/grub.new) ]] && {
+			sed -ri 's/\"\$\{initrdfail\}\".*/\"\$\{initrdfail\}\" = \"\" ]; then/g' /tmp/grub.new
+			sed -ri 's/initrdfail/initrdfial/g' /tmp/grub.new
+		}
+
+		sed -i ''${INSERTGRUB}'i\\n' $GRUBDIR/$GRUBFILE
+		sed -i ''${INSERTGRUB}'r /tmp/grub.new' $GRUBDIR/$GRUBFILE
+		[[ -f $GRUBDIR/grubenv ]] && sed -i 's/saved_entry/#saved_entry/g' $GRUBDIR/grubenv
+
+		# The value of " set default=... " in "/boot/grub/grub.cfg" in Ubuntu 20.04 of Tencent Cloud is "1", to boot to the new menuentry that we generated, the value of it must be replaced to "0".
+		[[ $(grep "set default=\"[0-9]" $GRUBDIR/$GRUBFILE | tr -cd "[0-9]") != "0" ]] && {
+			sed -ri 's/set default=\"[0-9].*/set default=\"0\"/g' $GRUBDIR/$GRUBFILE
+		}
+
+		# Debian/Ubuntu/Kali/AlpineLinux grub1 setting end
+	elif [[ "$setNetbootXyz" == "1" ]]; then
+		grub-mkconfig -o $GRUBDIR/$GRUBFILE >>/dev/null 2>&1
+		grub-set-default "Bootable ISO Image: netboot.xyz" >>/dev/null 2>&1
+		grub-reboot "Bootable ISO Image: netboot.xyz" >>/dev/null 2>&1
+	fi
+elif [[ ! -z "$GRUBTYPE" && "$GRUBTYPE" == "isGrub2" ]]; then
+	if [[ "$setNetbootXyz" == "0" ]]; then
+		# RedHat grub2 setting start
+		# Confirm linux and initrd kernel direction
+		if [[ -f $GRUBDIR/grubenv ]] && [[ -d /boot/loader/entries ]] && [[ "$(ls /boot/loader/entries | wc -l)" != "0" ]]; then
+			LoaderPath=$(cat $GRUBDIR/grubenv | grep 'saved_entry=' | awk -F '=' '{print $2}')
+			LpLength=$(echo ${#LoaderPath})
+			LpFile="/boot/loader/entries/$LoaderPath.conf"
+			# The saved_entry of OpenCloudOS(Tencent Cloud) is equal "0"
+			# [root@VM-4-11-opencloudos ~]# cat /boot/grub2/grubenv
+			# GRUB Environment Block
+			# saved_entry=0
+			# kernelopts=root=UUID=c21f153f-c0a8-42db-9ba5-8299e3c3d5b9 ro quiet elevator=noop console=ttyS0,115200 console=tty0 vconsole.keymap=us crashkernel=1800M-64G:256M,64G-128G:512M,128G-:768M vconsole.font=latarcyrheb-sun16 net.ifnames=0 biosdevname=0 intel_idle.max_cstate=1 intel_pstate=disable iommu=pt amd_iommu=on
+			# boot_success=0
+			if [[ "$LpLength" -le "1" ]] || [[ ! -f "$LpFile" ]]; then
+				LpFile=$(ls -Sl /boot/loader/entries/ | grep -wv "*rescue*" | awk -F' ' '{print $NF}' | sed -n '2p')
+				[[ "$(cat /boot/loader/entries/$LpFile | grep '^linux /boot/')" ]] && BootDIR='/boot' || BootDIR=''
+			else
+				[[ "$(cat $LpFile | grep '^linux /boot/')" ]] && BootDIR='/boot' || BootDIR=''
+			fi
+		else
+			[[ -n "$(grep 'linux.*/\|kernel.*/' $GRUBDIR/$GRUBFILE | awk '{print $2}' | tail -n 1 | grep '^/boot/')" ]] && BootDIR='/boot' || BootDIR=''
+		fi
+		# Confirm if BIOS or UEFI firmware for architecture of x86_64(AMD64) processors.
+		if [[ "$VER" == "x86_64" || "$VER" == "amd64" ]]; then
+			[[ "$EfiSupport" == "enabled" ]] && BootHex="efi" || BootHex="16"
+			# The architecture of aarch64(ARM64) processors have matched for only UEFI firmware even nowadays.
+		elif [[ "$VER" == "aarch64" || "$VER" == "arm64" ]]; then
+			BootHex=""
+		fi
+		# Get main menuentry parameter from current system
+		CFG0="$(awk '/insmod part_/{print NR}' $GRUBDIR/$GRUBFILE | head -n 1)"
+		CFG2tmp="$(awk '/--fs-uuid --set=root/{print NR}' $GRUBDIR/$GRUBFILE | head -n 2 | tail -n 1)"
+		CFG2=$(expr $CFG2tmp + 1)
+		CFG1=""
+		for tmpCFG in $(awk '/fi/{print NR}' $GRUBDIR/$GRUBFILE); do
+			[ "$tmpCFG" -ge "$CFG0" -a "$tmpCFG" -le "$CFG2" ] && CFG1="$tmpCFG"
+		done
+		if [[ -z "$CFG1" ]]; then
+			# In standard Redhat like linux OS with grub2 above version of 7, the OS boot configuration in "grub.cfg" is like:
+			#
+			# insmod part_msdos
+			# insmod xfs
+			# set root='hd0,msdos1'
+			# if [ x$feature_platform_search_hint = xy ]; then
+			#   search --no-floppy --fs-uuid --set=root --hint='hd0,msdos1'  d34311d7-62fd-419e-8f19-71494c773ddd
+			# else
+			#   search --no-floppy --fs-uuid --set=root d34311d7-62fd-419e-8f19-71494c773ddd
+			# fi
+			#
+			# But in RockyLinux 9.1 of official templates in Oracle Cloud, OVH Cloud etc, the boot configuration in "grub.cfg" is different from any other of Redhat release versions compeletely:
+			#
+			# insmod part_gpt
+			# insmod xfs
+			# search --no-floppy --fs-uuid --set=root 11000e8c-9777-43c3-a83b-54a13d609fdb
+			# insmod part_gpt
+			# insmod fat
+			# search --no-floppy --fs-uuid --set=boot 9E70-9B63
+			#
+			# In CentOS 7, Fedora 36+, AlmaLinux/CentOS-stream/RockyLinux 8+ of official templates in Linode, all the samples are the same:
+			#
+			# insmod part_msdos
+			# insmod ext2
+			# set root='hd0,gpt2'
+			# insmod part_msdos
+			# insmod ext2
+			# set boot='hd0,gpt2'
+			#
+			# Only the following method will effective:
+			#
+			# The expect component in grub file should be like "search --no-floppy --fs-uuid --set=root 9340b3c7-e898-44ae-bd1e-4c58dec2b16d" or "set boot='hd0'".
+			SetRootCfg="$(awk '/--fs-uuid --set=root/{print NR}' $GRUBDIR/$GRUBFILE | head -n 2 | tail -n 1)"
+			[[ "$SetRootCfg" == "" ]] && SetRootCfg="$(awk '/set root='\''hd[0-9]/{print NR}' /boot/grub2/grub.cfg | head -n 2 | tail -n 1)"
+			# An array for depositing all rows of "insmod part_".
+			InsmodPartArray=()
+			# An array for row number of "search --no-floppy --fs-uuid --set=root..." minus row number of "insmod part_".
+			IpaSpace=()
+			# Static how many times does "insmod part_" appeared and storage rows in array of "InsmodPartArray",
+			# storage minus rows in arrary of "IpaSpace"
+			for tmpCFG in $(awk '/insmod part_/{print NR}' $GRUBDIR/$GRUBFILE); do
+				InsmodPartArray+=("$tmpCFG" "$InsmodPartArray")
+				# One number of row minus another one shouldn't be less than "0".
+				[[ $(expr $SetRootCfg - $tmpCFG) -gt "0" ]] && IpaSpace+=($(expr "$SetRootCfg" - "$tmpCFG") "$IpaSpace")
+			done
+			# Definite order "0" in "IpaSpace" as a default value of variable of "minArray".
+			minArray=${IpaSpace[0]}
+			# The outer condition of this cycle is to definite how many times does it will execute.
+			for ((i = 1; i <= $(grep -io "insmod part_*" $GRUBDIR/$GRUBFILE | wc -l); i++)); do
+				# The inner condition of this cycle is the orders in array of "IpaSpace".
+				for j in ${IpaSpace[@]}; do
+					# A typical buddle sort for compare whether the current variable "minArray" is greater than the order of number in "IpaSpace" of current cycle.
+					# If "minArray" is greater than the order "j" in array of "IpaSpace", the less one "j" will replace the former "IpaSpace".
+					[[ $minArray -gt $j ]] && minArray=$j
+				done
+			done
+			# The least "minArray" will be the result and once it plus "SetRootCfg" will be the nearest row number of "insmod part_".
+			# So we can figure out the valid section of boot configuration in "grub.cfg" like:
+			#
+			# insmod part_gpt
+			# insmod xfs
+			# search --no-floppy --fs-uuid --set=root 9340b3c7-e898-44ae-bd1e-4c58dec2b16d
+			#
+			CFG0=$(expr $SetRootCfg - $minArray)
+			CFG1="$SetRootCfg"
+		fi
+		[[ -z "$CFG0" || -z "$CFG1" ]] && {
+			echo -ne "\n[${red}Error${plain}] Read $GRUBFILE !\n"
+			exit 1
+		}
+		sed -n "$CFG0,$CFG1"p $GRUBDIR/$GRUBFILE >/tmp/grub.new
+		sed -i -e 's/^/  /' /tmp/grub.new
+		[[ -f /tmp/grub.new ]] && [[ "$(grep -c '{' /tmp/grub.new)" -eq "$(grep -c '}' /tmp/grub.new)" ]] || {
+			echo -ne "\n[${red}Error${plain}] Not configure $GRUBFILE !\n"
+			exit 1
+		}
+		[ ! -f /tmp/grub.new ] && echo -ne "\n[${red}Error${plain}] $GRUBFILE !\n" && exit 1
+		# Set IPv6 or distribute unite network adapter interface
+		[[ "$setInterfaceName" == "1" ]] && Add_OPTION="$Add_OPTION net.ifnames=0 biosdevname=0" || Add_OPTION="$Add_OPTION"
+		[[ "$setIPv6" == "0" ]] && Add_OPTION="$Add_OPTION ipv6.disable=1" || Add_OPTION="$Add_OPTION"
+		# Write menuentry to grub
+		# Find existed boot entries: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/managing_monitoring_and_updating_the_kernel/configuring-kernel-command-line-parameters_managing-monitoring-and-updating-the-kernel#what-boot-entries-are_configuring-kernel-command-line-parameters
+		# There is no directory of "/boot/loader/entries/" in CentOS 7.
+		grub2Order=$(find /boot/loader/entries/ -maxdepth 1 -name "*.conf" 2>/dev/null | wc -l)
+		[[ "$grub2Order" == "0" ]] && grub2Order=$(grep -ic "menuentry '*'" $GRUBDIR/$GRUBFILE)
+		[[ "$grub2Order" == "0" ]] && grub2Order=$(grub2-mkconfig -o $GRUBDIR/$GRUBFILE 2>&1 | grep -ic "linux image:")
+		[[ "$grub2Order" == "0" ]] && grub2Order="saved"
+		# Make grub2 to prefer installation item to boot first.
+		sed -ri 's/GRUB_DEFAULT=.*/GRUB_DEFAULT='$grub2Order'/g' /etc/default/grub
+		if [[ "$linux_relese" == 'ubuntu' || "$linux_relese" == 'debian' || "$linux_relese" == 'kali' ]]; then
+			BOOT_OPTION="auto=true $Add_OPTION hostname=$HostName domain=$linux_relese quiet"
+		elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+			if [[ "$IPStackType" == "BiStack" || "$IPStackType" == "IPv4Stack" ]]; then
+				[[ "$Network4Config" == "isStatic" ]] && Add_OPTION="ip=$IPv4::$GATE:$MASK::$interface4::$ipDNS:" || Add_OPTION="ip=dhcp"
+				[[ "$BurnIrregularIpv4Status" == "1" ]] && Add_OPTION="ip=$IPv4:::$ipMask::$interface4::$ipDNS:"
+			elif [[ "$IPStackType" == "IPv6Stack" ]]; then
+				[[ "$Network6Config" == "isStatic" ]] && Add_OPTION="ip=$fakeIpv4:::$fakeIpMask::$interface6:::" || Add_OPTION="ip=dhcp"
+			fi
+			BOOT_OPTION="alpine_repo=$LinuxMirror/$DIST/main/ modloop=$ModLoopUrl $Add_OPTION"
+		elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+			ipv6ForRedhatGrub
+			BOOT_OPTION="inst.ks=file://ks.cfg $Add_OPTION inst.nomemcheck quiet $ipv6StaticConfForKsGrub"
+		fi
+		[[ -n "$ttyConsole" ]] && BOOT_OPTION="$BOOT_OPTION $ttyConsole"
+		[[ "$setAutoConfig" == "0" ]] && sed -i 's/inst.ks=file:\/\/ks.cfg//' $GRUBDIR/$GRUBFILE
+		cat >>/etc/grub.d/40_custom <<EOF
+menuentry 'Install $Relese $DIST $VER' --class $linux_relese --class gnu-linux --class gnu --class os {
+  load_video
+  set gfxpayload=text
+  insmod gzio
+$(cat /tmp/grub.new)
+  linux$BootHex $BootDIR/vmlinuz $BOOT_OPTION
+  initrd$BootHex $BootDIR/initrd.img
 }
 EOF
-
-        # 设置重启引导项
-        if is_use_local_grub; then
-            $grub-reboot "$(get_entry_name)"
-        fi
-    fi
+		# Refreshing current system grub2 service
+		grub2-mkconfig -o $GRUBDIR/$GRUBFILE >>/dev/null 2>&1
+		grub2-set-default "Install $Relese $DIST $VER" >>/dev/null 2>&1
+		grub2-reboot "Install $Relese $DIST $VER" >>/dev/null 2>&1
+		# RedHat grub setting end
+	elif [[ "$setNetbootXyz" == "1" ]]; then
+		grub2-mkconfig -o $GRUBDIR/$GRUBFILE >>/dev/null 2>&1
+		grub2-set-default "Bootable ISO Image: netboot.xyz" >>/dev/null 2>&1
+		grub2-reboot "Bootable ISO Image: netboot.xyz" >>/dev/null 2>&1
+	fi
 fi
+# Grub config end
 
-info 'info'
-echo "$distro $releasever"
+# To fix errors about grub 2.06 reading configs from grub 2.12 .
+checkAndReplaceEfiGrub
 
-case "$distro" in
-windows) username=administrator ;;
-dd | netboot.xyz) username= ;;
-*) username=root ;;
-esac
-
-if [ -n "$username" ]; then
-    echo "Username: $username"
-    if [ -n "$ssh_keys" ]; then
-        echo "Public Key: $ssh_keys"
-    else
-        echo "Password: $password"
-    fi
-fi
-
-if is_netboot_xyz; then
-    echo 'Reboot to start netboot.xyz.'
-elif is_alpine_live; then
-    echo 'Reboot to start Alpine Live OS.'
-elif is_use_dd; then
-    echo 'Reboot to start DD.'
-elif [ "$distro" = fnos ]; then
-    echo "Special note for FNOS:"
-    echo "Reboot to start the installation."
-    echo "SSH login is disabled when installation completed."
-    echo "You need to config the account and password on http://SERVER_IP:5666 as soon as possible."
-    echo
-    echo "飞牛 OS 注意事项："
-    echo "重启后开始安装。"
-    echo "安装完成后不支持 SSH 登录。"
-    echo "你需要尽快在 http://SERVER_IP:5666 配置账号密码。"
+if [[ "$loaderMode" == "0" ]]; then
+	# sleep 5 && reboot || sudo reboot >/dev/null 2>&1
+	cp -f /tmp/initrd.img /boot/initrd.img || sudo cp -f /tmp/initrd.img /boot/initrd.img
+	cp -f /tmp/vmlinuz /boot/vmlinuz || sudo cp -f /tmp/vmlinuz /boot/vmlinuz
+	chown root:root $GRUBDIR/$GRUBFILE
+	chmod 444 $GRUBDIR/$GRUBFILE
 else
-    echo "Reboot to start the installation."
+	rm -rf "$HOME/loader"
+	mkdir -p "$HOME/loader"
+	cp -rf "/tmp/initrd.img" "$HOME/loader/initrd.img"
+	cp -rf "/tmp/vmlinuz" "$HOME/loader/vmlinuz"
+	[[ -f "/tmp/initrd.img" ]] && rm -rf "/tmp/initrd.img"
+	[[ -f "/tmp/vmlinuz" ]] && rm -rf "/tmp/vmlinuz"
+	echo && ls -AR1 "$HOME/loader"
 fi
 
-if is_in_windows; then
-    echo 'You can run this command to reboot:'
-    echo 'shutdown /r /t 0'
-fi
+[[ "$setAutoConfig" != "0" || "$setNetbootXyz" != "1" || "$loaderMode" == "0" ]] && {
+	echo -ne "\n${aoiBlue}# Directory of Grub and Unattended Disposition File${plain}\n\n"
+	echo "$GRUBDIR/$GRUBFILE"
+	if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'kali' ]]; then
+		echo "/tmp/boot/preseed.cfg"
+	elif [[ "$linux_relese" == 'centos' ]] || [[ "$linux_relese" == 'rockylinux' ]] || [[ "$linux_relese" == 'almalinux' ]] || [[ "$linux_relese" == 'fedora' ]]; then
+		echo "/tmp/boot/ks.cfg"
+	elif [[ "$linux_relese" == 'alpinelinux' ]]; then
+		echo "/tmp/boot/init"
+	fi
+}
+
+echo -ne "\n[${green}Finish${plain}] Input '${yellow}reboot${plain}' to continue the subsequential installation.\n"
+exit 1
