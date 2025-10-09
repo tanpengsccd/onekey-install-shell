@@ -44,7 +44,7 @@ get_github_key() {
     fi
     echo -e "${INFO} The GitHub account is: ${KEY_ID}"
     echo -e "${INFO} Get key from GitHub..."
-    PUB_KEY=$(curl -fsSL https://gh.j8.work/https://github.com/${KEY_ID}.keys)
+    PUB_KEY=$(curl -fsSL https://rp.j8.work/https://github.com/${KEY_ID}.keys)
     if [ "${PUB_KEY}" == 'Not Found' ]; then
         echo -e "${ERROR} GitHub account not found."
         exit 1
