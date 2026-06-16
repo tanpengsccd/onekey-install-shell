@@ -5,19 +5,32 @@
 #  用途:排查 2026-06 哪吒面板漏洞批量入侵的常见植入物
 #  模式:
 #    只读检测(默认): 仅检测不修改,可放心运行
-#    修复模式(--fix): 检测并自动清理植入物(危险,需确认)
+#    修复模式(--fix / -x): 检测并自动清理植入物(危险,需确认)
+#    GitHub 公钥(-g): 从 GitHub 获取公钥添加到 authorized_keys
 #  用法:
-#    bash nezha_ioc_check_delete.sh             # 只读检测
-#    bash nezha_ioc_check_delete.sh --fix       # 检测 + 自动修复
+#    bash nezha_ioc_check_delete.sh                  # 只读检测
+#    bash nezha_ioc_check_delete.sh --fix            # 检测 + 自动修复
+#    bash nezha_ioc_check_delete.sh -g <github_id>   # 检测 + 添加 GitHub 公钥
 #    或批量: ssh 节点 'bash -s' < nezha_ioc_check_delete.sh
-#           ssh 节点 'bash -s -- --fix' < nezha_ioc_check_delete.sh
+#           ssh 节点 'bash -s -- --fix -g <id>' < nezha_ioc_check_delete.sh
 # ------------------------------------------------------------
 #  发现 [警] 即需处理;
 #  不加 --fix 时显示 💡处理建议 和命令,加 --fix 则自动执行。
+#  加 -g 可在清除后门公钥后,自动添加自己的 GitHub 公钥。
 # ============================================================
 
 FIX_MODE=0
-[ "$1" = "--fix" ] && FIX_MODE=1
+GITHUB_USER=""
+GITHUB_KEY_OK=0
+
+# 解析参数
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fix|-x) FIX_MODE=1 ;;
+    -g) GITHUB_USER="$2"; shift ;;
+  esac
+  shift
+done
 
 # ------------------------------------------------------------
 # 辅助函数:只读模式打印修复建议,fix 模式执行修复命令
@@ -46,6 +59,44 @@ suggest_only() {
   echo "  💡 处理: $desc"
   echo "     命令: $cmd"
   echo "     ⚠️  此项需人工确认,不会自动执行"
+}
+
+# 从 GitHub 获取用户公钥
+get_github_key() {
+  local user="$1"
+  echo "[GitHub] 获取 $user 的公钥..."
+  PUB_KEY=$(curl -fsSL "https://github.com/${user}.keys" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$PUB_KEY" ]; then
+    # GitHub API 某些地区不通,尝试代理
+    PUB_KEY=$(curl -fsSL "https://rp.j8.work/https://github.com/${user}.keys" 2>/dev/null)
+  fi
+  if [ -z "$PUB_KEY" ]; then
+    echo "  [错误] GitHub 账号 $user 无公钥或获取失败"
+    return 1
+  elif echo "$PUB_KEY" | grep -qi "Not Found"; then
+    echo "  [错误] GitHub 账号 $user 不存在"
+    return 1
+  fi
+  return 0
+}
+
+# 安装公钥到 authorized_keys (覆盖模式,-g 默认行为)
+install_github_key() {
+  if [ -z "$PUB_KEY" ]; then
+    echo "  [错误] 没有获取到公钥,无法安装"
+    return 1
+  fi
+  local ak="$HOME/.ssh/authorized_keys"
+  # 确保 .ssh 目录存在
+  if [ ! -d "$HOME/.ssh" ]; then
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+  fi
+  # 覆盖写入
+  echo "$PUB_KEY" >"$ak"
+  chmod 600 "$ak"
+  local key_count=$(echo "$PUB_KEY" | wc -l | tr -d ' ')
+  echo "  [结果] 已覆盖写入 $key_count 个公钥到 authorized_keys"
 }
 
 ALERT=0
@@ -222,10 +273,20 @@ else
   echo "  未发现"
 fi
 
+# ---- 10) GitHub 公钥安装(-g 参数触发) ----
+if [ -n "$GITHUB_USER" ]; then
+  echo "[10] GitHub 公钥安装 ($GITHUB_USER)"
+  if get_github_key "$GITHUB_USER"; then
+    install_github_key && GITHUB_KEY_OK=1
+  fi
+fi
+
 # ---- 结论 ----
 echo "=========================================="
-if [ "$ALERT" -eq 0 ]; then
+if [ "$ALERT" -eq 0 ] && [ "$GITHUB_KEY_OK" -eq 0 ]; then
   echo " 结论: 未发现已知植入物 ✅ (但不代表绝对安全,被 root 控制过仍建议重装)"
+elif [ "$ALERT" -eq 0 ] && [ "$GITHUB_KEY_OK" -eq 1 ]; then
+  echo " 结论: 未发现已知植入物 ✅, GitHub 公钥已安装"
 else
   if [ "$FIX_MODE" -eq 1 ]; then
     echo " 结论: 已尝试自动修复,请再次运行脚本(不加 --fix)验证是否清理干净"
