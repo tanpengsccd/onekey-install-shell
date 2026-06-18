@@ -280,17 +280,94 @@ if [ -e /etc/systemd/system/systemlog.service ]; then
 fi
 [ "$systemlog_found" -eq 0 ] && echo "  未发现"
 
-# ---- 7) SSH 后门公钥 ----
-# 网传后门公钥常带 gary 之类注释;这里同时提示你核对公钥总数。
-echo "[8] SSH 后门公钥"
+# ---- 8) SSH 安全(公钥/配置/触发脚本/PAM)----
+echo "[8] SSH 安全"
 ssh_found=0
+
+# 8.1 authorized_keys 后门公钥
+echo "  [8-1] authorized_keys"
 if grep -iq "gary" ~/.ssh/authorized_keys 2>/dev/null; then
-  echo "  [警] authorized_keys 含可疑公钥(gary)"; ALERT=1; ssh_found=1
-  fix_it "备份 authorized_keys 到 authorized_keys.bak" "cp -f ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak.\$(date +%s)"
+  echo "    [警] authorized_keys 含可疑公钥(gary)"; ALERT=1; ssh_found=1
+  fix_it "备份 authorized_keys" "cp -f ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak.\$(date +%s)"
   fix_it "删除含 gary 的公钥行" "sed -i.bak '/gary/I d' ~/.ssh/authorized_keys"
 fi
-echo "  (当前 authorized_keys 公钥数: $(grep -c '^ssh-' ~/.ssh/authorized_keys 2>/dev/null))"
-if [ "$ssh_found" -eq 0 ]; then echo "  未发现可疑 SSH 公钥"; fi
+echo "    (当前 authorized_keys 公钥数: $(grep -c '^ssh-' ~/.ssh/authorized_keys 2>/dev/null))"
+
+# 8.2 authorized_keys2 (已废弃但部分版本仍读取)
+if [ -f ~/.ssh/authorized_keys2 ]; then
+  echo "    [警] ~/.ssh/authorized_keys2 存在(已废弃但仍可能被读取):"; cat ~/.ssh/authorized_keys2 | sed 's/^/      /'; ALERT=1; ssh_found=1
+  fix_it "备份并删除 authorized_keys2" "cp -f ~/.ssh/authorized_keys2 ~/.ssh/authorized_keys2.bak.\$(date +%s); rm -f ~/.ssh/authorized_keys2"
+fi
+
+# 8.3 sshd_config 风险配置(仅提示,不自动修改,防止锁死SSH)
+echo "  [8-2] sshd_config 风险配置"
+SSHD_CFG=""
+for f in /etc/ssh/sshd_config /etc/sshd_config /usr/local/etc/ssh/sshd_config; do
+  [ -f "$f" ] && { SSHD_CFG="$f"; break; }
+done
+if [ -n "$SSHD_CFG" ]; then
+  # PermitRootLogin
+  if grep -E '^\s*PermitRootLogin\s+yes' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] PermitRootLogin yes → 允许 root 远程登录"; ALERT=1; ssh_found=1
+    suggest_only "建议禁用 root 登录" "sed -i 's/^[[:space:]]*PermitRootLogin.*/PermitRootLogin no/' $SSHD_CFG; systemctl restart sshd"
+  fi
+  # PasswordAuthentication
+  if grep -E '^\s*PasswordAuthentication\s+yes' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] PasswordAuthentication yes → 允许密码登录(建议只用密钥)"; ALERT=1; ssh_found=1
+    suggest_only "建议禁用密码登录" "sed -i 's/^[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' $SSHD_CFG; systemctl restart sshd"
+  fi
+  # ChallengeResponseAuthentication
+  if grep -E '^\s*ChallengeResponseAuthentication\s+yes' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] ChallengeResponseAuthentication yes → 允许键盘交互登录"; ALERT=1; ssh_found=1
+    suggest_only "建议禁用键盘交互" "sed -i 's/^[[:space:]]*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' $SSHD_CFG; systemctl restart sshd"
+  fi
+  # AuthorizedKeysCommand (攻击者常用此后门)
+  if grep -E '^\s*AuthorizedKeysCommand\s+[^#]' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] AuthorizedKeysCommand 已设置(攻击者常用此后门):"; grep 'AuthorizedKeysCommand' "$SSHD_CFG" | sed 's/^/      /'; ALERT=1; ssh_found=1
+    suggest_only "检查并移除 AuthorizedKeysCommand" "sed -i '/^[[:space:]]*AuthorizedKeysCommand/s/^/#/' $SSHD_CFG; systemctl restart sshd"
+  fi
+  # AuthorizedKeysFile 指向非标准路径
+  if grep -E '^\s*AuthorizedKeysFile\s+' "$SSHD_CFG" 2>/dev/null; then
+    akf=$(grep -E '^\s*AuthorizedKeysFile\s+' "$SSHD_CFG")
+    echo "    [信息] AuthorizedKeysFile 已指定: $akf (请核对是否非标准路径)"
+  fi
+  # PermitTunnel + GatewayPorts (可用于反向隧道持久化)
+  if grep -E '^\s*PermitTunnel\s+yes' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] PermitTunnel yes → 允许SSH隧道"; ALERT=1; ssh_found=1
+    suggest_only "建议禁用隧道" "sed -i 's/^[[:space:]]*PermitTunnel.*/PermitTunnel no/' $SSHD_CFG; systemctl restart sshd"
+  fi
+  if grep -E '^\s*GatewayPorts\s+yes' "$SSHD_CFG" 2>/dev/null; then
+    echo "    [警] GatewayPorts yes → 允许隧道对外监听(可被用于反弹隧道)"; ALERT=1; ssh_found=1
+    suggest_only "建议禁用 GatewayPorts" "sed -i 's/^[[:space:]]*GatewayPorts.*/GatewayPorts no/' $SSHD_CFG; systemctl restart sshd"
+  fi
+else
+  echo "    (未找到 sshd_config)"
+fi
+
+# 8.4 登录触发脚本
+echo "  [8-3] 登录触发脚本"
+if [ -f ~/.ssh/rc ]; then
+  echo "    [警] ~/.ssh/rc 存在(SSH登录时自动执行):"; cat ~/.ssh/rc | sed 's/^/      /'; ALERT=1; ssh_found=1
+  fix_it "备份并删除 ~/.ssh/rc" "cp -f ~/.ssh/rc ~/.ssh/rc.bak.\$(date +%s); rm -f ~/.ssh/rc"
+fi
+if [ -f /etc/ssh/sshrc ]; then
+  echo "    [警] /etc/ssh/sshrc 存在(全局SSH登录自动执行):"; cat /etc/ssh/sshrc | sed 's/^/      /'; ALERT=1; ssh_found=1
+  fix_it "备份并删除 /etc/ssh/sshrc" "cp -f /etc/ssh/sshrc /etc/ssh/sshrc.bak.\$(date +%s); rm -f /etc/ssh/sshrc"
+fi
+
+# 8.5 PAM sshd 模块
+echo "  [8-4] PAM sshd"
+if [ -f /etc/pam.d/sshd ]; then
+  # 检查是否有非标准 PAM 模块
+  # 排除标准模块: Linux (pam_unix/pam_systemd/...) + macOS (pam_opendirectory/pam_launchd/...)
+  PAM_SUS=$(grep -vE '^\s*#|^\s*$' /etc/pam.d/sshd | grep -vE '(pam_selinux|pam_loginuid|pam_keyinit|pam_namespace|pam_nologin|pam_unix|pam_systemd|pam_limits|pam_env|pam_mail|pam_motd|pam_deny|pam_permit|pam_access|pam_lastlog|pam_tally|pam_faillock|pam_google_authenticator|pam_duo|pam_krb5|pam_ntlm|pam_mount|pam_opendirectory|pam_sacl|pam_launchd)' || true)
+  if [ -n "$PAM_SUS" ]; then
+    echo "    [警] PAM sshd 含非标准模块(可能是后门):"; echo "$PAM_SUS" | sed 's/^/      /'; ALERT=1; ssh_found=1
+    suggest_only "检查 /etc/pam.d/sshd 中可疑的 PAM 模块" "手动编辑 /etc/pam.d/sshd 删除可疑行"
+  fi
+fi
+
+if [ "$ssh_found" -eq 0 ]; then echo "  SSH 安全: 未发现异常"; fi
 
 # ---- 9) 自启动持久化(cron / 可疑 service)----
 echo "[9] 持久化(cron)"
