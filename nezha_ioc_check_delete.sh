@@ -360,7 +360,8 @@ echo "  [8-4] PAM sshd"
 if [ -f /etc/pam.d/sshd ]; then
   # 检查是否有非标准 PAM 模块
   # 排除标准模块: Linux (pam_unix/pam_systemd/...) + macOS (pam_opendirectory/pam_launchd/...)
-  PAM_SUS=$(grep -vE '^\s*#|^\s*$' /etc/pam.d/sshd | grep -vE '(pam_selinux|pam_loginuid|pam_keyinit|pam_namespace|pam_nologin|pam_unix|pam_systemd|pam_limits|pam_env|pam_mail|pam_motd|pam_deny|pam_permit|pam_access|pam_lastlog|pam_tally|pam_faillock|pam_google_authenticator|pam_duo|pam_krb5|pam_ntlm|pam_mount|pam_opendirectory|pam_sacl|pam_launchd)' || true)
+  # 排除标准模块/指令: pam_* 模块 + @include (Debian/Ubuntu) + substack + auth/account/password/session 关键字行
+  PAM_SUS=$(grep -vE '^\s*#|^\s*$' /etc/pam.d/sshd | grep -vE '(^[[:space:]]*@include|^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_|^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_|^[[:space:]]*auth[[:space:]]+optional[[:space:]]+pam_|^[[:space:]]*auth[[:space:]]+requisite[[:space:]]+pam_|^[[:space:]]*auth[[:space:]]+[[:space:]]+pam_|substack|pam_selinux|pam_loginuid|pam_keyinit|pam_namespace|pam_nologin|pam_unix|pam_systemd|pam_limits|pam_env|pam_mail|pam_motd|pam_deny|pam_permit|pam_access|pam_lastlog|pam_tally|pam_faillock|pam_google_authenticator|pam_duo|pam_krb5|pam_ntlm|pam_mount|pam_opendirectory|pam_sacl|pam_launchd|pam_umask|pam_cap)' || true)
   if [ -n "$PAM_SUS" ]; then
     echo "    [警] PAM sshd 含非标准模块(可能是后门):"; echo "$PAM_SUS" | sed 's/^/      /'; ALERT=1; ssh_found=1
     suggest_only "检查 /etc/pam.d/sshd 中可疑的 PAM 模块" "手动编辑 /etc/pam.d/sshd 删除可疑行"
