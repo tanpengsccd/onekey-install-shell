@@ -7,27 +7,33 @@
 #    只读检测(默认): 仅检测不修改,可放心运行
 #    修复模式(--fix / -x): 检测并自动清理植入物(危险,需确认)
 #    GitHub 公钥(-g): 从 GitHub 获取公钥添加到 authorized_keys
+#    修改密码(-p): 修改 root 用户密码
 #  用法:
-#    bash nezha_ioc_check_delete.sh                  # 只读检测
-#    bash nezha_ioc_check_delete.sh --fix            # 检测 + 自动修复
-#    bash nezha_ioc_check_delete.sh -g <github_id>   # 检测 + 添加 GitHub 公钥
+#    bash nezha_ioc_check_delete.sh                       # 只读检测
+#    bash nezha_ioc_check_delete.sh --fix                 # 检测 + 自动修复
+#    bash nezha_ioc_check_delete.sh -g <github_id>        # 检测 + 添加 GitHub 公钥
+#    bash nezha_ioc_check_delete.sh -p '<new_password>'   # 检测 + 修改 root 密码
 #    或批量: ssh 节点 'bash -s' < nezha_ioc_check_delete.sh
-#           ssh 节点 'bash -s -- --fix -g <id>' < nezha_ioc_check_delete.sh
+#           ssh 节点 'bash -s -- --fix -g <id> -p <pwd>' < nezha_ioc_check_delete.sh
 # ------------------------------------------------------------
 #  发现 [警] 即需处理;
 #  不加 --fix 时显示 💡处理建议 和命令,加 --fix 则自动执行。
 #  加 -g 可在清除后门公钥后,自动添加自己的 GitHub 公钥。
+#  加 -p 可修改 root 密码(入侵后务必修改)。
 # ============================================================
 
 FIX_MODE=0
 GITHUB_USER=""
 GITHUB_KEY_OK=0
+ROOT_PASSWD=""
+ROOT_PASSWD_OK=0
 
 # 解析参数
 while [ $# -gt 0 ]; do
   case "$1" in
     --fix|-x) FIX_MODE=1 ;;
     -g) GITHUB_USER="$2"; shift ;;
+    -p) ROOT_PASSWD="$2"; shift ;;
   esac
   shift
 done
@@ -97,6 +103,26 @@ install_github_key() {
   chmod 600 "$ak"
   local key_count=$(echo "$PUB_KEY" | wc -l | tr -d ' ')
   echo "  [结果] 已覆盖写入 $key_count 个公钥到 authorized_keys"
+}
+
+# 修改 root 密码
+change_root_password() {
+  local pwd="$1"
+  if [ -z "$pwd" ]; then
+    echo "  [错误] 密码不能为空"
+    return 1
+  fi
+  echo "  [执行] 正在修改 root 密码..."
+  if echo "root:$pwd" | chpasswd 2>/dev/null; then
+    echo "  [完成] ✓ root 密码已修改"
+    return 0
+  elif echo "$pwd" | passwd --stdin root 2>/dev/null; then
+    echo "  [完成] ✓ root 密码已修改"
+    return 0
+  else
+    echo "  [失败] ✗ 密码修改失败(可能需要 root 权限)"
+    return 1
+  fi
 }
 
 ALERT=0
@@ -217,8 +243,26 @@ if [ -e /etc/systemd/system/c3pool_miner.service ]; then
 fi
 [ "$miner_found" -eq 0 ] && echo "  未发现"
 
-# ---- 6) 守护/复活服务(SystemLoger / systemlog.service)----
-echo "[6] 守护复活服务"
+# ---- 6) traffmonetizer/cli_v2 容器 ----
+# 攻击者利用被控机器运行 traffmonetizer 流量套利容器
+echo "[6] traffmonetizer 容器"
+traff_found=0
+if command -v docker &>/dev/null; then
+  TRAFF_IDS=$(docker ps -a --filter "ancestor=traffmonetizer/cli_v2:latest" --format "{{.ID}}" 2>/dev/null)
+  if [ -n "$TRAFF_IDS" ]; then
+    for cid in $TRAFF_IDS; do
+      cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
+      cimg=$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null)
+      echo "  [警] 发现 traffmonetizer 容器 ID=$cid name=$cname image=$cimg"
+      ALERT=1; traff_found=1
+      fix_it "停止并删除容器 $cid ($cname)" "docker stop '$cid' 2>/dev/null; docker rm -f '$cid' 2>/dev/null"
+    done
+  fi
+fi
+[ "$traff_found" -eq 0 ] && echo "  未发现"
+
+# ---- 7) 守护/复活服务(SystemLoger / systemlog.service)----
+echo "[7] 守护复活服务"
 systemlog_found=0
 if pgrep -x SystemLoger >/dev/null 2>&1; then
   echo "  [警] SystemLoger 进程在运行"; ALERT=1; systemlog_found=1
@@ -238,7 +282,7 @@ fi
 
 # ---- 7) SSH 后门公钥 ----
 # 网传后门公钥常带 gary 之类注释;这里同时提示你核对公钥总数。
-echo "[7] SSH 后门公钥"
+echo "[8] SSH 后门公钥"
 ssh_found=0
 if grep -iq "gary" ~/.ssh/authorized_keys 2>/dev/null; then
   echo "  [警] authorized_keys 含可疑公钥(gary)"; ALERT=1; ssh_found=1
@@ -248,8 +292,8 @@ fi
 echo "  (当前 authorized_keys 公钥数: $(grep -c '^ssh-' ~/.ssh/authorized_keys 2>/dev/null))"
 if [ "$ssh_found" -eq 0 ]; then echo "  未发现可疑 SSH 公钥"; fi
 
-# ---- 8) 自启动持久化(cron / 可疑 service)----
-echo "[8] 持久化(cron)"
+# ---- 9) 自启动持久化(cron / 可疑 service)----
+echo "[9] 持久化(cron)"
 for u in $(cut -f1 -d: /etc/passwd); do
   c=$(crontab -l -u "$u" 2>/dev/null | grep -vE '^\s*#|^\s*$')
   [ -n "$c" ] && { echo "  [信息] 用户 $u 有 cron(请核对):"; echo "$c" | sed 's/^/      /'; }
@@ -264,8 +308,8 @@ else
   echo "  未发现可疑 cron"
 fi
 
-# ---- 9) ld.so.preload 劫持 ----
-echo "[9] ld.so.preload"
+# ---- 10) ld.so.preload 劫持 ----
+echo "[10] ld.so.preload"
 if [ -f /etc/ld.so.preload ]; then
   echo "  [警] /etc/ld.so.preload 存在(默认不该有):"; cat /etc/ld.so.preload | sed 's/^/      /'; ALERT=1
   fix_it "备份并删除 /etc/ld.so.preload" "mv /etc/ld.so.preload /etc/ld.so.preload.bak.\$(date +%s)"
@@ -273,20 +317,29 @@ else
   echo "  未发现"
 fi
 
-# ---- 10) GitHub 公钥安装(-g 参数触发) ----
+# ---- 11) GitHub 公钥安装(-g 参数触发) ----
 if [ -n "$GITHUB_USER" ]; then
-  echo "[10] GitHub 公钥安装 ($GITHUB_USER)"
+  echo "[11] GitHub 公钥安装 ($GITHUB_USER)"
   if get_github_key "$GITHUB_USER"; then
     install_github_key && GITHUB_KEY_OK=1
   fi
 fi
 
+# ---- 12) 修改 root 密码(-p 参数触发) ----
+if [ -n "$ROOT_PASSWD" ]; then
+  echo "[12] 修改 root 密码"
+  change_root_password "$ROOT_PASSWD" && ROOT_PASSWD_OK=1
+fi
+
 # ---- 结论 ----
 echo "=========================================="
-if [ "$ALERT" -eq 0 ] && [ "$GITHUB_KEY_OK" -eq 0 ]; then
+if [ "$ALERT" -eq 0 ] && [ "$GITHUB_KEY_OK" -eq 0 ] && [ "$ROOT_PASSWD_OK" -eq 0 ]; then
   echo " 结论: 未发现已知植入物 ✅ (但不代表绝对安全,被 root 控制过仍建议重装)"
-elif [ "$ALERT" -eq 0 ] && [ "$GITHUB_KEY_OK" -eq 1 ]; then
-  echo " 结论: 未发现已知植入物 ✅, GitHub 公钥已安装"
+elif [ "$ALERT" -eq 0 ]; then
+  _msg=" 结论: 未发现已知植入物 ✅"
+  [ "$GITHUB_KEY_OK" -eq 1 ] && _msg="$_msg, GitHub 公钥已安装"
+  [ "$ROOT_PASSWD_OK" -eq 1 ] && _msg="$_msg, root 密码已修改"
+  echo "$_msg"
 else
   if [ "$FIX_MODE" -eq 1 ]; then
     echo " 结论: 已尝试自动修复,请再次运行脚本(不加 --fix)验证是否清理干净"
