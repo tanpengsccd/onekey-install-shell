@@ -51,4 +51,22 @@ Linux debian12 常自用shell脚本.
  ```
  bash <(wget --no-check-certificate -qO- 'https://iilog.com/1panelV2Upgrade.sh')  upgrade-master
  ```
+## 安装 Eternal Terminal (ET)（SSH 断线自动重连，保持会话不中断）
+  适配 Debian 11 / 12 / 13 与 Ubuntu（Debian 12/13 自动走官方 APT 源，Ubuntu 22.04+ 自动走官方 PPA，Debian 11 / Ubuntu 20.04 等无预编译包的系统自动回退源码编译）。
+  ```shell
+  # 默认安装（服务端 + 客户端，监听 TCP 2022，自动放行 ufw/firewalld）
+  bash <(curl -fsSL iilog.com/install-et.sh)
+
+  # 自定义端口
+  bash <(curl -fsSL iilog.com/install-et.sh) --port 2022
+
+  # 仅安装客户端
+  bash <(curl -fsSL iilog.com/install-et.sh) --client-only
+
+  # 卸载
+  bash <(curl -fsSL iilog.com/install-et.sh) --uninstall
+  ```
+  - 连接示例（默认 SSH 端口 22）：`et root@服务器IP`
+  - 若 SSH 为非默认端口（如 `10022`）：`et --ssh-option="Port=10022" root@服务器IP:2022`
+
 
